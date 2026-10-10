@@ -79,6 +79,15 @@ test('rejects a literal normalization marker as an invalid timestamp', async () 
   assert.equal(bothMalformed.match, false);
 });
 
+test('preserves JSON __proto__ claims for differential and expected comparisons', async () => {
+  const expectedClaims = JSON.parse('{"__proto__":{"role":"admin"}}') as Record<string, unknown>;
+  const result = await runFixture({ ...request, expect: { status: 200, claims: expectedClaims },
+    fetchImpl: async url => Response.json(JSON.parse(String(url).includes('rust.test')
+      ? '{"__proto__":{"role":"user"}}' : '{"__proto__":{"role":"admin"}}')) });
+  assert.equal(result.match, false);
+  assert.ok(result.diffs.some(diff => diff.field === 'expect.claim[__proto__]'));
+});
+
 test('OAuth errors remain distinct during comparison', () => {
   assert.equal(compareResponses({ fixtureId: 'errors', rust: { status: 400, headers: {}, body: { error: 'invalid_grant' } }, ts: { status: 400, headers: {}, body: { error: 'invalid_client' } } }).match, false);
 });
