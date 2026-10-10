@@ -56,7 +56,7 @@ function parseRequest(input: unknown, label: string): FixtureRequest {
   if (request.method !== 'GET' && request.method !== 'POST') {
     throw new TypeError(`${label} method must be GET or POST`);
   }
-  if (typeof request.path !== 'string' || !request.path.startsWith('/') || request.path.startsWith('//')) {
+  if (typeof request.path !== 'string' || !request.path.startsWith('/') || request.path.startsWith('//') || request.path.includes('\\')) {
     throw new TypeError(`${label} path must start with / and be local to the server`);
   }
   return {

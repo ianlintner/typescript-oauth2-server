@@ -15,6 +15,27 @@ for (const [field, value] of [['query', 1], ['body', { a: 1 }], ['headers', []],
     assert.throws(() => parseFixture({ ...base, request: { ...base.request, [field as string]: value } }), new RegExp(`request.${field}`));
   });
 }
+test('rejects a backslash network-path that can leave both configured origins', () => {
+  assert.throws(() => parseFixture({ ...base,
+    request: { method: 'GET', path: '/\\\\other.test/probe' },
+  }), /request path/);
+});
+
+test('rejects an interpolated path that escapes the configured server origin', async () => {
+  const fixture = parseFixture({ ...base,
+    setup: [{ request: { method: 'GET', path: '/setup' }, expect: { status: 200 }, bind: { target: 'target' } }],
+    request: { method: 'GET', path: '/{{target}}' },
+  });
+  const seen: string[] = [];
+  const fetchImpl: typeof fetch = async input => {
+    seen.push(String(input));
+    return Response.json({ target: '\\other.test/probe' });
+  };
+  await assert.rejects(runFixture({ fixtureId: fixture.id, ...fixture.request,
+    expect: fixture.expect, setup: fixture.setup, ...urls, fetchImpl }), /origin/);
+  assert.equal(seen.length, 2, 'only setup requests should reach their configured server');
+});
+
 for (const [field, value] of [['headers', []], ['headers', { a: 1 }], ['claims', []], ['claims', 1]]) {
   test(`rejects malformed expectation ${field}: ${JSON.stringify(value)}`, () => {
     assert.throws(() => parseFixture({ ...base, expect: { status: 200, [field as string]: value } }), new RegExp(`expect.${field}`));
@@ -39,6 +60,14 @@ test('ignores undeclared response claims when validating a fixture', async () =>
   const result = await runFixture({ ...request, expect: { status: 200, claims: { ok: true } },
     fetchImpl: async url => Response.json({ ok: true, incidental: String(url) }) });
   assert.equal(result.match, true);
+});
+
+test('rejects malformed token and timestamp claims despite normalization', async () => {
+  const result = await runFixture({ ...request, expect: { status: 200, claims: { access_token: 'expected-token', exp: 123 } },
+    fetchImpl: async () => Response.json({ access_token: null, exp: 'not-a-numeric-date' }) });
+  assert.equal(result.match, false);
+  assert.ok(result.diffs.some(diff => diff.field === 'expect.claim[access_token]'));
+  assert.ok(result.diffs.some(diff => diff.field === 'expect.claim[exp]'));
 });
 
 test('OAuth errors remain distinct during comparison', () => {
@@ -94,6 +123,49 @@ test('per-server setup obtains, exchanges, replays code and checks prior token r
   const result = await runFixture({ fixtureId: fixture.id, ...fixture.request, expect: fixture.expect, setup: fixture.setup, ...urls, fetchImpl });
   assert.equal(result.match, true);
   assert.deepEqual([...calls.values()], [4, 4]);
+});
+
+test('stateful replay mock detects missing cascade revocation', async () => {
+  const fixture = parseFixture({ ...base,
+    setup: [
+      { request: { method: 'GET', path: '/authorize' }, expect: { status: 200 }, bind: { code: 'code' } },
+      { request: { method: 'POST', path: '/token', body: { code: '{{code}}' } }, expect: { status: 200 }, bind: { token: 'access_token' } },
+      { request: { method: 'POST', path: '/token', body: { code: '{{code}}' } }, expect: { status: 400, claims: { error: 'invalid_grant' } } },
+    ], request: { method: 'POST', path: '/introspect', body: { token: '{{token}}' } },
+    expect: { status: 200, claims: { active: false } },
+  });
+  const makeMock = (revokeOnReplay: boolean): typeof fetch => {
+    const stores = new Map<string, { code: string; used: boolean; active: boolean }>();
+    return async (input, init) => {
+      const url = new URL(String(input));
+      let store = stores.get(url.host);
+      if (url.pathname === '/authorize') {
+        store = { code: `${url.host}-code`, used: false, active: false };
+        stores.set(url.host, store);
+        return Response.json({ code: store.code });
+      }
+      assert.ok(store, 'authorization must precede token or introspection');
+      const body = new URLSearchParams(String(init?.body));
+      if (url.pathname === '/token') {
+        assert.equal(body.get('code'), store.code);
+        if (!store.used) {
+          store.used = true;
+          store.active = true;
+          return Response.json({ access_token: `${url.host}-token` });
+        }
+        if (revokeOnReplay) store.active = false;
+        return Response.json({ error: 'invalid_grant' }, { status: 400 });
+      }
+      assert.equal(url.pathname, '/introspect');
+      assert.equal(body.get('token'), `${url.host}-token`);
+      return Response.json({ active: store.active });
+    };
+  };
+  const input = { fixtureId: fixture.id, ...fixture.request, expect: fixture.expect, setup: fixture.setup, ...urls };
+  assert.equal((await runFixture({ ...input, fetchImpl: makeMock(true) })).match, true);
+  const unrevoked = await runFixture({ ...input, fetchImpl: makeMock(false) });
+  assert.equal(unrevoked.match, false);
+  assert.ok(unrevoked.diffs.some(diff => diff.field === 'expect.claim[active]'));
 });
 
 test('setup contract failures stop dependent requests', async () => {

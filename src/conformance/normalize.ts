@@ -37,9 +37,9 @@ export function normalizePayload(value: unknown, depth = 0): unknown {
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
       if ((TOKEN_FIELDS as readonly string[]).includes(key)) {
-        out[key] = NORMALIZED;
+        out[key] = typeof entry === 'string' && entry.length > 0 ? NORMALIZED : normalizePayload(entry, depth + 1);
       } else if ((TIME_CLAIMS as readonly string[]).includes(key)) {
-        out[key] = NORMALIZED;
+        out[key] = typeof entry === 'number' && Number.isFinite(entry) ? NORMALIZED : normalizePayload(entry, depth + 1);
       } else {
         out[key] = normalizePayload(entry, depth + 1);
       }

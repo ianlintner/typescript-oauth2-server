@@ -107,7 +107,11 @@ export async function runFixture(input: FixtureRequest & {
       return bound;
     });
     const resolveRecord = (record: Record<string, string>): Record<string, string> => Object.fromEntries(Object.entries(record).map(([key, value]) => [key, resolve(value)]));
-    const url = new URL(resolve(request.path), base);
+    const root = new URL(base);
+    const url = new URL(resolve(request.path), root);
+    if (url.origin !== root.origin) {
+      throw new Error(`fixture request escaped configured server origin ${root.origin}`);
+    }
     for (const [key, value] of Object.entries(resolveRecord(request.query ?? {}))) url.searchParams.set(key, value);
     const init: RequestInit = { method: request.method, redirect: 'manual', headers: resolveRecord(request.headers ?? {}) };
     if (request.body !== undefined) {
