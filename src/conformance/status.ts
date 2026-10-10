@@ -32,6 +32,10 @@ export interface ConformanceEntry {
   path: string;
   /** Rust implementation reference: source file + route. */
   rustReference: string;
+  /** Rust integration test files that mention this path (not proof of per-method coverage). */
+  rustTests: readonly string[];
+  /** Planned delivery wave from the architecture proposal, or `unscheduled`. */
+  milestone: 'stage3' | 'stage4' | 'stage5' | 'unscheduled';
   /** TS implementation reference, or null when not yet implemented. */
   tsReference: string | null;
   /** Conformance status for this entry. */
