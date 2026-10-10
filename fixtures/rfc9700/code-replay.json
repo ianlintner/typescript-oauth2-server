@@ -1,0 +1,23 @@
+{
+  "id": "rfc9700.code-replay",
+  "rfc": "RFC 9700 \u00a74.5",
+  "status": "deferred",
+  "request": {
+    "method": "POST",
+    "path": "/oauth/token",
+    "body": {
+      "grant_type": "authorization_code",
+      "code": "{{code}}",
+      "client_id": "client-a",
+      "redirect_uri": "https://client.example/callback",
+      "code_verifier": "matching-verifier"
+    }
+  },
+  "expect": {
+    "status": 400,
+    "claims": {
+      "error": "invalid_grant"
+    }
+  },
+  "note": "Requires live setup to obtain a code, exchange it successfully, replay the same code, and introspect the prior token to verify revocation."
+}
