@@ -1,7 +1,7 @@
 // Pinned snapshot of the Rust reference route table. Regenerate only from a
 // reviewed checkout of the commit below; `test/matrix.test.ts` compares the
-// conformance matrix against it, and `RUST_REFERENCE_DIR` enables a check of
-// the snapshot itself against a live Rust checkout.
+// conformance matrix against it. The snapshot itself is not re-verified against
+// a live Rust checkout by the test suite.
 
 export interface RustRoute {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE';

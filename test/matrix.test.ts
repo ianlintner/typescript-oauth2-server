@@ -63,3 +63,9 @@ test('matrix scope is a full route inventory, not a partial seed', async () => {
     assert.doesNotMatch(await readFile(file, 'utf8'), /intentionally partial seed/);
   }
 });
+
+test('no route-method key appears twice in the matrix or the pinned Rust route table', () => {
+  const dupes = (keys: string[]) => keys.filter((k, i) => keys.indexOf(k) !== i);
+  assert.deepEqual(dupes(MATRIX.map((e) => `${e.method} ${e.path}`)), [], 'duplicate matrix route-method keys');
+  assert.deepEqual(dupes(RUST_ROUTES.map((r) => `${r.method} ${r.path}`)), [], 'duplicate Rust snapshot keys');
+});
