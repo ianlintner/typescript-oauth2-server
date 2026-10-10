@@ -1,0 +1,21 @@
+{
+  "id": "rfc6749.authorization-code.reject-wrong-redirect-uri",
+  "rfc": "RFC 6749 §4.1.3",
+  "status": "planned",
+  "request": {
+    "method": "POST",
+    "path": "/oauth/token",
+    "body": {
+      "grant_type": "authorization_code",
+      "code": "valid-code",
+      "client_id": "client-a",
+      "redirect_uri": "https://attacker.example/callback"
+    }
+  },
+  "expect": {
+    "status": 400,
+    "claims": {
+      "error": "invalid_grant"
+    }
+  }
+}

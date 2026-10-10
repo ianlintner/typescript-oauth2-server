@@ -1,0 +1,22 @@
+{
+  "id": "rfc9700.code-replay",
+  "rfc": "RFC 9700 §4.5",
+  "status": "planned",
+  "request": {
+    "method": "POST",
+    "path": "/oauth/token",
+    "body": {
+      "grant_type": "authorization_code",
+      "code": "already-consumed-code",
+      "client_id": "client-a",
+      "redirect_uri": "https://client.example/callback",
+      "code_verifier": "matching-verifier"
+    }
+  },
+  "expect": {
+    "status": 400,
+    "claims": {
+      "error": "invalid_grant"
+    }
+  }
+}

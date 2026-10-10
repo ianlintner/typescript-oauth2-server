@@ -1,0 +1,22 @@
+{
+  "id": "rfc7636.pkce.wrong-verifier",
+  "rfc": "RFC 7636 §4.6",
+  "status": "planned",
+  "request": {
+    "method": "POST",
+    "path": "/oauth/token",
+    "body": {
+      "grant_type": "authorization_code",
+      "code": "valid-code",
+      "client_id": "client-a",
+      "redirect_uri": "https://client.example/callback",
+      "code_verifier": "wrong-verifier-does-not-match-challenge"
+    }
+  },
+  "expect": {
+    "status": 400,
+    "claims": {
+      "error": "invalid_grant"
+    }
+  }
+}
