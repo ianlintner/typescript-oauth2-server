@@ -6,15 +6,15 @@ import {
   normalizeValue,
 } from '../src/conformance/normalize.js';
 
-test('normalizes a JWT into a deterministic placeholder', () => {
+test('preserves an unnamed JWT string', () => {
   assert.equal(
     normalizeValue('eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.signature'),
-    NORMALIZED,
+    'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.signature',
   );
 });
 
-test('normalizes an opaque access token', () => {
-  assert.equal(normalizeValue('kWJthG45ubWfYc8ZgN7aQdV9pJr3XoLm'), NORMALIZED);
+test('preserves an unnamed opaque string', () => {
+  assert.equal(normalizeValue('kWJthG45ubWfYc8ZgN7aQdV9pJr3XoLm'), 'kWJthG45ubWfYc8ZgN7aQdV9pJr3XoLm');
 });
 
 test('leaves a plain-text scope value untouched', () => {
@@ -55,4 +55,15 @@ test('rejects payload nesting deeper than 32 levels', () => {
   let deep: unknown = 'leaf';
   for (let i = 0; i < 40; i += 1) deep = { nested: deep };
   assert.throws(() => normalizePayload(deep), /depth/);
+});
+
+test('preserves client-controlled state and nonce exactly', () => {
+  const input = { state: 'client-state-123456', nonce: 'client-nonce-123456' };
+  assert.deepEqual(normalizePayload(input), input);
+});
+
+test('preserves OAuth errors and other deterministic strings', () => {
+  for (const error of ['invalid_grant', 'invalid_client', 'access_denied']) {
+    assert.deepEqual(normalizePayload({ error }), { error });
+  }
 });

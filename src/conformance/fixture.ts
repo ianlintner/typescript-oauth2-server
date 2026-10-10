@@ -1,96 +1,118 @@
-// Extension of the bootstrap Scenario into a full conformance fixture.
-//
-// The bootstrap `Scenario` (src/fixtures.ts) validates a minimal request +
-// expected status. A conformance fixture adds the fields the architecture
-// proposal §Stage 2 requires the harness to compare: response headers and
-// response claims, plus a `setup` hook for stateful flows (e.g. obtain a
-// token, then call an authenticated endpoint).
-
 import type { ConformanceStatus } from './status.js';
 
 export interface FixtureRequest {
   method: 'GET' | 'POST';
   path: string;
-  /** Optional query parameters, appended to `path`. */
   query?: Record<string, string>;
-  /** Optional form body (application/x-www-form-urlencoded). */
+  /** Form body (application/x-www-form-urlencoded). */
   body?: Record<string, string>;
-  /** Optional request headers. */
   headers?: Record<string, string>;
 }
 
 export interface FixtureExpectation {
-  /** Expected HTTP status code. */
   status: number;
-  /** Header names to compare (values normalized for nondeterminism). */
+  /** Only these response headers are checked; names are case insensitive. */
   headers?: Record<string, string>;
-  /**
-   * Claim checks compared (after nondeterministic-field normalization) between
-   * the two server responses.
-   */
+  /** Declared top-level claims must be present and match normalized values. */
   claims?: Record<string, unknown>;
 }
 
-export interface Fixture {
-  /** Stable identifier, shared with the conformance matrix entry. */
-  id: string;
-  /** Reference clause, e.g. `RFC 6749 §4.1`. */
-  rfc: string;
-  /** Conformance status this fixture is currently tracking. */
-  status: ConformanceStatus;
-  /** The request to issue against both servers. */
+export interface FixtureStep {
   request: FixtureRequest;
-  /** The expected response contract. */
+  expect: FixtureExpectation;
+  /** Bind variable names to top-level string claims in the raw response. */
+  bind?: Record<string, string>;
+}
+
+export interface Fixture {
+  id: string;
+  rfc: string;
+  status: ConformanceStatus;
+  note?: string;
+  /** Ordered steps executed separately for each server before the final request. */
+  setup?: FixtureStep[];
+  request: FixtureRequest;
   expect: FixtureExpectation;
 }
 
+function record(input: unknown, label: string): Record<string, unknown> {
+  if (typeof input !== 'object' || input === null ||
+      (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  return input as Record<string, unknown>;
+}
+
+function strings(input: unknown, label: string): Record<string, string> {
+  const value = record(input, label);
+  if (Object.values(value).some(entry => typeof entry !== 'string')) {
+    throw new TypeError(`${label} must be a string-valued record`);
+  }
+  return value as Record<string, string>;
+}
+
+function parseRequest(input: unknown, label: string): FixtureRequest {
+  const request = record(input, label);
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    throw new TypeError(`${label} method must be GET or POST`);
+  }
+  if (typeof request.path !== 'string' || !request.path.startsWith('/') || request.path.startsWith('//')) {
+    throw new TypeError(`${label} path must start with / and be local to the server`);
+  }
+  return {
+    method: request.method,
+    path: request.path,
+    ...(request.query !== undefined ? { query: strings(request.query, `${label}.query`) } : {}),
+    ...(request.body !== undefined ? { body: strings(request.body, `${label}.body`) } : {}),
+    ...(request.headers !== undefined ? { headers: strings(request.headers, `${label}.headers`) } : {}),
+  };
+}
+
+function parseExpectation(input: unknown, label: string): FixtureExpectation {
+  const expect = record(input, label);
+  if (!Number.isInteger(expect.status) || (expect.status as number) < 100 || (expect.status as number) > 599) {
+    throw new TypeError(`${label}: expected status must be an HTTP status code`);
+  }
+  return {
+    status: expect.status as number,
+    ...(expect.headers !== undefined ? { headers: strings(expect.headers, `${label}.headers`) } : {}),
+    ...(expect.claims !== undefined ? { claims: record(expect.claims, `${label}.claims`) } : {}),
+  };
+}
+
 export function parseFixture(input: unknown): Fixture {
-  if (typeof input !== 'object' || input === null) {
-    throw new TypeError('fixture must be an object');
-  }
-  const value = input as Record<string, unknown>;
-  if (typeof value.id !== 'string' || value.id.trim() === '') {
-    throw new TypeError('fixture id must be nonempty');
-  }
-  if (typeof value.rfc !== 'string' || value.rfc.trim() === '') {
-    throw new TypeError('RFC reference must be nonempty');
-  }
+  const value = record(input, 'fixture');
+  if (typeof value.id !== 'string' || value.id.trim() === '') throw new TypeError('fixture id must be nonempty');
+  if (typeof value.rfc !== 'string' || value.rfc.trim() === '') throw new TypeError('RFC reference must be nonempty');
   const status = value.status;
   if (status !== 'planned' && status !== 'passing' && status !== 'deferred' && status !== 'deviation') {
     throw new TypeError('fixture status must be a valid conformance status');
   }
-  const request = value.request as Record<string, unknown> | undefined;
-  if (typeof request !== 'object' || request === null || Array.isArray(request)) {
-    throw new TypeError('request must be an object');
+  if (value.note !== undefined && (typeof value.note !== 'string' || value.note.trim() === '')) {
+    throw new TypeError('fixture note must be nonempty');
   }
-  if (request.method !== 'GET' && request.method !== 'POST') {
-    throw new TypeError('request method must be GET or POST');
-  }
-  if (typeof request.path !== 'string' || !request.path.startsWith('/')) {
-    throw new TypeError('request path must start with /');
-  }
-  const expect = value.expect as Record<string, unknown> | undefined;
-  if (typeof expect !== 'object' || expect === null || Array.isArray(expect)) {
-    throw new TypeError('expectation must be an object');
-  }
-  if (!Number.isInteger(expect.status) || (expect.status as number) < 100 || (expect.status as number) > 599) {
-    throw new TypeError('expected status must be an HTTP status code');
+  let setup: FixtureStep[] | undefined;
+  if (value.setup !== undefined) {
+    if (!Array.isArray(value.setup)) throw new TypeError('setup must be an array');
+    setup = value.setup.map((input, index) => {
+      const label = `setup[${index}]`;
+      const step = record(input, label);
+      const bind = step.bind === undefined ? undefined : strings(step.bind, `${label}.bind`);
+      if (bind && Object.entries(bind).some(([name, claim]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || claim === '')) {
+        throw new TypeError(`${label}.bind requires variable names and nonempty claim names`);
+      }
+      return {
+        request: parseRequest(step.request, `${label}.request`),
+        expect: parseExpectation(step.expect, `${label}.expect`),
+        ...(bind ? { bind } : {}),
+      };
+    });
   }
   return {
-    id: value.id as string,
-    rfc: value.rfc as string,
-    status: status as Fixture['status'],
-    request: {
-      method: request.method as FixtureRequest['method'],
-      path: request.path as string,
-      ...(request.query !== undefined ? { query: request.query as Record<string, string> } : {}),
-      ...(request.body !== undefined ? { body: request.body as Record<string, string> } : {}),
-      ...(request.headers !== undefined ? { headers: request.headers as Record<string, string> } : {}),
-    },
-    expect: {
-      status: expect.status as number,
-      ...(expect.headers !== undefined ? { headers: expect.headers as Record<string, string> } : {}),
-      ...(expect.claims !== undefined ? { claims: expect.claims as Record<string, unknown> } : {}),
-    },
+    id: value.id, rfc: value.rfc, status,
+    ...(value.note !== undefined ? { note: value.note as string } : {}),
+    ...(setup !== undefined ? { setup } : {}),
+    request: parseRequest(value.request, 'request'),
+    expect: parseExpectation(value.expect, 'expect'),
   };
 }

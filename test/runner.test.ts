@@ -84,3 +84,13 @@ test('reports every mismatch deterministically in field order', () => {
     { field: 'header[cache-control]', rust: 'no-store', ts: 'no-cache' },
   ]);
 });
+
+for (const key of ['state', 'nonce']) {
+  test(`detects a client-controlled ${key} mismatch`, () => {
+    assert.equal(compareResponses({
+      fixtureId: key,
+      rust: snapshot({ body: { [key]: 'client-value-123456' } }),
+      ts: snapshot({ body: { [key]: 'changed-value-123456' } }),
+    }).match, false);
+  });
+}

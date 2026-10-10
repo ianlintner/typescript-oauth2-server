@@ -1,11 +1,10 @@
 // Conformance matrix inventory.
 //
-// This is the machine-readable Stage 1 deliverable: every HTTP route and the
-// protocol test coverage of the Rust reference implementation
-// (`ianlintner/rust-oauth2-server`) enumerated with a conformance status
-// against the TypeScript port. Source of truth for route surface:
-// `crates/oauth2-server/src/lib.rs` (see `rustReference` strings) and the
-// `tests/compliance_*` / `tests/rfc9700_*` / `tests/security_http.rs` suites.
+// This is an intentionally partial seed of routes and protocol scenarios,
+// not a full Rust route inventory or a completed Stage 1 deliverable.
+// References below identify the intended Rust comparison points; this seed
+// has not been checked against a current Rust checkout. See README.md for
+// omitted route families and the work needed before claiming full coverage.
 //
 // The TypeScript server does not implement any endpoints yet, so every entry
 // is `planned` (port pending), `deferred` (out of scope per the architecture
@@ -52,7 +51,8 @@ export const MATRIX: readonly ConformanceEntry[] = [
     path: '/oauth/token',
     rustReference: 'tests/rfc9700_code_replay.rs',
     tsReference: null,
-    status: 'planned',
+    status: 'deferred',
+    note: 'Live obtain/exchange/replay/introspection setup is not available; mock harness tests are not protocol coverage.',
   },
   // ── Token lifecycle (RFC 7009 / 7662) ────────────────────────────────
   {

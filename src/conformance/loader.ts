@@ -24,13 +24,16 @@ export async function loadFixtures(root: string = FIXTURES_ROOT): Promise<Fixtur
   const entries = await readdir(root, { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
-    const full = path.join(root, entry.name);
+    const full = path.resolve(root, entry.name);
     if (entry.isDirectory()) {
       results.push(...(await loadFixtures(full)));
     } else if (entry.name.endsWith('.json')) {
       const raw = await readFile(full, 'utf8');
-      const fixture = parseFixture(JSON.parse(raw));
-      results.push(fixture);
+      try {
+        results.push(parseFixture(JSON.parse(raw)));
+      } catch (cause) {
+        throw new Error(`Invalid fixture ${full}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      }
     }
   }
   return results;

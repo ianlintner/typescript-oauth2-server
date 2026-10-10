@@ -9,10 +9,10 @@ test('loads every seeded fixture and validates each one', async () => {
   // There must be no duplicate fixture identifiers.
   assert.equal(new Set(ids).size, ids.length, 'fixture ids must be unique');
   // Every loaded fixture is fully typed (parseFixture already validated), but
-  // assert the intended statuses are all still `planned` until a TS endpoint
+  // assert the statuses remain planned or deferred until a TS endpoint
   // exists to exercise them for real.
   for (const fixture of fixtures) {
-    assert.equal(fixture.status, 'planned', `${fixture.id} must start as planned`);
+    assert.ok(['planned', 'deferred'].includes(fixture.status), `${fixture.id} must stay planned or deferred`);
   }
 });
 

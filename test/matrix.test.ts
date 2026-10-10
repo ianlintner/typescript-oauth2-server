@@ -32,3 +32,10 @@ test('no entry is yet marked passing, because the TS server has no endpoints', (
   const passing = MATRIX.filter((entry) => entry.status === 'passing');
   assert.equal(passing.length, 0, 'nothing may be passing until a TS endpoint is exercised');
 });
+
+test('matrix scope is explicitly an intentionally partial seed', async () => {
+  const { readFile } = await import('node:fs/promises');
+  for (const file of ['src/conformance/matrix.ts', 'README.md']) {
+    assert.match(await readFile(file, 'utf8'), /intentionally partial seed/);
+  }
+});

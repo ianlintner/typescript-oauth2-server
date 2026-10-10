@@ -1,9 +1,9 @@
 // Conformance harness CLI.
 //
-// Replays every seeded fixture against an isolated Rust base URL and an
-// isolated TypeScript base URL, compares the normalized response contract, and
-// prints a per-fixture PASS/DIFF report. Exit code 0 only when every fixture
-// matches.
+// Replays non-deferred fixtures against isolated Rust and TypeScript base
+// URLs, enforcing expectations and comparing normalized responses. Reports
+// PASS/DIFF for executed fixtures and DEFERRED for skipped ones. Exit code 0
+// requires at least one executed fixture and no mismatches.
 //
 // Usage:
 //   node src/conformance/cli.ts --rust http://127.0.0.1:8080 --ts http://127.0.0.1:3000
@@ -45,9 +45,17 @@ async function main(argv: string[]): Promise<number> {
   const fixtures = await loadFixtures();
 
   let failures = 0;
+  let executed = 0;
   for (const fixture of fixtures) {
+    if (fixture.status === 'deferred') {
+      console.log(`DEFERRED ${fixture.id}: ${fixture.note ?? 'not executable yet'}`);
+      continue;
+    }
+    executed += 1;
     const result = await runFixture({
       fixtureId: fixture.id,
+      expect: fixture.expect,
+      setup: fixture.setup,
       method: fixture.request.method,
       path: fixture.request.path,
       ...(fixture.request.query !== undefined ? { query: fixture.request.query } : {}),
@@ -63,20 +71,20 @@ async function main(argv: string[]): Promise<number> {
       failures += 1;
       console.log(`DIFF ${fixture.id}`);
       for (const diff of result.diffs) {
-        console.log(`  ${diff.field}: rust=${safeJson(diff.rust)} ts=${safeJson(diff.ts)}`);
+        console.log(`  ${diff.field}: rust=${safeJson(diff.rust)} ts=${safeJson(diff.ts)}${Object.hasOwn(diff, 'expected') ? ` expected=${safeJson(diff.expected)}` : ''}`);
       }
     }
   }
 
-  if (fixtures.length === 0) {
-    console.log('no fixtures loaded');
+  if (executed === 0) {
+    console.log('no executable fixtures');
     return 1;
   }
   if (failures > 0) {
-    console.log(`${failures} of ${fixtures.length} fixtures diverged`);
+    console.log(`${failures} of ${executed} executed fixtures diverged`);
     return 1;
   }
-  console.log(`all ${fixtures.length} fixtures matched`);
+  console.log(`${executed} executed fixtures matched; ${fixtures.length - executed} deferred (no conformance status changed)`);
   return 0;
 }
 
