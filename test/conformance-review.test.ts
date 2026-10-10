@@ -70,6 +70,15 @@ test('rejects malformed token and timestamp claims despite normalization', async
   assert.ok(result.diffs.some(diff => diff.field === 'expect.claim[exp]'));
 });
 
+test('rejects a literal normalization marker as an invalid timestamp', async () => {
+  const oneMalformed = await runFixture({ ...request, expect: { status: 200, claims: { exp: 123 } },
+    fetchImpl: async url => Response.json({ exp: String(url).includes('rust.test') ? 123 : '<normalized>' }) });
+  assert.equal(oneMalformed.match, false);
+  const bothMalformed = await runFixture({ ...request, expect: { status: 200, claims: { exp: 123 } },
+    fetchImpl: async () => Response.json({ exp: '<normalized>' }) });
+  assert.equal(bothMalformed.match, false);
+});
+
 test('OAuth errors remain distinct during comparison', () => {
   assert.equal(compareResponses({ fixtureId: 'errors', rust: { status: 400, headers: {}, body: { error: 'invalid_grant' } }, ts: { status: 400, headers: {}, body: { error: 'invalid_client' } } }).match, false);
 });

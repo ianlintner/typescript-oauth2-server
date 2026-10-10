@@ -79,7 +79,7 @@ export function compareResponses(input: {
     for (const [key, value] of Object.entries(headers(expect.headers ?? {})).sort()) {
       if (rh[key] !== value || th[key] !== value) diffs.push({ field: `expect.header[${key}]`, rust: rh[key], ts: th[key], expected: value });
     }
-    for (const [key, value] of Object.entries(claims(normalizePayload(expect.claims ?? {}))).sort()) {
+    for (const [key, value] of Object.entries(claims(normalizePayload(expect.claims ?? {}))).sort(([a], [b]) => a.localeCompare(b))) {
       if (!Object.hasOwn(rc, key) || !Object.hasOwn(tc, key) || !deepEqual(rc[key], value) || !deepEqual(tc[key], value)) {
         diffs.push({ field: `expect.claim[${key}]`, rust: rc[key], ts: tc[key], expected: value });
       }

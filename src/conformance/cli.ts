@@ -13,6 +13,7 @@
 // single server.
 
 import { loadFixtures } from './loader.js';
+import { NORMALIZED } from './normalize.js';
 import { runFixture } from './runner.js';
 
 interface Options {
@@ -94,6 +95,7 @@ function safeJson(value: unknown): string {
     return JSON.stringify(value, (_key, entry: unknown) => {
       // Deep-equal-safe stringification for values that may contain cycles or
       // non-serializable entries from a live response.
+      if (entry === NORMALIZED) return '<normalized>';
       if (typeof entry === 'bigint') return entry.toString();
       return entry as string;
     });

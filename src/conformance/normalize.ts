@@ -17,8 +17,8 @@ export const TOKEN_FIELDS = [
 /** RFC 7519 NumericDate claims that drift between runs. */
 export const TIME_CLAIMS = ['exp', 'iat', 'nbf', 'auth_time'] as const;
 
-/** Placeholder substituted for every normalized value. */
-export const NORMALIZED = '<normalized>';
+/** Internal marker not representable by a JSON response, preventing collisions. */
+export const NORMALIZED = Symbol('normalized');
 
 /** Without a field name, strings carry no evidence of nondeterminism. */
 export function normalizeValue(value: string): string {
