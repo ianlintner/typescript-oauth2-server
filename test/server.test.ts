@@ -1,7 +1,7 @@
+import { createServer as createNetServer } from 'node:net';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { exportPKCS8, generateKeyPair } from 'jose';
-import { loadConfig } from '../src/config.js';
 import { startServer } from '../src/main.js';
 import { buildServer } from '../src/server.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -81,7 +81,11 @@ test('startServer refuses to boot with invalid config', async () => {
   await assert.rejects(startServer({ OAUTH2_ENV: 'production' }), /OAUTH2_/);
 });
 
-test('startServer boots with valid config on an ephemeral port and serves /health', async () => {
+test('startServer boots with valid config on a free port and serves /health', async () => {
+  const probe = createNetServer();
+  await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+  const port = (probe.address() as { port: number }).port;
+  await new Promise((r) => probe.close(r));
   const { privateKey } = await generateKeyPair('ES256', { extractable: true });
   const env = {
     OAUTH2_ENV: 'development',
@@ -89,12 +93,11 @@ test('startServer boots with valid config on an ephemeral port and serves /healt
     OAUTH2_SESSION_SECRET: 'y'.repeat(32),
     OAUTH2_SIGNING_KEY_PEM: await exportPKCS8(privateKey),
     OAUTH2_SIGNING_KEY_ID: 'k1',
-    OAUTH2_PORT: '18080',
+    OAUTH2_PORT: String(port),
   };
-  assert.equal(loadConfig(env).port, 18080);
-  const running = await startServer({ ...env, OAUTH2_PORT: '18080' });
+  const running = await startServer(env);
   try {
-    const res = await fetch('http://127.0.0.1:18080/health');
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(res.status, 200);
   } finally {
     await running.close();

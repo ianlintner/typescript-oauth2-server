@@ -147,3 +147,35 @@ test('healthcheck succeeds when open and fails after close', async () => {
   await s.close();
   await assert.rejects(s.healthcheck());
 });
+
+test('root-store writes made during an open transaction are not swallowed by its rollback', async () => {
+  await withStore(async (s) => {
+    await s.saveClient(client);
+    await s.saveAuthorizationCode(code);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const txDone = s
+      .transaction(async (tx) => {
+        await tx.saveClient({ ...client, clientId: 'tx-only' });
+        await gate;
+        throw new Error('abort');
+      })
+      .catch(() => undefined);
+    const consumed = s.consumeAuthorizationCode('h1', 1000);
+    release();
+    await txDone;
+    assert.ok(await consumed, 'consume succeeded');
+    assert.equal(await s.getClient('tx-only'), null);
+    assert.equal(await s.consumeAuthorizationCode('h1', 1001), null, 'consume survived the rollback');
+  });
+});
+
+test('a transaction handle cannot be used after the transaction ends', async () => {
+  await withStore(async (s) => {
+    let leaked!: Store;
+    await s.transaction(async (tx) => {
+      leaked = tx;
+    });
+    await assert.rejects(() => leaked.saveClient(client), /transaction/);
+  });
+});
