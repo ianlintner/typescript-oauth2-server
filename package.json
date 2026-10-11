@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "test": "tsx --test test/*.test.ts",
     "check": "pnpm typecheck && pnpm lint && pnpm test",
-    "conformance": "tsx src/conformance/cli.ts"
+    "conformance": "tsx src/conformance/cli.ts",
+    "start": "tsx src/main.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -18,5 +19,9 @@
     "tsx": "^4.0.0",
     "typescript": "^5.0.0",
     "typescript-eslint": "^8.0.0"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5",
+    "jose": "^6.2.12"
   }
 }
