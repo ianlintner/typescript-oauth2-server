@@ -7,6 +7,7 @@
 //
 // Usage:
 //   node src/conformance/cli.ts --rust http://127.0.0.1:8080 --ts http://127.0.0.1:3000
+//   Add --fixtures <directory> to exercise an isolated fixture suite.
 //
 // The CLI deliberately refuses to run until both base URLs are provided; the
 // harness is cross-language by design and has nothing to compare against a
@@ -19,31 +20,33 @@ import { runFixture } from './runner.js';
 interface Options {
   rust: string;
   ts: string;
+  fixtures?: string;
 }
 
 function parseArgs(argv: string[]): Options {
   const opts: Partial<Options> = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--rust' || arg === '--ts') {
+    if (arg === '--rust' || arg === '--ts' || arg === '--fixtures') {
       const value = argv[i + 1];
       if (value === undefined) {
         throw new Error(`missing value for ${arg}`);
       }
       if (arg === '--rust') opts.rust = value;
       if (arg === '--ts') opts.ts = value;
+      if (arg === '--fixtures') opts.fixtures = value;
       i += 1;
     }
   }
   if (opts.rust === undefined || opts.ts === undefined) {
     throw new Error('usage: cli.ts --rust <url> --ts <url>');
   }
-  return { rust: opts.rust, ts: opts.ts };
+  return { rust: opts.rust, ts: opts.ts, ...(opts.fixtures !== undefined ? { fixtures: opts.fixtures } : {}) };
 }
 
 async function main(argv: string[]): Promise<number> {
-  const { rust, ts } = parseArgs(argv);
-  const fixtures = await loadFixtures();
+  const { rust, ts, fixtures: fixtureRoot } = parseArgs(argv);
+  const fixtures = await loadFixtures(fixtureRoot);
 
   let failures = 0;
   let executed = 0;
