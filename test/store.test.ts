@@ -18,6 +18,7 @@ const code = {
   codeHash: 'h1',
   clientId: 'c1',
   redirectUri: 'https://app.example/cb',
+  subject: 'u1',
   scope: 'openid',
   codeChallenge: 'chal',
   expiresAt: 2000,

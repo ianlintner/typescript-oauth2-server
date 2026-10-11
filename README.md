@@ -14,9 +14,11 @@ Fixtures can supply an ordered `setup` array. Each step has `request`, `expect`,
 
 The four live PKCE, redirect, and code-replay fixtures are deferred until real authorization/client setup exists. The CLI reports them as DEFERRED and does not dispatch their requests. Replay harness tests use deterministic mocks to obtain a code, exchange it successfully, replay that same code, and check revocation of the prior token through introspection. These tests validate the harness only. Fixture/matrix statuses stay planned or deferred (with the existing documented Rust stub deviation); a matching run does not promote a status or establish protocol conformance.
 
-## Server skeleton (no grant flows)
+## Server skeleton and authorization-code/PKCE slice
 
-`src/main.ts` boots a Fastify shell that serves only `GET /health` (503 when storage is unreachable); every other route returns an OAuth-shaped JSON 404. No authorization, token, introspection, revocation, JWKS or OIDC endpoint exists yet, so nothing here is protocol-conformant.
+`src/main.ts` boots a Fastify shell serving `GET /health` (503 when storage is unreachable). `src/oauth.ts` adds `GET /oauth/authorize` and `POST /oauth/token` for the authorization-code grant only: S256 PKCE (required), exact redirect URI match, `state` and `iss` on redirect responses, duplicate-parameter rejection, atomic one-time code redemption, and confidential (scrypt-hashed secret, Basic or form) plus public client authentication. No implicit or password grant, refresh, introspection, revocation, JWKS or OIDC endpoint exists. Resource-owner login/consent is out of scope: `authenticate` is an injected hook and the authorize endpoint fails closed with `access_denied` without it, so this is not a deployable authorization server.
+
+Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/client-auth.test.ts`). The cross-language fixtures above remain deferred because the harness cannot yet bind a code from a redirect `Location`; matrix statuses are unchanged.
 
 - `src/config.ts`: environment validation that fails closed. `OAUTH2_ENV`, `OAUTH2_ISSUER`, `OAUTH2_SESSION_SECRET` (32+ chars), `OAUTH2_SIGNING_KEY_PEM` (PKCS#8 ES256) and `OAUTH2_SIGNING_KEY_ID` are required. Production additionally requires an https issuer, a persistent `OAUTH2_DATABASE_PATH`, and a non-placeholder secret. Error messages never echo secret values.
 - `src/errors.ts`: typed OAuth errors mapped once to RFC 6749 status, headers and JSON; server errors are opaque.
