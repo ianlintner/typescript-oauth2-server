@@ -14,7 +14,7 @@
   "expect": {
     "status": 401,
     "headers": {
-      "www-authenticate": "Basic"
+      "www-authenticate": "Basic realm=\"oauth2\", charset=\"UTF-8\""
     },
     "claims": {
       "error": "invalid_client"

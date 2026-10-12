@@ -1,22 +1,17 @@
 {
   "id": "rfc7636.pkce.missing-challenge",
-  "rfc": "RFC 7636 \u00a74.4.1",
-  "status": "deferred",
+  "rfc": "RFC 7636 §4.4.1",
+  "status": "planned",
+  "note": "Authorization request without code_challenge must be rejected by redirecting (302) with error=invalid_request; the Location header embeds a server-specific iss, so only the status is compared.",
   "request": {
-    "method": "POST",
-    "path": "/oauth/token",
-    "body": {
-      "grant_type": "authorization_code",
-      "code": "{{code}}",
+    "method": "GET",
+    "path": "/oauth/authorize",
+    "query": {
+      "response_type": "code",
       "client_id": "client-a",
-      "redirect_uri": "https://client.example/callback"
+      "redirect_uri": "https://client.example/callback",
+      "state": "xyz"
     }
   },
-  "expect": {
-    "status": 400,
-    "claims": {
-      "error": "invalid_request"
-    }
-  },
-  "note": "Requires live authorization setup and client registration to obtain a code with known PKCE and redirect properties; no executable endpoint setup exists yet."
+  "expect": { "status": 302 }
 }

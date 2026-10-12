@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
   client_id TEXT NOT NULL REFERENCES clients(client_id),
   redirect_uri TEXT NOT NULL,
+  subject TEXT NOT NULL,
   scope TEXT NOT NULL,
   code_challenge TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
@@ -33,6 +34,7 @@ interface CodeRow {
   code_hash: string;
   client_id: string;
   redirect_uri: string;
+  subject: string;
   scope: string;
   code_challenge: string;
   expires_at: number;
@@ -70,9 +72,9 @@ const ops = {
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
     db.prepare(
-      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, scope, code_challenge, expires_at, consumed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(c.codeHash, c.clientId, c.redirectUri, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt);
+      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt);
   },
 
   // Single conditional UPDATE ... RETURNING: the database decides the winner of a race.
@@ -89,6 +91,7 @@ const ops = {
       codeHash: r.code_hash,
       clientId: r.client_id,
       redirectUri: r.redirect_uri,
+      subject: r.subject,
       scope: r.scope,
       codeChallenge: r.code_challenge,
       expiresAt: r.expires_at,

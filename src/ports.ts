@@ -30,6 +30,8 @@ export interface AuthorizationCodeRecord {
   codeHash: string;
   clientId: string;
   redirectUri: string;
+  /** Authenticated resource owner the code was issued for. */
+  subject: string;
   scope: string;
   codeChallenge: string;
   expiresAt: number;

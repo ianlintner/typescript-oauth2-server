@@ -1,7 +1,39 @@
 {
   "id": "rfc9700.code-replay",
-  "rfc": "RFC 9700 \u00a74.5",
-  "status": "deferred",
+  "rfc": "RFC 9700 §4.5",
+  "status": "planned",
+  "setup": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/oauth/authorize",
+        "query": {
+          "response_type": "code",
+          "client_id": "client-a",
+          "redirect_uri": "https://client.example/callback",
+          "code_challenge": "o_UBuWlNRvSWwsVYJqrs5EQo89Jn7Cm_gk-BDYsu17Y",
+          "code_challenge_method": "S256",
+          "state": "xyz"
+        }
+      },
+      "expect": { "status": 302 },
+      "bind": { "code": "location.query.code" }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/oauth/token",
+        "body": {
+          "grant_type": "authorization_code",
+          "code": "{{code}}",
+          "client_id": "client-a",
+          "redirect_uri": "https://client.example/callback",
+          "code_verifier": "conformance-verifier-0123456789-abcdefghijklmnopqrstuvwxyz"
+        }
+      },
+      "expect": { "status": 200, "claims": { "token_type": "Bearer" } }
+    }
+  ],
   "request": {
     "method": "POST",
     "path": "/oauth/token",
@@ -10,14 +42,11 @@
       "code": "{{code}}",
       "client_id": "client-a",
       "redirect_uri": "https://client.example/callback",
-      "code_verifier": "matching-verifier"
+      "code_verifier": "conformance-verifier-0123456789-abcdefghijklmnopqrstuvwxyz"
     }
   },
   "expect": {
     "status": 400,
-    "claims": {
-      "error": "invalid_grant"
-    }
-  },
-  "note": "Requires live setup to obtain a code, exchange it successfully, replay the same code, and introspect the prior token to verify revocation."
+    "claims": { "error": "invalid_grant" }
+  }
 }

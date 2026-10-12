@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { parseFixture } from '../src/conformance/fixture.js';
-import { runFixture, compareResponses } from '../src/conformance/runner.js';
+import { runFixture, compareResponses, bindSource } from '../src/conformance/runner.js';
 import { loadFixtures } from '../src/conformance/loader.js';
 
 const base = { id: 'test', rfc: 'test', status: 'planned', request: { method: 'GET', path: '/test' }, expect: { status: 200 } };
@@ -103,13 +103,46 @@ for (const raw of ['{broken', JSON.stringify({ ...base, request: { method: 'GET'
   });
 }
 
-test('seed stateful cases are explicitly deferred without fake codes', async () => {
+test('shipped stateful fixtures are executable and obtain codes through setup, not fake literals', async () => {
   const fixtures = await loadFixtures();
-  for (const fixture of fixtures.filter(f => !f.id.endsWith('reject-invalid-client'))) {
-    assert.equal(fixture.status, 'deferred');
-    assert.ok(fixture.note);
+  const byId = new Map(fixtures.map(f => [f.id, f]));
+  for (const id of ['rfc6749.authorization-code.reject-wrong-redirect-uri', 'rfc7636.pkce.wrong-verifier', 'rfc9700.code-replay']) {
+    const fixture = byId.get(id);
+    assert.ok(fixture, id);
+    assert.notEqual(fixture.status, 'deferred', id);
+    assert.equal(fixture.setup?.[0]?.bind?.code, 'location.query.code', id);
     assert.doesNotMatch(JSON.stringify(fixture), /valid-code|already-consumed-code/);
   }
+  assert.ok(byId.has('rfc7636.pkce.missing-challenge'));
+  assert.ok(byId.has('rfc6749.authorization.reject-duplicate-parameter'));
+  assert.ok(byId.has('rfc6749.client-auth.reject-wrong-secret'));
+});
+
+const redirect = (location?: string) => ({ status: 302, headers: location === undefined ? {} : { Location: location }, body: {} });
+
+test('bindSource reads exactly one location.query value and rejects missing, empty or repeated ones', () => {
+  assert.equal(bindSource(redirect('https://c.example/cb?code=abc&state=x'), 'location.query.code'), 'abc');
+  assert.equal(bindSource(redirect('https://c.example/cb?code=a&code=b'), 'location.query.code'), undefined);
+  assert.equal(bindSource(redirect('https://c.example/cb?code='), 'location.query.code'), undefined);
+  assert.equal(bindSource(redirect('https://c.example/cb?state=x'), 'location.query.code'), undefined);
+  assert.equal(bindSource(redirect(), 'location.query.code'), undefined);
+  assert.equal(bindSource(redirect('https://c.example/cb?code=abc'), 'location.query.'), undefined);
+  assert.equal(bindSource({ status: 200, headers: {}, body: { code: 'body-code' } }, 'code'), 'body-code');
+});
+
+test('setup binds a redirect code per server and injects it into the next request', async () => {
+  const fixture = parseFixture({ ...base,
+    setup: [{ request: { method: 'GET', path: '/authorize' }, expect: { status: 302 }, bind: { code: 'location.query.code' } }],
+    request: { method: 'POST', path: '/token', body: { code: '{{code}}' } }, expect: { status: 200 },
+  });
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/authorize') return new Response(null, { status: 302, headers: { location: `https://c.example/cb?code=${url.host}-code` } });
+    assert.equal(new URLSearchParams(String(init?.body)).get('code'), `${url.host}-code`);
+    return Response.json({});
+  };
+  const result = await runFixture({ fixtureId: fixture.id, ...fixture.request, expect: fixture.expect, setup: fixture.setup, ...urls, fetchImpl });
+  assert.equal(result.match, true);
 });
 
 test('per-server setup obtains, exchanges, replays code and checks prior token revocation', async () => {

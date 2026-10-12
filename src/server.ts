@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
+import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 
 export interface Deps {
@@ -8,6 +9,7 @@ export interface Deps {
   clock: Clock;
   random: Random;
   issuer: string;
+  authenticate?: OAuthDeps['authenticate'] | undefined;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
@@ -41,6 +43,8 @@ export function buildServer(deps: Deps): FastifyInstance {
       return reply.status(503).send({ status: 'unavailable' });
     }
   });
+
+  registerOAuthRoutes(app, deps);
 
   return app;
 }
