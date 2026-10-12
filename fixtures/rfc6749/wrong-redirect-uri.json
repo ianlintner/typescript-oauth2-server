@@ -1,7 +1,25 @@
 {
   "id": "rfc6749.authorization-code.reject-wrong-redirect-uri",
-  "rfc": "RFC 6749 \u00a74.1.3",
-  "status": "deferred",
+  "rfc": "RFC 6749 §4.1.3",
+  "status": "planned",
+  "setup": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/oauth/authorize",
+        "query": {
+          "response_type": "code",
+          "client_id": "client-a",
+          "redirect_uri": "https://client.example/callback",
+          "code_challenge": "o_UBuWlNRvSWwsVYJqrs5EQo89Jn7Cm_gk-BDYsu17Y",
+          "code_challenge_method": "S256",
+          "state": "xyz"
+        }
+      },
+      "expect": { "status": 302 },
+      "bind": { "code": "location.query.code" }
+    }
+  ],
   "request": {
     "method": "POST",
     "path": "/oauth/token",
@@ -9,14 +27,12 @@
       "grant_type": "authorization_code",
       "code": "{{code}}",
       "client_id": "client-a",
-      "redirect_uri": "https://attacker.example/callback"
+      "redirect_uri": "https://attacker.example/callback",
+      "code_verifier": "conformance-verifier-0123456789-abcdefghijklmnopqrstuvwxyz"
     }
   },
   "expect": {
     "status": 400,
-    "claims": {
-      "error": "invalid_grant"
-    }
-  },
-  "note": "Requires live authorization setup and client registration to obtain a code with known PKCE and redirect properties; no executable endpoint setup exists yet."
+    "claims": { "error": "invalid_grant" }
+  }
 }

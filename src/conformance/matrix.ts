@@ -195,7 +195,7 @@ export const MATRIX: readonly ConformanceEntry[] = [
     tsReference: null,
     milestone: 'stage3',
     status: 'planned',
-    note: "Live code-replay fixtures stay deferred until real client setup exists.",
+    note: "Code-replay and PKCE fixtures run live against the conformance responder (src/conformance/serve.ts).",
   },
   {
     id: "get-oauth-logout",

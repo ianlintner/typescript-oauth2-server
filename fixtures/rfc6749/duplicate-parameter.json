@@ -1,0 +1,19 @@
+{
+  "id": "rfc6749.authorization.reject-duplicate-parameter",
+  "rfc": "RFC 6749 §3.1",
+  "status": "planned",
+  "request": {
+    "method": "GET",
+    "path": "/oauth/authorize?client_id=client-a&client_id=client-conf",
+    "query": {
+      "response_type": "code",
+      "redirect_uri": "https://client.example/callback",
+      "code_challenge": "o_UBuWlNRvSWwsVYJqrs5EQo89Jn7Cm_gk-BDYsu17Y",
+      "code_challenge_method": "S256"
+    }
+  },
+  "expect": {
+    "status": 400,
+    "claims": { "error": "invalid_request" }
+  }
+}

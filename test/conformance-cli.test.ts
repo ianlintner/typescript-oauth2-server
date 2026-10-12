@@ -104,3 +104,29 @@ test('CLI cannot claim success when every fixture is deferred', async () => {
   assert.match(result.stdout, /no executable fixtures/);
   assert.deepEqual(result.requests, [[], []]);
 });
+
+test('CLI runs the shipped stateful fixtures against two live conformance responders', async () => {
+  const { startConformanceServer } = await import('../src/conformance/serve.js');
+  const a = await startConformanceServer();
+  const b = await startConformanceServer();
+  try {
+    let stdout = '';
+    let exitCode = 0;
+    try {
+      ({ stdout } = await exec('pnpm', ['conformance', '--rust', a.address, '--ts', b.address], { cwd: process.cwd(), timeout: 60000 }));
+    } catch (error) {
+      const failure = error as Error & { code?: number; stdout?: string };
+      exitCode = failure.code ?? -1;
+      stdout = failure.stdout ?? '';
+    }
+    assert.equal(exitCode, 0, stdout);
+    for (const id of ['rfc9700.code-replay', 'rfc7636.pkce.wrong-verifier', 'rfc7636.pkce.missing-challenge',
+      'rfc6749.authorization-code.reject-wrong-redirect-uri', 'rfc6749.authorization.reject-duplicate-parameter',
+      'rfc6749.client-auth.reject-wrong-secret']) {
+      assert.match(stdout, new RegExp(`PASS ${id.replaceAll('.', '\\.')}`), stdout);
+    }
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});

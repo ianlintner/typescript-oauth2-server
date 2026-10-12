@@ -1,7 +1,25 @@
 {
   "id": "rfc7636.pkce.wrong-verifier",
-  "rfc": "RFC 7636 \u00a74.6",
-  "status": "deferred",
+  "rfc": "RFC 7636 §4.6",
+  "status": "planned",
+  "setup": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/oauth/authorize",
+        "query": {
+          "response_type": "code",
+          "client_id": "client-a",
+          "redirect_uri": "https://client.example/callback",
+          "code_challenge": "o_UBuWlNRvSWwsVYJqrs5EQo89Jn7Cm_gk-BDYsu17Y",
+          "code_challenge_method": "S256",
+          "state": "xyz"
+        }
+      },
+      "expect": { "status": 302 },
+      "bind": { "code": "location.query.code" }
+    }
+  ],
   "request": {
     "method": "POST",
     "path": "/oauth/token",
@@ -10,14 +28,11 @@
       "code": "{{code}}",
       "client_id": "client-a",
       "redirect_uri": "https://client.example/callback",
-      "code_verifier": "wrong-verifier-does-not-match-challenge"
+      "code_verifier": "wrong-verifier-0123456789-abcdefghijklmnopqrstuvwxyz-nomatch"
     }
   },
   "expect": {
     "status": 400,
-    "claims": {
-      "error": "invalid_grant"
-    }
-  },
-  "note": "Requires live authorization setup and client registration to obtain a code with known PKCE and redirect properties; no executable endpoint setup exists yet."
+    "claims": { "error": "invalid_grant" }
+  }
 }

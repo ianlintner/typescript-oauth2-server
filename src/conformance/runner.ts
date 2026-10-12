@@ -88,6 +88,29 @@ export function compareResponses(input: {
   return { fixtureId, match: diffs.length === 0, diffs };
 }
 
+const LOCATION_QUERY_PREFIX = 'location.query.';
+
+/**
+ * Resolve a bind source against a raw response: either a top-level string body
+ * claim, or `location.query.<name>` read from the redirect `Location` header.
+ * Returns undefined unless exactly one string value exists (a repeated or
+ * missing redirect parameter is never silently bound).
+ */
+export function bindSource(snapshot: ResponseSnapshot, source: string): string | undefined {
+  if (source.startsWith(LOCATION_QUERY_PREFIX)) {
+    const name = source.slice(LOCATION_QUERY_PREFIX.length);
+    const location = headers(snapshot.headers).location;
+    if (name === '' || location === undefined) return undefined;
+    let url: URL;
+    try { url = new URL(location, 'http://redirect.invalid'); } catch { return undefined; }
+    const values = url.searchParams.getAll(name);
+    return values.length === 1 && values[0] !== '' ? values[0] : undefined;
+  }
+  const body = claims(snapshot.body);
+  const value = body[source];
+  return Object.hasOwn(body, source) && typeof value === 'string' ? value : undefined;
+}
+
 /** Bind raw string claims independently per server. Never bind normalized tokens. */
 export async function runFixture(input: FixtureRequest & {
   fixtureId: string;
@@ -138,9 +161,8 @@ export async function runFixture(input: FixtureRequest & {
     }
     for (const [name, claim] of Object.entries(step.bind ?? {})) {
       for (const [i, snapshot] of snapshots.entries()) {
-        const body = claims(snapshot.body);
-        const value = body[claim];
-        if (!Object.hasOwn(body, claim) || typeof value !== 'string') throw new Error(`setup[${index}] binding ${name}: ${claim} must be a string claim for ${bases[i]}`);
+        const value = bindSource(snapshot, claim);
+        if (value === undefined) throw new Error(`setup[${index}] binding ${name}: ${claim} must be a string claim or single location.query value for ${bases[i]}`);
         variables[i]!.set(name, value);
       }
     }
