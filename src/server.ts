@@ -10,6 +10,8 @@ export interface Deps {
   random: Random;
   issuer: string;
   authenticate?: OAuthDeps['authenticate'] | undefined;
+  loginPath?: string | undefined;
+  consent?: OAuthDeps['consent'] | undefined;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {

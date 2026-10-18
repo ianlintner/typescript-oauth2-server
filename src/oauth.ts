@@ -19,6 +19,18 @@ export interface OAuthDeps {
    * returns null the request fails closed with access_denied.
    */
   authenticate?: ((req: FastifyRequest) => Promise<string | null>) | undefined;
+  /**
+   * Conformance/test mode only. When set, an unauthenticated authorize request
+   * is redirected (302) to this same-origin path instead of failing with
+   * access_denied. Never set in normal operation.
+   */
+  loginPath?: string | undefined;
+  /**
+   * Conformance/test mode only. When set, consent is granted only if this
+   * returns true for (subject, clientId); otherwise the request fails closed
+   * with access_denied (no consent UI exists). Absent means no extra check.
+   */
+  consent?: ((subject: string, clientId: string) => boolean) | undefined;
 }
 
 // RFC 7636 §4.1/§4.2: verifier 43-128 unreserved chars; S256 challenge is 43 base64url chars.
@@ -93,7 +105,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (requested.some((s) => !client.scopes.includes(s))) return fail('invalid_scope');
 
     const subject = deps.authenticate ? await deps.authenticate(req) : null;
-    if (!subject) return fail('access_denied');
+    if (!subject) {
+      if (deps.loginPath !== undefined) return reply.status(302).header('location', deps.loginPath).send();
+      return fail('access_denied');
+    }
+    if (deps.consent && !deps.consent(subject, client.clientId)) return fail('access_denied');
 
     const code = deps.random.token(32);
     await deps.store.saveAuthorizationCode({
