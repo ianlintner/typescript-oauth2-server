@@ -16,6 +16,7 @@ export interface SeedUser {
   username: string;
   password: string;
   autoApproveClients: string[];
+  email?: string | undefined;
 }
 export interface SeedSigningKey {
   kid: string;
@@ -182,7 +183,7 @@ export function parseSeed(text: string): Seed {
     }
     if (usernames.has(username)) fail(`seed: duplicate username ${JSON.stringify(username)}`);
     usernames.add(username);
-    return { username, password, autoApproveClients };
+    return { username, password, autoApproveClients, email };
   });
 
   const signingKeys: SeedSigningKey[] = [];

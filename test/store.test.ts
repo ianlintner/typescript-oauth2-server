@@ -24,6 +24,7 @@ const code = {
   expiresAt: 2000,
   consumedAt: null,
   nonce: null,
+  authTime: null,
 };
 
 async function withStore(fn: (s: Store) => Promise<void>) {

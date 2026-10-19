@@ -38,6 +38,8 @@ export interface AuthorizationCodeRecord {
   consumedAt: number | null;
   /** OIDC nonce, set from the authorize request. */
   nonce: string | null;
+  /** Epoch seconds the end-user authenticated, recorded when max_age was requested (OIDC auth_time). */
+  authTime: number | null;
 }
 
 export interface AccessTokenRecord {

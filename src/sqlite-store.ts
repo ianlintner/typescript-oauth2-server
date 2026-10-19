@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
   code_challenge TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   consumed_at INTEGER,
-  nonce TEXT
+  nonce TEXT,
+  auth_time INTEGER
 );
 CREATE TABLE IF NOT EXISTS access_tokens (
   jti TEXT PRIMARY KEY,
@@ -62,6 +63,7 @@ interface CodeRow {
   expires_at: number;
   consumed_at: number | null;
   nonce: string | null;
+  auth_time: number | null;
 }
 
 interface AccessTokenRow {
@@ -144,9 +146,9 @@ const ops = {
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
     db.prepare(
-      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt, c.nonce ?? null);
+      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce, auth_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt, c.nonce ?? null, c.authTime ?? null);
   },
 
   // Single conditional UPDATE ... RETURNING: the database decides the winner of a race.
@@ -169,6 +171,7 @@ const ops = {
       expiresAt: r.expires_at,
       consumedAt: r.consumed_at,
       nonce: r.nonce,
+      authTime: r.auth_time,
     };
   },
 

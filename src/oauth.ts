@@ -8,6 +8,7 @@ export const CODE_TTL_SECONDS = 60;
 export const ACCESS_TOKEN_TTL_SECONDS = 3600;
 /** Unset unless the caller passes a value. */
 const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 86_400; // 24h default
+const REAUTH_GRACE_SECONDS = 5;
 
 export interface OAuthDeps {
   store: Store;
@@ -34,6 +35,27 @@ export interface OAuthDeps {
    * with access_denied (no consent UI exists). Absent means no extra check.
    */
   consent?: ((subject: string, clientId: string) => boolean) | undefined;
+  /** Epoch seconds at which the request's session authenticated; null when unknown. Feeds auth_time / max_age. */
+  authTime?: ((req: FastifyRequest) => number | null) | undefined;
+  /** End-user claims for a subject (OIDC Core 5.1). Absent or null means only `sub` is disclosed. */
+  userClaims?: ((subject: string) => UserClaims | null) | undefined;
+  /** Terminates the request's session (RP-initiated logout). */
+  endSession?: ((req: FastifyRequest, reply: FastifyReply) => void) | undefined;
+}
+
+export interface UserClaims {
+  email?: string | undefined;
+  preferred_username?: string | undefined;
+}
+
+/** OIDC Core 5.4 scope-to-claim mapping: only claims authorized by the granted scopes are released. */
+export function claimsForScope(scope: string, user: UserClaims | null): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!user) return out;
+  const scopes = scope.split(' ');
+  if (scopes.includes('email') && user.email !== undefined) out.email = user.email;
+  if (scopes.includes('profile') && user.preferred_username !== undefined) out.preferred_username = user.preferred_username;
+  return out;
 }
 
 // RFC 7636 §4.1/§4.2: verifier 43-128 unreserved chars; S256 challenge is 43 base64url chars.
@@ -146,8 +168,23 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const requested = (single(params, 'scope') ?? '').split(' ').filter((s) => s !== '');
     if (requested.some((s) => !client.scopes.includes(s))) return fail('invalid_scope');
 
-    const subject = deps.authenticate ? await deps.authenticate(req) : null;
+    const prompt = (single(params, 'prompt') ?? '').split(' ').filter((p) => p !== '');
+    if (prompt.includes('none') && prompt.length > 1) return fail('invalid_request');
+    const maxAgeRaw = single(params, 'max_age');
+    if (maxAgeRaw !== undefined && !/^\d+$/.test(maxAgeRaw)) return fail('invalid_request');
+    const maxAge = maxAgeRaw === undefined ? null : Number(maxAgeRaw);
+
+    let subject = deps.authenticate ? await deps.authenticate(req) : null;
+    const authTime = subject && deps.authTime ? deps.authTime(req) : null;
+    // OIDC Core 3.1.2.1: prompt=login or a session older than max_age (or of unknown age) must re-authenticate.
+    // A login completed within REAUTH_GRACE_SECONDS counts as fresh so the post-login redirect does not loop.
+    const age = authTime === null ? null : deps.clock.now() - authTime;
+    const needsFresh = prompt.includes('login') || maxAge !== null;
+    const limit = (prompt.includes('login') ? 0 : maxAge ?? 0) + (needsFresh ? REAUTH_GRACE_SECONDS : 0);
+    if (subject && needsFresh && (age === null || age > limit)) subject = null;
     if (!subject) {
+      // prompt=none forbids any interactive login (OIDC Core 3.1.2.1).
+      if (prompt.includes('none')) return fail('login_required');
       if (deps.loginPath !== undefined) return reply.status(302).header('location', deps.loginPath).send();
       return fail('access_denied');
     }
@@ -165,6 +202,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       expiresAt: deps.clock.now() + CODE_TTL_SECONDS,
       consumedAt: null,
       nonce,
+      // auth_time is claimed when max_age was requested (OIDC Core 2).
+      authTime: maxAge !== null ? authTime : null,
     });
     return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
   });
@@ -245,6 +284,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           jti: deps.random.token(16),
         };
         if (record.nonce) idClaims.nonce = record.nonce;
+        if (record.authTime !== null) idClaims.auth_time = record.authTime;
         body.id_token = await deps.signer.sign(idClaims);
       }
 
@@ -526,16 +566,37 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     // Verify token is still alive in store (not revoked)
     const jti = payload.jti as string | undefined;
-    if (jti) {
-      const stored = await deps.store.getAccessToken(jti, deps.clock.now());
-      if (!stored) {
-        return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
-      }
-    } else {
+    const stored = jti ? await deps.store.getAccessToken(jti, deps.clock.now()) : null;
+    // A client_credentials token represents an application, not an end-user (sub === client_id).
+    if (!stored || payload.sub === payload.client_id) {
       return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
     }
+    const claims = claimsForScope(stored.scope, deps.userClaims?.(stored.subject) ?? null);
+    return reply.header('content-type', 'application/json').send({ ...claims, sub: payload.sub });
+  });
 
-    return reply.header('content-type', 'application/json').send({ sub: payload.sub });
+  // -- RP-initiated logout (OIDC RP-Initiated Logout 1.0 §2) --
+  app.get('/oauth/logout', async (req, reply) => {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    rejectDuplicates(params);
+    const hint = single(params, 'id_token_hint');
+    if (hint !== undefined) {
+      // The hint must be our own ID token (signature, issuer) addressed to a registered client.
+      // Expiry is ignored: RPs commonly present an expired hint.
+      let aud: unknown;
+      try {
+        const payload = await verifyOwnJwt(deps, hint, true);
+        aud = payload.aud;
+      } catch {
+        throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+      }
+      const audiences = Array.isArray(aud) ? aud : [aud];
+      let registered = false;
+      for (const a of audiences) if (typeof a === 'string' && (await deps.store.getClient(a))) registered = true;
+      if (!registered) throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
+    }
+    deps.endSession?.(req, reply);
+    return reply.status(200).header('content-type', 'text/plain; charset=utf-8').send('logged out');
   });
 }
 
@@ -558,4 +619,16 @@ async function verifyAccessJwt(deps: OAuthDeps, token: string): Promise<Record<s
   } catch {
     return null;
   }
+}
+/** Verify a JWT this server signed (signature and issuer). `ignoreExpiry` is for id_token_hint only. */
+async function verifyOwnJwt(deps: OAuthDeps, token: string, ignoreExpiry: boolean): Promise<Record<string, unknown>> {
+  const jwks = await deps.signer.publicJwks();
+  const { jwtVerify, importJWK } = await import('jose');
+  const key = await importJWK(jwks.keys[0] as unknown as import('jose').JWK, 'ES256');
+  const result = await jwtVerify(token, key, {
+    issuer: deps.issuer,
+    algorithms: ['ES256'],
+    currentDate: ignoreExpiry ? new Date(0) : new Date(deps.clock.now() * 1000),
+  });
+  return result.payload as Record<string, unknown>;
 }

@@ -64,3 +64,8 @@ jobs:
         run: |
           CONFORMANCE_PROFILE=token-lifecycle scripts/conformance-run.sh build/conformance-report-token-lifecycle.json .contract
           node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-token-lifecycle.json
+
+      - name: Run the oidc-basic profile against the TypeScript server
+        run: |
+          CONFORMANCE_PROFILE=oidc-basic scripts/conformance-run.sh build/conformance-report-oidc-basic.json .contract
+          node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-oidc-basic.json

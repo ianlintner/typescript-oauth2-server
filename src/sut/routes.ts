@@ -1,5 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { Clock } from '../ports.js';
+import type { UserClaims } from '../oauth.js';
 import type { SeedUser } from './seed.js';
 
 /** Process-local test-login session registry for conformance mode only. */
@@ -8,6 +10,12 @@ export interface TestLoginRegistry {
   login(username: string, password: string): string | null;
   /** Look up the username bound to a session id, or null. */
   usernameFor(sessionId: string | null): string | null;
+  /** Epoch seconds the session logged in, or null. */
+  authTimeFor(sessionId: string | null): number | null;
+  /** Drop a session (logout). */
+  end(sessionId: string | null): void;
+  /** Seeded profile claims for a username, or null. */
+  claimsFor(username: string): UserClaims | null;
 }
 
 export const SESSION_COOKIE = 'oauth2_test_session';
@@ -42,21 +50,34 @@ export function sessionFrom(request: FastifyRequest): string | null {
  * is never constructed off conformance mode), so seeded passwords are dead in
  * normal operation.
  */
-export function createTestRegistry(users: SeedUser[]): TestLoginRegistry {
+export function createTestRegistry(users: SeedUser[], clock: Clock): TestLoginRegistry {
   const byName = new Map<string, string>();
-  const sessions = new Map<string, string>();
-  for (const user of users) byName.set(user.username, user.password);
+  const profiles = new Map<string, UserClaims>();
+  const sessions = new Map<string, { username: string; at: number }>();
+  for (const user of users) {
+    byName.set(user.username, user.password);
+    profiles.set(user.username, { preferred_username: user.username, ...(user.email !== undefined ? { email: user.email } : {}) });
+  }
 
   return {
     login(username, password) {
       const expected = byName.get(username);
       if (expected === undefined || !secureEqual(expected, password)) return null;
       const sessionId = randomBytes(32).toString('base64url');
-      sessions.set(sessionId, username);
+      sessions.set(sessionId, { username, at: clock.now() });
       return sessionId;
     },
     usernameFor(sessionId) {
-      return sessionId === null ? null : sessions.get(sessionId) ?? null;
+      return sessionId === null ? null : sessions.get(sessionId)?.username ?? null;
+    },
+    authTimeFor(sessionId) {
+      return sessionId === null ? null : sessions.get(sessionId)?.at ?? null;
+    },
+    end(sessionId) {
+      if (sessionId !== null) sessions.delete(sessionId);
+    },
+    claimsFor(username) {
+      return profiles.get(username) ?? null;
     },
   };
 }
@@ -64,6 +85,17 @@ export function createTestRegistry(users: SeedUser[]): TestLoginRegistry {
 /** Resolve an authorized subject for the authorize endpoint from the session cookie. */
 export function makeTestAuthenticate(registry: TestLoginRegistry) {
   return async (req: FastifyRequest): Promise<string | null> => registry.usernameFor(sessionFrom(req));
+}
+
+export function makeTestAuthTime(registry: TestLoginRegistry) {
+  return (req: FastifyRequest): number | null => registry.authTimeFor(sessionFrom(req));
+}
+
+export function makeTestEndSession(registry: TestLoginRegistry) {
+  return (req: FastifyRequest, reply: FastifyReply): void => {
+    registry.end(sessionFrom(req));
+    reply.header('set-cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  };
 }
 
 /** Consent check: grant only if the subject's seed lists this client for auto-approval. */
