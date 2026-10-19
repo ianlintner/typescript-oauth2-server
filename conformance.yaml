@@ -26,7 +26,3 @@ deviations:
     reason: loopback port wildcard for IPv6 redirect URIs is not implemented
   - requirement: RFC7636-4.3-missing-verifier
     reason: a code exchange omitting the PKCE verifier reports invalid_request, not invalid_grant
-  - requirement: RFC6749-5.2-invalid-client
-    reason: client-authentication failure at /oauth/token returns 400, not 401 invalid_client
-  - requirement: RFC6749-5.1-no-store
-    reason: the client_credentials grant is not implemented, so the no-store success path is absent
