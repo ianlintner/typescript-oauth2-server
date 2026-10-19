@@ -144,6 +144,19 @@ test('consuming a refresh token that has a consumed sibling in the same family r
     assert.equal(await s.consumeRefreshToken('rt-002', 1000), null);
   }));
 
+test('two consecutive legitimate rotations do not trip sibling replay detection', () =>
+  withStore(async (s) => {
+    await s.saveRefreshToken(rt);
+    // Rotation 1: consume rt-001, issue rt-002
+    assert.ok(await s.consumeRefreshToken('rt-001', 1000));
+    await s.saveRefreshToken({ ...rt, jti: 'rt-002', parentJti: 'rt-001' });
+    // Rotation 2: consume rt-002, issue rt-003 (must succeed — not replay)
+    assert.ok(await s.consumeRefreshToken('rt-002', 1000));
+    await s.saveRefreshToken({ ...rt, jti: 'rt-003', parentJti: 'rt-002' });
+    // Rotation 3: consume rt-003 (must succeed)
+    assert.ok(await s.consumeRefreshToken('rt-003', 1000));
+  }));
+
 test('data persists across process restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'oauth2-token-store-'));
   const path = join(dir, 'db.sqlite');
