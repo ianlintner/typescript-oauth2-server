@@ -57,6 +57,9 @@ function validateManifest(manifest) {
     if (typeof reason !== 'string' || reason.length < 10) {
       throw new GateError(`deviation ${requirement}: reason must be at least 10 characters`);
     }
+    if (deviation.profile !== undefined && !profiles.includes(deviation.profile)) {
+      throw new GateError(`deviation ${requirement}: profile ${JSON.stringify(deviation.profile)} is not a claimed profile`);
+    }
   }
 }
 
@@ -73,7 +76,11 @@ function evaluate(manifest, report) {
   }
 
   const results = report.results ?? [];
-  const declared = new Set((manifest.deviations ?? []).map((d) => d.requirement));
+  // A deviation may be scoped to one profile (`profile: core`); it then only
+  // excuses failures, and is only ratcheted, in that profile's report. An
+  // unscoped deviation applies to every profile.
+  const applicable = (manifest.deviations ?? []).filter((d) => d.profile === undefined || d.profile === report.profile);
+  const declared = new Set(applicable.map((d) => d.requirement));
   const failingRequirements = new Set();
 
   for (const result of results) {

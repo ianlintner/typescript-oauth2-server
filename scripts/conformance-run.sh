@@ -2,7 +2,7 @@
 # Start the TypeScript SUT in conformance mode and run the pinned shared
 # conformance runner against it, writing a JSON report. The runner's own
 # verdict is intentionally all-or-nothing and ignored at this layer: this
-# repository claims the `core` profile with an explicit `deviations` list, and
+# repository claims the `core` and `token-lifecycle` profiles with an explicit `deviations` list, and
 # CI gates the report with scripts/check-conformance-report.mjs (an undeclared
 # stable failure is a regression; a deviation that stops failing must go).
 #
@@ -72,7 +72,7 @@ base_url="http://127.0.0.1:$port"
 # Runner's exit code is deliberately ignored; the gate reads the report.
 set +e
 pnpm --dir "$contract_dir/runner" exec tsx src/cli.ts run \
-  --base-url "$base_url" --scenarios "$contract_dir/scenarios" --profile core \
+  --base-url "$base_url" --scenarios "$contract_dir/scenarios" --profile "${CONFORMANCE_PROFILE:-core}" \
   --contract "$pin" \
   --implementation "$(sed -n 's/^implementation:[[:space:]]*//p' conformance.yaml)" \
   --report "$report"

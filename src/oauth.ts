@@ -404,26 +404,26 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const hint = single(form, 'token_type_hint');
     const now = deps.clock.now();
 
-    // Try access-token (JWT decode) first when hint doesn't say refresh_token.
-    const triedAccess = hint !== 'refresh_token';
-    if (triedAccess) {
+    // RFC 7009 §2.1: the hint is only an optimisation; if the token is not of
+    // the hinted type the server MUST extend its search across all types.
+    const revokeAccess = async (): Promise<boolean> => {
       const decoded = decodeJwtSafe(token);
-      if (decoded?.jti) {
-        const stored = await deps.store.getAccessToken(String(decoded.jti), now);
-        if (stored && stored.clientId === client.clientId) {
-          await deps.store.revokeAccessToken(String(decoded.jti), now);
-          return reply.status(200).send();
-        }
-      }
-    }
-
-    // Try refresh token.
-    const triedRefresh = hint !== 'access_token';
-    if (triedRefresh) {
+      if (!decoded?.jti) return false;
+      const stored = await deps.store.getAccessToken(String(decoded.jti), now);
+      if (!stored || stored.clientId !== client.clientId) return false;
+      await deps.store.revokeAccessToken(String(decoded.jti), now);
+      return true;
+    };
+    const revokeRefresh = async (): Promise<boolean> => {
       const rt = await deps.store.getRefreshToken(token, now);
-      if (rt && rt.clientId === client.clientId) {
-        await deps.store.revokeRefreshToken(token, now);
-      }
+      if (!rt || rt.clientId !== client.clientId) return false;
+      await deps.store.revokeRefreshToken(token, now);
+      return true;
+    };
+    if (hint === 'refresh_token') {
+      if (!(await revokeRefresh())) await revokeAccess();
+    } else if (!(await revokeAccess())) {
+      await revokeRefresh();
     }
 
     return reply.status(200).send();
@@ -467,6 +467,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
             client_id: stored.clientId,
             token_type: 'Bearer',
             exp: stored.expiresAt,
+            iat: typeof decoded.iat === 'number' ? decoded.iat : undefined,
+            jti: stored.jti,
             sub: stored.subject,
           };
         }

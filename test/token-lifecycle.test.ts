@@ -543,3 +543,46 @@ test('revoked access token stays revoked after store restart', async () => {
     (await import('node:fs')).rmSync(dir, { recursive: true, force: true });
   }
 });
+// -- v0.2 contract regressions (token-lifecycle.introspection.active-token / revocation.hint-mismatch) --
+
+test('introspection of an active access token includes jti and iat (RFC 7662 §2.2)', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' },
+    { client_id: 'conf', client_secret: SECRET });
+  const at = first.json().access_token;
+  const claims = decodeJwt(at);
+
+  const res = await introspect(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  const body = res.json();
+  assert.equal(body.jti, claims.jti);
+  assert.ok(typeof body.jti === 'string' && body.jti.length > 0);
+  assert.equal(body.iat, claims.iat);
+  assert.equal(typeof body.exp, 'number');
+  await done(s);
+});
+
+test('revoking a refresh token with a wrong access_token hint still revokes it (RFC 7009 §2.1)', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' },
+    { client_id: 'conf', client_secret: SECRET });
+  const rt = first.json().refresh_token;
+  assert.ok(rt);
+
+  const res = await revoke(s.server, rt, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  assert.equal(res.statusCode, 200);
+  const redeem = await token(s.server, { grant_type: 'refresh_token', refresh_token: rt, client_id: 'conf', client_secret: SECRET });
+  assert.equal(redeem.statusCode, 400);
+  assert.equal(redeem.json().error, 'invalid_grant');
+  await done(s);
+});
+
+test('revoking an access token with a wrong refresh_token hint still revokes it', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' },
+    { client_id: 'conf', client_secret: SECRET });
+  const at = first.json().access_token;
+  await revoke(s.server, at, 'refresh_token', { client_id: 'conf', client_secret: SECRET });
+  const res = await introspect(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  assert.equal(res.json().active, false);
+  await done(s);
+});
