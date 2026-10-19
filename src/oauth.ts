@@ -394,31 +394,35 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (!token) {
       return reply.status(200).send(); // RFC 7009 §2.2: 200 even for missing token
     }
-    const hint = single(form, 'token_type_hint');
 
-    let client: ClientRecord | null = null;
-    try {
-      client = await authenticateClient(deps, req, form);
-    } catch {
-      // Proceed without client auth — token may still be revocable by value alone
+    // Require client authentication (RFC 7009 §2.1).
+    const client = await authenticateClient(deps, req, form).catch(() => null);
+    if (!client) {
+      throw new OAuthError('invalid_client', 'revocation requires client authentication');
     }
 
+    const hint = single(form, 'token_type_hint');
     const now = deps.clock.now();
-    if (hint === 'refresh_token' || (!hint && token.length > 80)) {
-      // Try refresh token
-      const ok = client
-        ? await deps.store.revokeRefreshToken(token, now)
-        : false;
-      // Find by jti and check client match
-      if (!ok && client) {
-        // The store interface revokes by jti — but the opaque refresh value IS the jti
-        await deps.store.revokeRefreshToken(token, now);
-      }
-    } else {
-      // Access token: we have to decode the JWT to get jti
+
+    // Try access-token (JWT decode) first when hint doesn't say refresh_token.
+    const triedAccess = hint !== 'refresh_token';
+    if (triedAccess) {
       const decoded = decodeJwtSafe(token);
       if (decoded?.jti) {
-        await deps.store.revokeAccessToken(String(decoded.jti), now);
+        const stored = await deps.store.getAccessToken(String(decoded.jti), now);
+        if (stored && stored.clientId === client.clientId) {
+          await deps.store.revokeAccessToken(String(decoded.jti), now);
+          return reply.status(200).send();
+        }
+      }
+    }
+
+    // Try refresh token.
+    const triedRefresh = hint !== 'access_token';
+    if (triedRefresh) {
+      const rt = await deps.store.getRefreshToken(token, now);
+      if (rt && rt.clientId === client.clientId) {
+        await deps.store.revokeRefreshToken(token, now);
       }
     }
 
@@ -448,30 +452,29 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     const inactive = { active: false };
 
-    if (hint === 'refresh_token' || (!hint && token.length > 80)) {
-      // Refresh token introspection not supported — return inactive per RFC 7662
-      return inactive;
+    // Try access token (JWT) when hint is not explicitly refresh_token.
+    if (hint !== 'refresh_token') {
+      const decoded = decodeJwtSafe(token);
+      if (decoded && decoded.jti) {
+        const stored = await deps.store.getAccessToken(String(decoded.jti), now);
+        if (stored) {
+          // Cross-client protection: only return details to the owning client.
+          if (stored.clientId !== client.clientId && decoded.aud !== client.clientId) return inactive;
+
+          return {
+            active: true,
+            scope: stored.scope || undefined,
+            client_id: stored.clientId,
+            token_type: 'Bearer',
+            exp: stored.expiresAt,
+            sub: stored.subject,
+          };
+        }
+      }
     }
 
-    // Decode JWT
-    const decoded = decodeJwtSafe(token);
-    if (!decoded || !decoded.jti) return inactive;
-
-    const stored = await deps.store.getAccessToken(String(decoded.jti), now);
-    if (!stored) return inactive;
-
-    // Cross-client protection: only return details if the caller is the token's audience
-    // or the token's client
-    if (stored.clientId !== client.clientId && decoded.aud !== client.clientId) return inactive;
-
-    return {
-      active: true,
-      scope: stored.scope || undefined,
-      client_id: stored.clientId,
-      token_type: 'Bearer',
-      exp: stored.expiresAt,
-      sub: stored.subject,
-    };
+    // Refresh tokens: not introspectable per RFC 7662 §2.2.
+    return inactive;
   });
 
   // -- JWKS --
@@ -481,22 +484,29 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- Discovery --
+  const serverMetadata = {
+    issuer: deps.issuer,
+    authorization_endpoint: `${deps.issuer}/oauth/authorize`,
+    token_endpoint: `${deps.issuer}/oauth/token`,
+    jwks_uri: `${deps.issuer}/.well-known/jwks.json`,
+    userinfo_endpoint: `${deps.issuer}/oauth/userinfo`,
+    revocation_endpoint: `${deps.issuer}/oauth/revoke`,
+    introspection_endpoint: `${deps.issuer}/oauth/introspect`,
+    scopes_supported: ['openid', 'profile', 'email'],
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+    code_challenge_methods_supported: ['S256'],
+    subject_types_supported: ['public'],
+    id_token_signing_alg_values_supported: ['ES256'],
+  } as const;
+
+  app.get('/.well-known/oauth-authorization-server', async (_req, reply) => {
+    return reply.header('content-type', 'application/json').send(serverMetadata);
+  });
+
   app.get('/.well-known/openid-configuration', async (_req, reply) => {
-    return reply.header('content-type', 'application/json').send({
-      issuer: deps.issuer,
-      authorization_endpoint: `${deps.issuer}/oauth/authorize`,
-      token_endpoint: `${deps.issuer}/oauth/token`,
-      jwks_uri: `${deps.issuer}/.well-known/jwks.json`,
-      userinfo_endpoint: `${deps.issuer}/oauth/userinfo`,
-      revocation_endpoint: `${deps.issuer}/oauth/revoke`,
-      introspection_endpoint: `${deps.issuer}/oauth/introspect`,
-      scopes_supported: ['openid', 'profile', 'email'],
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
-      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
-      subject_types_supported: ['public'],
-      id_token_signing_alg_values_supported: ['ES256'],
-    });
+    return reply.header('content-type', 'application/json').send(serverMetadata);
   });
 
   // -- UserInfo --

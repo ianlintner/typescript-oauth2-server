@@ -320,10 +320,10 @@ function revoke(server: FastifyInstance, token: string, tokenTypeHint: string, a
   });
 }
 
-test('revocation returns 200 for any token', async () => {
+test('revocation without client authentication returns 401', async () => {
   const s = await setup();
   const res = await revoke(s.server, 'anything', 'access_token', {});
-  assert.equal(res.statusCode, 200);
+  assert.equal(res.statusCode, 401);
   await done(s);
 });
 
@@ -336,7 +336,7 @@ test('revocation of an access token makes it unusable', async () => {
   const decoded = decodeJwt(at);
   const jti = decoded.jti as string;
 
-  await revoke(s.server, at, 'access_token', {});
+  await revoke(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
   const stored = await s.store.getAccessToken(jti, 1_000_000);
   assert.equal(stored, null);
   await done(s);
