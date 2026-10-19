@@ -70,7 +70,7 @@ test('unexpected handler error is opaque server_error and does not leak', async 
 
 test('server does not advertise framework identity or implement unported endpoints yet', async () => {
   const { server, store } = await app();
-  const res = await server.inject({ method: 'POST', url: '/oauth/introspect', payload: 'token=x' });
+  const res = await server.inject({ method: 'POST', url: '/unregistered' });
   assert.equal(res.statusCode, 404);
   assert.equal(res.headers['x-powered-by'], undefined);
   await server.close();

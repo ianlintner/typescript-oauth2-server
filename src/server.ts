@@ -12,6 +12,7 @@ export interface Deps {
   authenticate?: OAuthDeps['authenticate'] | undefined;
   loginPath?: string | undefined;
   consent?: OAuthDeps['consent'] | undefined;
+  refreshTokenTtl?: number | undefined;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {

@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { AuthorizationCodeRecord, ClientRecord, Store } from './ports.js';
+import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, RefreshTokenRecord, Store } from './ports.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS clients (
@@ -18,7 +18,29 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
   scope TEXT NOT NULL,
   code_challenge TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
-  consumed_at INTEGER
+  consumed_at INTEGER,
+  nonce TEXT
+);
+CREATE TABLE IF NOT EXISTS access_tokens (
+  jti TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  token_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  jti TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  family TEXT NOT NULL,
+  parent_jti TEXT,
+  consumed_at INTEGER,
+  revoked_at INTEGER,
+  revoked_by_replay_at INTEGER
 );`;
 
 interface ClientRow {
@@ -39,6 +61,56 @@ interface CodeRow {
   code_challenge: string;
   expires_at: number;
   consumed_at: number | null;
+  nonce: string | null;
+}
+
+interface AccessTokenRow {
+  jti: string;
+  client_id: string;
+  subject: string;
+  scope: string;
+  expires_at: number;
+  revoked_at: number | null;
+  token_hash: string | null;
+}
+
+interface RefreshTokenRow {
+  jti: string;
+  client_id: string;
+  subject: string;
+  scope: string;
+  expires_at: number;
+  family: string;
+  parent_jti: string | null;
+  consumed_at: number | null;
+  revoked_at: number | null;
+  revoked_by_replay_at: number | null;
+}
+
+function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
+  return {
+    jti: r.jti,
+    clientId: r.client_id,
+    subject: r.subject,
+    scope: r.scope,
+    expiresAt: r.expires_at,
+    revokedAt: r.revoked_at,
+    tokenHash: r.token_hash,
+  };
+}
+
+function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
+  return {
+    jti: r.jti,
+    clientId: r.client_id,
+    subject: r.subject,
+    scope: r.scope,
+    expiresAt: r.expires_at,
+    family: r.family,
+    parentJti: r.parent_jti,
+    revokedByReplayAt: r.revoked_by_replay_at,
+    revokedAt: r.revoked_at,
+  };
 }
 
 /** Statement-level operations on one connection. Stateless apart from the db it is handed. */
@@ -72,9 +144,9 @@ const ops = {
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
     db.prepare(
-      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt);
+      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt, c.nonce ?? null);
   },
 
   // Single conditional UPDATE ... RETURNING: the database decides the winner of a race.
@@ -96,7 +168,114 @@ const ops = {
       codeChallenge: r.code_challenge,
       expiresAt: r.expires_at,
       consumedAt: r.consumed_at,
+      nonce: r.nonce,
     };
+  },
+
+  // -- access tokens --
+
+  saveAccessToken(db: DatabaseSync, t: AccessTokenRecord): void {
+    db.prepare(
+      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash);
+  },
+
+  getAccessToken(db: DatabaseSync, jti: string, now: number): AccessTokenRecord | null {
+    const r = db.prepare(
+      'SELECT * FROM access_tokens WHERE jti = ? AND revoked_at IS NULL AND expires_at > ?',
+    ).get(jti, now) as unknown as AccessTokenRow | undefined;
+    return r ? rowToAccessToken(r) : null;
+  },
+
+  revokeAccessToken(db: DatabaseSync, jti: string, now: number): boolean {
+    const res = db.prepare(
+      'UPDATE access_tokens SET revoked_at = ? WHERE jti = ?',
+    ).run(now, jti);
+    return res.changes > 0;
+  },
+
+  // -- refresh tokens --
+
+  saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
+    db.prepare(
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt);
+  },
+
+  consumeRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
+    // First, check if this token exists and its state (without marking).
+    const existing = db.prepare(
+      'SELECT * FROM refresh_tokens WHERE jti = ?',
+    ).get(jti) as unknown as RefreshTokenRow | undefined;
+
+    if (!existing) return null;
+
+    // If expired or revoked, not consumable.
+    if (existing.expires_at <= now || existing.revoked_at !== null || existing.revoked_by_replay_at !== null) {
+      return null;
+    }
+
+    // If already consumed, this is a replay. Revoke the family.
+    if (existing.consumed_at !== null) {
+      db.prepare(
+        `UPDATE refresh_tokens SET revoked_by_replay_at = ?
+         WHERE family = ? AND revoked_by_replay_at IS NULL AND revoked_at IS NULL`,
+      ).run(now, existing.family);
+      return null;
+    }
+
+    // Mark consumed.
+    const r = db.prepare(
+      `UPDATE refresh_tokens SET consumed_at = ?
+       WHERE jti = ? AND consumed_at IS NULL AND revoked_at IS NULL AND revoked_by_replay_at IS NULL AND expires_at > ?
+       RETURNING *`,
+    ).get(now, jti, now) as unknown as RefreshTokenRow | undefined;
+    if (!r) return null;
+
+    // Check for sibling replay: if any other token in the same family was already consumed,
+    // this is also a replay attack (the previous bearer already rotated).
+    const sibling = db.prepare(
+      `SELECT jti FROM refresh_tokens
+       WHERE family = ? AND jti != ? AND consumed_at IS NOT NULL
+         AND revoked_at IS NULL AND revoked_by_replay_at IS NULL
+       LIMIT 1`,
+    ).get(r.family, r.jti) as { jti: string } | undefined;
+
+    if (sibling) {
+      // Replay attack: revoke the entire family.
+      db.prepare(
+        `UPDATE refresh_tokens SET revoked_by_replay_at = ?
+         WHERE family = ? AND revoked_by_replay_at IS NULL AND revoked_at IS NULL`,
+      ).run(now, r.family);
+    }
+
+    return rowToRefreshToken(r);
+  },
+
+  getRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
+    const row = db.prepare(
+      'SELECT * FROM refresh_tokens WHERE jti = ?',
+    ).get(jti) as unknown as RefreshTokenRow | undefined;
+    if (!row) return null;
+    if (row.expires_at <= now || row.revoked_at !== null || row.revoked_by_replay_at !== null) return null;
+    return rowToRefreshToken(row);
+  },
+
+  revokeRefreshToken(db: DatabaseSync, jti: string, now: number): boolean {
+    const res = db.prepare(
+      'UPDATE refresh_tokens SET revoked_at = ? WHERE jti = ?',
+    ).run(now, jti);
+    return res.changes > 0;
+  },
+
+  revokeTokenFamily(db: DatabaseSync, family: string, now: number): number {
+    const res = db.prepare(
+      `UPDATE refresh_tokens SET revoked_at = ?
+       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL`,
+    ).run(now, family);
+    return Number(res.changes);
   },
 };
 
@@ -146,6 +325,30 @@ class TxStore implements Store {
   }
   consumeAuthorizationCode(codeHash: string, now: number): Promise<AuthorizationCodeRecord | null> {
     return this.#use((db) => ops.consumeCode(db, codeHash, now));
+  }
+  saveAccessToken(t: AccessTokenRecord): Promise<void> {
+    return this.#use((db) => ops.saveAccessToken(db, t));
+  }
+  getAccessToken(jti: string, now: number): Promise<AccessTokenRecord | null> {
+    return this.#use((db) => ops.getAccessToken(db, jti, now));
+  }
+  revokeAccessToken(jti: string, now: number): Promise<boolean> {
+    return this.#use((db) => ops.revokeAccessToken(db, jti, now));
+  }
+  saveRefreshToken(t: RefreshTokenRecord): Promise<void> {
+    return this.#use((db) => ops.saveRefreshToken(db, t));
+  }
+  consumeRefreshToken(jti: string, now: number): Promise<RefreshTokenRecord | null> {
+    return this.#use((db) => ops.consumeRefreshToken(db, jti, now));
+  }
+  getRefreshToken(jti: string, now: number): Promise<RefreshTokenRecord | null> {
+    return this.#use((db) => ops.getRefreshToken(db, jti, now));
+  }
+  revokeRefreshToken(jti: string, now: number): Promise<boolean> {
+    return this.#use((db) => ops.revokeRefreshToken(db, jti, now));
+  }
+  revokeTokenFamily(family: string, now: number): Promise<number> {
+    return this.#use((db) => ops.revokeTokenFamily(db, family, now));
   }
 }
 
@@ -207,6 +410,30 @@ export class SqliteStore implements Store {
   }
   consumeAuthorizationCode(codeHash: string, now: number): Promise<AuthorizationCodeRecord | null> {
     return this.#enqueue((db) => ops.consumeCode(db, codeHash, now));
+  }
+  saveAccessToken(t: AccessTokenRecord): Promise<void> {
+    return this.#enqueue((db) => ops.saveAccessToken(db, t));
+  }
+  getAccessToken(jti: string, now: number): Promise<AccessTokenRecord | null> {
+    return this.#enqueue((db) => ops.getAccessToken(db, jti, now));
+  }
+  revokeAccessToken(jti: string, now: number): Promise<boolean> {
+    return this.#enqueue((db) => ops.revokeAccessToken(db, jti, now));
+  }
+  saveRefreshToken(t: RefreshTokenRecord): Promise<void> {
+    return this.#enqueue((db) => ops.saveRefreshToken(db, t));
+  }
+  consumeRefreshToken(jti: string, now: number): Promise<RefreshTokenRecord | null> {
+    return this.#enqueue((db) => ops.consumeRefreshToken(db, jti, now));
+  }
+  getRefreshToken(jti: string, now: number): Promise<RefreshTokenRecord | null> {
+    return this.#enqueue((db) => ops.getRefreshToken(db, jti, now));
+  }
+  revokeRefreshToken(jti: string, now: number): Promise<boolean> {
+    return this.#enqueue((db) => ops.revokeRefreshToken(db, jti, now));
+  }
+  revokeTokenFamily(family: string, now: number): Promise<number> {
+    return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
   }
 
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T> {
