@@ -11,16 +11,21 @@
 # failing must be removed.
 implementation: ts-oauth2-server
 contract: 469bd864530af550a872e1d76bbd040da3b44647
-profiles: [core]
+profiles: [core, token-lifecycle]
 endpoint: http://localhost:8080
 deviations:
   - requirement: RFC6749-4.1.1-unknown-client
     reason: unknown client_id at /oauth/authorize returns 400 (not the reference 401)
+    profile: core
   - requirement: RFC6749-3.1.2-localhost-port-wildcard
     reason: loopback redirect URIs are matched on exact port, not any port
+    profile: core
   - requirement: RFC8252-7.3-loopback-ipv4-any-port
     reason: loopback port wildcard for IPv4 redirect URIs is not implemented
+    profile: core
   - requirement: RFC8252-7.3-loopback-ipv6-any-port
     reason: loopback port wildcard for IPv6 redirect URIs is not implemented
+    profile: core
   - requirement: RFC7636-4.3-missing-verifier
     reason: a code exchange omitting the PKCE verifier reports invalid_request, not invalid_grant
+    profile: core

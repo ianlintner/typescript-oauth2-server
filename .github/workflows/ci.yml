@@ -57,5 +57,10 @@ jobs:
 
       - name: Run the core profile against the TypeScript server
         run: |
-          scripts/conformance-run.sh build/conformance-report.json .contract
+          CONFORMANCE_PROFILE=core scripts/conformance-run.sh build/conformance-report.json .contract
           node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report.json
+
+      - name: Run the token-lifecycle profile against the TypeScript server
+        run: |
+          CONFORMANCE_PROFILE=token-lifecycle scripts/conformance-run.sh build/conformance-report-token-lifecycle.json .contract
+          node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-token-lifecycle.json
