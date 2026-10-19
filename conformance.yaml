@@ -14,8 +14,6 @@ contract: 469bd864530af550a872e1d76bbd040da3b44647
 profiles: [core]
 endpoint: http://localhost:8080
 deviations:
-  - requirement: RFC9207-2.3-iss-matches-metadata-issuer
-    reason: /.well-known/oauth-authorization-server discovery metadata is not yet published
   - requirement: RFC6749-4.1.1-unknown-client
     reason: unknown client_id at /oauth/authorize returns 400 (not the reference 401)
   - requirement: RFC6749-3.1.2-localhost-port-wildcard
@@ -26,7 +24,3 @@ deviations:
     reason: loopback port wildcard for IPv6 redirect URIs is not implemented
   - requirement: RFC7636-4.3-missing-verifier
     reason: a code exchange omitting the PKCE verifier reports invalid_request, not invalid_grant
-  - requirement: RFC6749-5.2-invalid-client
-    reason: client-authentication failure at /oauth/token returns 400, not 401 invalid_client
-  - requirement: RFC6749-5.1-no-store
-    reason: the client_credentials grant is not implemented, so the no-store success path is absent

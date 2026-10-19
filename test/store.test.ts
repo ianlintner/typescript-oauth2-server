@@ -23,6 +23,7 @@ const code = {
   codeChallenge: 'chal',
   expiresAt: 2000,
   consumedAt: null,
+  nonce: null,
 };
 
 async function withStore(fn: (s: Store) => Promise<void>) {
