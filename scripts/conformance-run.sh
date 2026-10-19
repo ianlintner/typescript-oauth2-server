@@ -16,8 +16,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-report="$(cd "$(dirname "${1:-build/conformance-report.json}")" && pwd)/$(basename "${1:-build/conformance-report.json}")"
-[ -d "$(dirname "$report")" ] || mkdir -p "$(dirname "$report")"
+report_arg="${1:-build/conformance-report.json}"
+mkdir -p "$(dirname "$report_arg")"
+report="$(cd "$(dirname "$report_arg")" && pwd)/$(basename "$report_arg")"
 contract_dir="$(cd "${2:-.contract}" && pwd)"
 seed="${3:-$contract_dir/examples/seed.yaml}"
 [ -f "$seed" ] || { echo "seed not found: $seed" >&2; exit 1; }
