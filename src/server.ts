@@ -12,6 +12,9 @@ export interface Deps {
   authenticate?: OAuthDeps['authenticate'] | undefined;
   loginPath?: string | undefined;
   consent?: OAuthDeps['consent'] | undefined;
+  authTime?: OAuthDeps['authTime'] | undefined;
+  userClaims?: OAuthDeps['userClaims'] | undefined;
+  endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
 }
 
