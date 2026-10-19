@@ -56,7 +56,7 @@ async function withServer(env: Record<string, string>, fn: (base: string) => Pro
 }
 
 async function login(base: string, username: string, password: string): Promise<Response> {
-  return fetch(`${base}/login`, {
+  return fetch(`${base}/auth/login`, {
     method: 'POST',
     redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -68,7 +68,7 @@ test('normal start exposes no test login, no seeded client, and authorize stays 
   const env = await baseEnv();
   await withServer(env, async (base) => {
     assert.equal((await fetch(`${base}/health`)).status, 200);
-    assert.equal((await fetch(`${base}/login`)).status, 404);
+    assert.equal((await fetch(`${base}/auth/login`)).status, 404);
     assert.equal((await login(base, 'alice', 'test-only-password')).status, 404);
     // Unknown client: the seed was never applied.
     assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 400);
@@ -78,7 +78,7 @@ test('normal start exposes no test login, no seeded client, and authorize stays 
 test('a seed path without the mode switch is ignored', async () => {
   const env = { ...(await baseEnv()), OAUTH2_CONFORMANCE_SEED: SEED_PATH };
   await withServer(env, async (base) => {
-    assert.equal((await fetch(`${base}/login`)).status, 404);
+    assert.equal((await fetch(`${base}/auth/login`)).status, 404);
     assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 400);
   });
 });
@@ -92,14 +92,14 @@ test('conformance mode seeds, then drives login, auto-approval and the OAuth red
     // Unauthenticated authorize goes to the login step (same-origin relative redirect).
     const first = await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' });
     assert.equal(first.status, 302);
-    assert.equal(first.headers.get('location'), '/login');
-    assert.equal((await fetch(`${base}/login`)).status, 200);
+    assert.equal(first.headers.get('location'), '/auth/login');
+    assert.equal((await fetch(`${base}/auth/login`)).status, 200);
 
     // Wrong password and unknown user are refused with error= and set no session.
     for (const [u, p] of [['alice', 'wrong'], ['mallory', 'test-only-password']] as const) {
       const refused = await login(base, u, p);
       assert.equal(refused.status, 302);
-      assert.match(refused.headers.get('location') ?? '', /^\/login\?error=/);
+      assert.match(refused.headers.get('location') ?? '', /^\/auth\/login\?error=/);
       assert.equal(refused.headers.get('set-cookie'), null);
     }
 
@@ -134,7 +134,7 @@ test('conformance mode seeds, then drives login, auto-approval and the OAuth red
 
     // A forged session cookie is not a session.
     const forged = await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual', headers: { cookie: 'oauth2_test_session=forged' } });
-    assert.equal(forged.headers.get('location'), '/login');
+    assert.equal(forged.headers.get('location'), '/auth/login');
   });
 });
 

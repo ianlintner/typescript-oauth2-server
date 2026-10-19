@@ -1,0 +1,32 @@
+# This repository's implementation manifest for the shared oauth2-conformance
+# contract (github.com/ianlintner/oauth2-conformance).
+#
+# `contract` pins the exact contract revision CI checks out and runs against.
+# Before a tagged release exists this is a full 40-hex commit SHA on the
+# contract's main branch (ROADMAP.md flow step 2). Bumping it is a reviewed
+# change, not a drive-by edit. `profiles` lists the profiles this server
+# truthfully claims; `deviations` enumerates the known, declared protocol gaps
+# the contract runner still reports as stable failures so CI can enforce a
+# ratchet: an undeclared failure is a regression, and a deviation that stops
+# failing must be removed.
+implementation: ts-oauth2-server
+contract: 469bd864530af550a872e1d76bbd040da3b44647
+profiles: [core]
+endpoint: http://localhost:8080
+deviations:
+  - requirement: RFC9207-2.3-iss-matches-metadata-issuer
+    reason: /.well-known/oauth-authorization-server discovery metadata is not yet published
+  - requirement: RFC6749-4.1.1-unknown-client
+    reason: unknown client_id at /oauth/authorize returns 400 (not the reference 401)
+  - requirement: RFC6749-3.1.2-localhost-port-wildcard
+    reason: loopback redirect URIs are matched on exact port, not any port
+  - requirement: RFC8252-7.3-loopback-ipv4-any-port
+    reason: loopback port wildcard for IPv4 redirect URIs is not implemented
+  - requirement: RFC8252-7.3-loopback-ipv6-any-port
+    reason: loopback port wildcard for IPv6 redirect URIs is not implemented
+  - requirement: RFC7636-4.3-missing-verifier
+    reason: a code exchange omitting the PKCE verifier reports invalid_request, not invalid_grant
+  - requirement: RFC6749-5.2-invalid-client
+    reason: client-authentication failure at /oauth/token returns 400, not 401 invalid_client
+  - requirement: RFC6749-5.1-no-store
+    reason: the client_credentials grant is not implemented, so the no-store success path is absent

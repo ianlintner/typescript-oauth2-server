@@ -24,3 +24,38 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+
+  conformance:
+    name: Conformance (oauth2-conformance core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.29.3
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Consume the shared contract instead of vendoring fixtures: check out the
+      # pinned commit (conformance.yaml `contract`), install the runner's frozen
+      # deps, then (1) prove the runner wires expectations into its exit status
+      # with a deterministic SUT-free self-test and (2) run the core profile
+      # against a locally started SUT, gated by the deviation ratchet.
+      - name: Check out the pinned contract
+        run: scripts/setup-conformance.sh .contract
+
+      - name: Install the runner's frozen dependencies
+        run: (cd .contract/runner && pnpm install --frozen-lockfile)
+
+      - name: Runner self-test (match exits 0, mismatch exits 1)
+        run: scripts/contract-selftest.sh .contract
+
+      - name: Run the core profile against the TypeScript server
+        run: |
+          scripts/conformance-run.sh build/conformance-report.json .contract
+          node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report.json
