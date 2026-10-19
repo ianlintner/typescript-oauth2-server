@@ -1,6 +1,8 @@
 node_modules/
 .worktrees/
+.contract/
 dist/
+build/
 coverage/
 .env
 .env.*

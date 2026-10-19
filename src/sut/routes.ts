@@ -11,7 +11,10 @@ export interface TestLoginRegistry {
 }
 
 export const SESSION_COOKIE = 'oauth2_test_session';
-export const LOGIN_PATH = '/login';
+// The contract's core scenarios hardcode `with.loginPath: /auth/login` (the
+// Rust reference path, shared by the Python port). The runner has no flag to
+// override it, so the SUT test-login must live at /auth/login to be drivable.
+export const LOGIN_PATH = '/auth/login';
 
 function secureEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
@@ -74,11 +77,11 @@ export function makeConsent(users: SeedUser[]) {
  * Register non-interactive test login routes. Only called in conformance mode;
  * with the mode off they never exist and test credentials are never accepted.
  *
- * - GET /login is the unauthenticated authorize redirect target (a bearer of a
+ * - GET /auth/login is the unauthenticated authorize redirect target (a bearer of a
  *   valid session never sees it). It returns the canonical login step.
- * - POST /login verifies seeded credentials, sets the session cookie, and
+ * - POST /auth/login verifies seeded credentials, sets the session cookie, and
  *   redirects to /oauth/authorize so the runner re-drives the request. A
- *   refused login redirects to /login?error=..., which the runner treats as a
+ *   refused login redirects to /auth/login?error=..., which the runner treats as a
  *   refusal rather than an authorization result.
  */
 export function registerTestLoginRoutes(app: FastifyInstance, registry: TestLoginRegistry): void {
