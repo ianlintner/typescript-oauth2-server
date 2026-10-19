@@ -407,7 +407,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // RFC 7009 §2.1: the hint is only an optimisation; if the token is not of
     // the hinted type the server MUST extend its search across all types.
     const revokeAccess = async (): Promise<boolean> => {
-      const decoded = decodeJwtSafe(token);
+      const decoded = await verifyAccessJwt(deps, token);
       if (!decoded?.jti) return false;
       const stored = await deps.store.getAccessToken(String(decoded.jti), now);
       if (!stored || stored.clientId !== client.clientId) return false;
@@ -454,12 +454,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     // Try access token (JWT) when hint is not explicitly refresh_token.
     if (hint !== 'refresh_token') {
-      const decoded = decodeJwtSafe(token);
+      const decoded = await verifyAccessJwt(deps, token);
       if (decoded && decoded.jti) {
         const stored = await deps.store.getAccessToken(String(decoded.jti), now);
         if (stored) {
           // Cross-client protection: only return details to the owning client.
-          if (stored.clientId !== client.clientId && decoded.aud !== client.clientId) return inactive;
+          if (stored.clientId !== client.clientId) return inactive;
 
           return {
             active: true,
@@ -519,14 +519,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     }
 
     // Verify the JWT
-    let payload: Record<string, unknown>;
-    try {
-      const jwks = await deps.signer.publicJwks();
-      const { jwtVerify: verify, importJWK } = await import('jose');
-      const key = await importJWK(jwks.keys[0] as unknown as import('jose').JWK, 'ES256');
-      const result = await verify(token, key, { issuer: deps.issuer, currentDate: new Date(deps.clock.now() * 1000) });
-      payload = result.payload as Record<string, unknown>;
-    } catch {
+    const payload = await verifyAccessJwt(deps, token);
+    if (!payload) {
       return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
     }
 
@@ -545,15 +539,22 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 }
 
-/** Safe JWT decode that doesn't throw for malformed tokens. */
-function decodeJwtSafe(token: string): Record<string, unknown> | null {
+/**
+ * Verify an access-token JWT's signature, issuer and expiry against the
+ * server's own key. Returns null for anything unverifiable: claims from an
+ * unverified payload must never drive ownership or revocation decisions.
+ */
+async function verifyAccessJwt(deps: OAuthDeps, token: string): Promise<Record<string, unknown> | null> {
   try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    const payload = Buffer.from(parts[1]!, 'base64url').toString('utf8');
-    const obj = JSON.parse(payload);
-    if (typeof obj !== 'object' || obj === null) return null;
-    return obj as Record<string, unknown>;
+    const jwks = await deps.signer.publicJwks();
+    const { jwtVerify, importJWK } = await import('jose');
+    const key = await importJWK(jwks.keys[0] as unknown as import('jose').JWK, 'ES256');
+    const result = await jwtVerify(token, key, {
+      issuer: deps.issuer,
+      algorithms: ['ES256'],
+      currentDate: new Date(deps.clock.now() * 1000),
+    });
+    return result.payload as Record<string, unknown>;
   } catch {
     return null;
   }

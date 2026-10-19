@@ -514,6 +514,61 @@ test('introspection of another clients token does not leak details', async () =>
   await done(s);
 });
 
+function forgeUnsigned(claims: Record<string, unknown>): string {
+  const b = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${b({ alg: 'none', typ: 'JWT' })}.${b(claims)}.`;
+}
+
+async function seedTwoClients() {
+  const s = await setup();
+  await s.store.saveClient({
+    clientId: 'rs-2', clientSecretHash: await hashClientSecret('rs2-secret'),
+    redirectUris: [CB], grantTypes: [], scopes: ['read'], enabled: true,
+  });
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' },
+    { client_id: 'conf', client_secret: SECRET });
+  const at = first.json().access_token as string;
+  const real = decodeJwt(at);
+  const forged = forgeUnsigned({ ...real, aud: 'rs-2' });
+  return { s, at, real, forged };
+}
+
+test('introspection ignores forged unsigned JWT claiming another audience (cross-client)', async () => {
+  const { s, forged } = await seedTwoClients();
+  const res = await introspect(s.server, forged, 'access_token', { client_id: 'rs-2', client_secret: 'rs2-secret' });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { active: false });
+  await done(s);
+});
+
+test('introspection with forged unsigned JWT is inactive even for the owning client', async () => {
+  const { s, forged } = await seedTwoClients();
+  const res = await introspect(s.server, forged, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  assert.deepEqual(res.json(), { active: false });
+  await done(s);
+});
+
+test('owner can still introspect its own valid token; unknown tokens stay inactive', async () => {
+  const { s, at } = await seedTwoClients();
+  const own = await introspect(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  assert.equal(own.json().active, true);
+  const unk = await introspect(s.server, forgeUnsigned({ jti: 'nope', aud: 'rs-2' }), 'access_token', { client_id: 'rs-2', client_secret: 'rs2-secret' });
+  assert.deepEqual(unk.json(), { active: false });
+  await done(s);
+});
+
+test('revocation ignores a forged unsigned JWT carrying a real jti', async () => {
+  const { s, at, real } = await seedTwoClients();
+  await s.server.inject({
+    method: 'POST', url: '/oauth/revoke',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    payload: new URLSearchParams({ token: forgeUnsigned({ ...real }), client_id: 'conf', client_secret: SECRET }).toString(),
+  });
+  const res = await introspect(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
+  assert.equal(res.json().active, true);
+  await done(s);
+});
+
 // -- Persistence across restart --
 
 test('revoked access token stays revoked after store restart', async () => {
