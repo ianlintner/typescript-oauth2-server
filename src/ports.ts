@@ -24,6 +24,41 @@ export interface ClientRecord {
   grantTypes: string[];
   scopes: string[];
   enabled: boolean;
+  /** Present only for clients created through RFC 7591 dynamic registration. */
+  registration?: ClientRegistration | null | undefined;
+}
+
+/** RFC 7591/7592 state. The registration access token is stored only as a SHA-256 hash. */
+export interface ClientRegistration {
+  tokenHash: string;
+  issuedAt: number;
+  /** Echoed client metadata (client_name, token_endpoint_auth_method, ...). */
+  metadata: Record<string, unknown>;
+}
+
+export type DeviceCodeStatus = 'pending' | 'approved' | 'denied' | 'consumed';
+
+/** RFC 8628 device authorization. Codes are stored only as SHA-256 hashes. */
+export interface DeviceCodeRecord {
+  deviceCodeHash: string;
+  userCodeHash: string;
+  clientId: string;
+  scope: string;
+  expiresAt: number;
+  /** Minimum seconds between polls; raised by 5 on each slow_down (RFC 8628 §3.5). */
+  interval: number;
+  lastPolledAt: number | null;
+  status: DeviceCodeStatus;
+  subject: string | null;
+}
+
+/** RFC 9126 pushed authorization request, bound to the pushing client. */
+export interface ParRecord {
+  requestUriHash: string;
+  clientId: string;
+  params: Record<string, string>;
+  expiresAt: number;
+  consumedAt: number | null;
 }
 
 export interface AuthorizationCodeRecord {
@@ -75,6 +110,23 @@ export interface Store {
 
   saveClient(client: ClientRecord): Promise<void>;
   getClient(clientId: string): Promise<ClientRecord | null>;
+  /** Delete a client and everything issued to it. Returns false if unknown. */
+  deleteClient(clientId: string): Promise<boolean>;
+
+  saveDeviceCode(record: DeviceCodeRecord): Promise<void>;
+  getDeviceCode(deviceCodeHash: string): Promise<DeviceCodeRecord | null>;
+  /** Record a poll attempt and the (possibly increased) interval. */
+  recordDevicePoll(deviceCodeHash: string, now: number, interval: number): Promise<void>;
+  /** Atomically decide a pending, unexpired code. False if unknown, expired or already decided. */
+  resolveDeviceCode(userCodeHash: string, status: 'approved' | 'denied', subject: string, now: number): Promise<boolean>;
+  /** Atomically consume an approved, unexpired code (one-time). */
+  consumeDeviceCode(deviceCodeHash: string, now: number): Promise<DeviceCodeRecord | null>;
+
+  savePar(record: ParRecord): Promise<void>;
+  /** Read a pushed request without consuming. Null if unknown or expired. */
+  getPar(requestUriHash: string, now: number): Promise<ParRecord | null>;
+  /** Atomically consume an unexpired pushed request bound to `clientId` (one-time). */
+  consumePar(requestUriHash: string, clientId: string, now: number): Promise<ParRecord | null>;
 
   saveAuthorizationCode(code: AuthorizationCodeRecord): Promise<void>;
   /**

@@ -62,16 +62,16 @@ export function claimsForScope(scope: string, user: UserClaims | null): Record<s
 const VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
 const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex');
+export const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex');
 
 /** Read a single-valued parameter. Repeated parameters are rejected (RFC 6749 §3.1); empty means absent. */
-function single(params: URLSearchParams, name: string): string | undefined {
+export function single(params: URLSearchParams, name: string): string | undefined {
   const all = params.getAll(name);
   if (all.length > 1) throw new OAuthError('invalid_request', `duplicate parameter: ${name}`);
   return all[0] === undefined || all[0] === '' ? undefined : all[0];
 }
 
-function rejectDuplicates(params: URLSearchParams): void {
+export function rejectDuplicates(params: URLSearchParams): void {
   const seen = new Set<string>();
   for (const key of params.keys()) {
     if (seen.has(key)) throw new OAuthError('invalid_request', `duplicate parameter: ${key}`);
@@ -85,12 +85,12 @@ function redirectTo(reply: FastifyReply, redirectUri: string, params: Record<str
   return reply.status(302).header('location', url.toString()).send();
 }
 
-function safeEqual(a: string, b: string): boolean {
+export function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a), bb = Buffer.from(b);
   return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
-function formDecode(value: string): string {
+export function formDecode(value: string): string {
   try {
     return decodeURIComponent(value.replace(/\+/g, ' '));
   } catch {
@@ -98,7 +98,7 @@ function formDecode(value: string): string {
   }
 }
 
-async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
+export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
   const header = req.headers.authorization;
@@ -130,11 +130,84 @@ async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: UR
   return client;
 }
 
-function bearerToken(req: FastifyRequest): string | undefined {
+export function bearerToken(req: FastifyRequest): string | undefined {
   const h = req.headers.authorization;
   if (!h) return undefined;
   const m = /^Bearer (.+)$/i.exec(h);
   return m ? m[1] : undefined;
+}
+
+/**
+ * RFC 8628 §3.4 device token grant. Returns the token reply. On a pending
+ * authorization the reply carries the authorization_pending error and a
+ * Cache-Control: no-store (RFC 8628 §3.5). A poll faster than the device's
+ * interval gets slow_down (+5s).
+ */
+async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: string): Promise<Record<string, unknown>> {
+  const now = deps.clock.now();
+  const record = await deps.store.getDeviceCode(hash);
+  if (!record || record.clientId !== client.clientId) throw new OAuthError('invalid_grant', 'device_code is invalid');
+  if (record.expiresAt <= now) throw new OAuthError('expired_token', 'device_code expired');
+  if (record.status === 'denied') throw new OAuthError('access_denied', 'end-user denied device authorization');
+  if (record.status === 'consumed') throw new OAuthError('invalid_grant', 'device_code already used');
+
+  if (record.status === 'pending') {
+    // slow_down when polling before the minimum interval (RFC 8628 §3.5).
+    const last = record.lastPolledAt;
+    if (last !== null && now - last < record.interval) {
+      await deps.store.recordDevicePoll(hash, now, record.interval + 5);
+      throw new OAuthError('slow_down', 'client is polling too quickly');
+    }
+    await deps.store.recordDevicePoll(hash, now, record.interval);
+    throw new OAuthError('authorization_pending', 'authorization is pending');
+  }
+
+  // approved: consume atomically (one-time).
+  const consumed = await deps.store.consumeDeviceCode(hash, now);
+  if (!consumed) throw new OAuthError('invalid_grant', 'device_code already used');
+
+  const subject = consumed.subject ?? consumed.clientId;
+  const scopes = consumed.scope;
+  const scopesList = scopes ? scopes.split(' ') : [];
+  const includesOpenid = scopesList.includes('openid');
+
+  const iat = now;
+  const atJti = deps.random.token(16);
+  const claims: Record<string, unknown> = {
+    iss: deps.issuer, sub: subject, aud: client.clientId, client_id: client.clientId,
+    iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
+  };
+  if (scopes !== '') claims.scope = scopes;
+  const accessToken = await deps.signer.sign(claims);
+
+  await deps.store.saveAccessToken({
+    jti: atJti, clientId: client.clientId, subject, scope: scopes,
+    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+  });
+
+  const body: Record<string, unknown> = {
+    access_token: accessToken, token_type: 'Bearer', expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    ...(scopes !== '' ? { scope: scopes } : {}),
+  };
+
+  if (includesOpenid) {
+    const idClaims: Record<string, unknown> = {
+      iss: deps.issuer, sub: subject, aud: client.clientId,
+      iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
+    };
+    body.id_token = await deps.signer.sign(idClaims);
+  }
+
+  if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
+    const rtJti = deps.random.token(24);
+    await deps.store.saveRefreshToken({
+      jti: rtJti, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
+      family: rtJti, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+    });
+    body.refresh_token = rtJti;
+  }
+
+  return body;
 }
 
 export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void {
@@ -145,14 +218,49 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   app.get('/oauth/authorize', async (req, reply) => {
-    const params = new URL(req.url, 'http://localhost').searchParams;
+    let params = new URL(req.url, 'http://localhost').searchParams;
     // Until client and redirect_uri are trusted, errors are shown to the user agent and never redirected.
     rejectDuplicates(params);
-    const clientId = single(params, 'client_id');
-    const redirectUri = single(params, 'redirect_uri');
+
+    // RFC 9126: a request_uri references a previously pushed request. Its stored
+    // parameters supply client_id and redirect_uri; fields present on the GET are
+    // ignored (RFC 9126 §2/§3).
+    const requestUri = single(params, 'request_uri');
+    let parClientId: string | undefined;
+    let parRedirectUri: string | undefined;
+    if (requestUri !== undefined) {
+      const pushed = await deps.store.getPar(sha256Hex(requestUri), deps.clock.now());
+      if (!pushed) {
+        throw new OAuthError('invalid_request_uri', 'request_uri is unknown or expired');
+      }
+      parClientId = pushed.clientId;
+      // RFC 9126 §4: the request_uri is bound to the client that pushed it.
+      const presented = single(params, 'client_id');
+      if (presented !== undefined && presented !== pushed.clientId) {
+        throw new OAuthError('invalid_request', 'request_uri was issued to a different client');
+      }
+      parRedirectUri = pushed.params.redirect_uri;
+      if (parRedirectUri === undefined || parRedirectUri === '') {
+        throw new OAuthError('invalid_request', 'pushed request is missing redirect_uri');
+      }
+      // Merge: pushed params win; the client_id/redirect_uri come from the push.
+      const merged = new URLSearchParams();
+      for (const [k, v] of Object.entries(pushed.params)) if (k !== 'request_uri') merged.set(k, v);
+      for (const [k, v] of params.entries()) if (k !== 'request_uri' && !merged.has(k)) merged.set(k, v);
+      params = merged;
+    }
+
+    const clientId = single(params, 'client_id') ?? parClientId;
+    const redirectUri = single(params, 'redirect_uri') ?? parRedirectUri;
     if (!clientId || !redirectUri) throw new OAuthError('invalid_request', 'client_id and redirect_uri are required');
     const client = await deps.store.getClient(clientId);
-    if (!client || !client.enabled || !client.redirectUris.includes(redirectUri)) {
+    if (!client || !client.enabled) {
+      throw new OAuthError('invalid_request', 'unknown client');
+    }
+    if (!client.redirectUris.includes(redirectUri)) {
+      if (requestUri !== undefined) {
+        throw new OAuthError('invalid_request', 'redirect_uri not registered for this client');
+      }
       throw new OAuthError('invalid_request', 'unknown client or unregistered redirect_uri');
     }
 
@@ -189,6 +297,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return fail('access_denied');
     }
     if (deps.consent && !deps.consent(subject, client.clientId)) return fail('access_denied');
+
+    // RFC 9126 §4: a request_uri is single-use; consume it only once the request is about to succeed.
+    if (requestUri !== undefined) {
+      const used = await deps.store.consumePar(sha256Hex(requestUri), client.clientId, deps.clock.now());
+      if (!used) throw new OAuthError('invalid_request_uri', 'request_uri is unknown, expired or already used');
+    }
 
     const nonce = single(params, 'nonce') ?? null;
     const code = deps.random.token(32);
@@ -421,6 +535,20 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return reply.header('pragma', 'no-cache').send(body);
     }
 
+    // -- device_code (RFC 8628 §3.4) --
+    if (grantType === 'urn:ietf:params:oauth:grant-type:device_code' || grantType === 'device_code') {
+      const client = await authenticateClient(deps, req, form);
+      if (!client.clientSecretHash) throw new OAuthError('invalid_client', 'public clients cannot use device_code');
+      if (!client.grantTypes.includes('urn:ietf:params:oauth:grant-type:device_code') &&
+          !client.grantTypes.includes('device_code')) {
+        throw new OAuthError('unauthorized_client', 'client is not allowed to use device_code grant');
+      }
+      const deviceCode = single(form, 'device_code');
+      if (!deviceCode) throw new OAuthError('invalid_request', 'device_code is required');
+      const hash = sha256Hex(deviceCode);
+      return deviceCodeGrant(deps, client, hash);
+    }
+
     throw new OAuthError('unsupported_grant_type');
   });
 
@@ -534,9 +662,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     userinfo_endpoint: `${deps.issuer}/oauth/userinfo`,
     revocation_endpoint: `${deps.issuer}/oauth/revoke`,
     introspection_endpoint: `${deps.issuer}/oauth/introspect`,
+    device_authorization_endpoint: `${deps.issuer}/oauth/device_authorization`,
+    pushed_authorization_request_endpoint: `${deps.issuer}/oauth/par`,
+    registration_endpoint: `${deps.issuer}/connect/register`,
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code'],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
