@@ -331,3 +331,56 @@ test('registration access token rejects a wrong token', async () => {
   assert.equal(res.json().error, 'invalid_client');
   await s.server.close();
 });
+
+// -- review fixes: public registration, PAR push-time validation, user-code throttling --
+
+test('dynamic registration with auth method none yields a public client without a secret', async () => {
+  const s = await setup();
+  const res = await s.server.inject({
+    method: 'POST', url: '/connect/register', headers: { 'content-type': 'application/json' },
+    payload: JSON.stringify({ redirect_uris: [CB], token_endpoint_auth_method: 'none' }),
+  });
+  assert.equal(res.statusCode, 201);
+  const body = res.json();
+  assert.equal(body.client_secret, undefined);
+  assert.equal(body.client_secret_expires_at, undefined);
+  const stored = await s.store.getClient(body.client_id);
+  assert.equal(stored?.clientSecretHash, null);
+  // A public client authenticates with client_id only (PAR proves it passes client auth).
+  const par = await s.server.inject({
+    method: 'POST', url: '/oauth/par', headers: form(new URLSearchParams()),
+    payload: new URLSearchParams({ client_id: body.client_id, response_type: 'code', redirect_uri: CB }).toString(),
+  });
+  assert.equal(par.statusCode, 201);
+  await s.server.close();
+});
+
+test('PAR rejects unregistered redirect_uri and unsupported response_type at push time', async () => {
+  const s = await setup();
+  const push = (extra: Record<string, string>) => s.server.inject({
+    method: 'POST', url: '/oauth/par', headers: form(new URLSearchParams()),
+    payload: new URLSearchParams({ client_id: 'conf', client_secret: 'conf-secret', ...extra }).toString(),
+  });
+  const badUri = await push({ response_type: 'code', redirect_uri: 'https://evil.example/cb' });
+  assert.equal(badUri.statusCode, 400);
+  assert.equal(badUri.json().error, 'invalid_request');
+  const badType = await push({ response_type: 'token', redirect_uri: CB });
+  assert.equal(badType.statusCode, 400);
+  assert.equal(badType.json().error, 'unsupported_response_type');
+  const ok = await push({ response_type: 'code', redirect_uri: CB });
+  assert.equal(ok.statusCode, 201);
+  await s.server.close();
+});
+
+test('device verify throttles repeated wrong user codes (RFC 8628 §5.1)', async () => {
+  const s = await setup();
+  const guess = () => s.server.inject({
+    method: 'POST', url: '/oauth/device/verify', headers: form(new URLSearchParams()),
+    payload: new URLSearchParams({ user_code: 'BBBB-BBBB', action: 'approve' }).toString(),
+  });
+  for (let i = 0; i < 5; i += 1) assert.equal((await guess()).statusCode, 400);
+  assert.equal((await guess()).statusCode, 429);
+  s.advance(61);
+  assert.equal((await guess()).statusCode, 400);
+  await s.server.close();
+});

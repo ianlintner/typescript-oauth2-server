@@ -47,7 +47,12 @@ function randomUserCode(): string {
 /** Case/dash/space-insensitive form used for hashing and lookup (RFC 8628 §6.1). */
 const normalizeUserCode = (code: string): string => code.toUpperCase().replace(/[\s-]/g, '');
 
+/** RFC 8628 §5.1 brute-force guard: max failed user-code guesses per source per window. */
+const USER_CODE_MAX_FAILURES = 5;
+const USER_CODE_WINDOW_SECONDS = 60;
+
 export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): void {
+  const guessState = new Map<string, { count: number; windowStart: number }>();
   // -- RFC 8628 device authorization endpoint --
   // POST /oauth/device_authorization  (also /oauth/device for the reference admin path)
   const deviceAuth = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -113,8 +118,22 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     const subject = deps.authenticate ? await deps.authenticate(req) : null;
     if (!subject) return reply.status(403).type('text/plain').send('authentication required');
     const status = action === 'approve' ? 'approved' : 'denied';
+    const now = deps.clock.now();
+    const key = `${req.ip}|${subject}`;
+    let g = guessState.get(key);
+    if (!g || now - g.windowStart >= USER_CODE_WINDOW_SECONDS) {
+      g = { count: 0, windowStart: now };
+      guessState.set(key, g);
+    }
+    if (g.count >= USER_CODE_MAX_FAILURES) {
+      return reply.status(429).header('retry-after', String(USER_CODE_WINDOW_SECONDS - (now - g.windowStart)))
+        .type('text/plain').send('too many attempts');
+    }
     const ok = await deps.store.resolveDeviceCode(sha256(normalizeUserCode(userCode)), status, subject, deps.clock.now());
-    if (!ok) return reply.status(400).type('text/plain').send('unknown, expired or already used user code');
+    if (!ok) {
+      g.count += 1;
+      return reply.status(400).type('text/plain').send('unknown, expired or already used user code');
+    }
     return reply.type('text/html; charset=utf-8').send(`<!doctype html><title>${status}</title>`);
   });
 
@@ -135,6 +154,13 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     }
     // Never allow a request_uri to piggy-back into a pushed request.
     delete params.request_uri;
+    // RFC 9126 §2.3: validate the request at push time as the authorization endpoint would.
+    if (params.response_type !== undefined && params.response_type !== 'code') {
+      throw new OAuthError('unsupported_response_type', 'only response_type=code is supported');
+    }
+    if (params.redirect_uri !== undefined && !client.redirectUris.includes(params.redirect_uri)) {
+      throw new OAuthError('invalid_request', 'redirect_uri is not registered for this client');
+    }
 
     const now = deps.clock.now();
     const requestUri = `urn:ietf:params:oauth:request_uri:${deps.random.token(32)}`;
@@ -173,9 +199,9 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
 
     const now = deps.clock.now();
     const clientId = deps.random.token(16);
-    const clientSecret = deps.random.token(32);
+    const clientSecret = authMethod === 'none' ? null : deps.random.token(32);
     const regToken = deps.random.token(32);
-    const clientSecretHash = await hashClientSecret(clientSecret);
+    const clientSecretHash = clientSecret === null ? null : await hashClientSecret(clientSecret);
 
     const metadata: Record<string, unknown> = {
       client_name: typeof meta.client_name === 'string' ? meta.client_name : clientId,
@@ -202,11 +228,10 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
 
     return reply.status(201).send({
       client_id: clientId,
-      client_secret: clientSecret,
+      ...(clientSecret === null ? {} : { client_secret: clientSecret, client_secret_expires_at: 0 }),
       registration_access_token: regToken,
       registration_client_uri: `${deps.issuer}/connect/register/${encodeURIComponent(clientId)}`,
       client_id_issued_at: now,
-      client_secret_expires_at: 0,
       ...metadata,
     });
   });
@@ -231,7 +256,13 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     const meta = body as Record<string, unknown>;
     const redirectUris = normalizeRedirectUris(meta.redirect_uris);
     if (redirectUris.length === 0) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must not be empty');
-    const authMethod = normalizeAuthMethod(meta.token_endpoint_auth_method);
+    const authMethod = meta.token_endpoint_auth_method === undefined
+      ? String(record.registration?.metadata.token_endpoint_auth_method ?? 'client_secret_basic')
+      : normalizeAuthMethod(meta.token_endpoint_auth_method);
+    // Switching public<->confidential would need a new secret; not supported on update.
+    if ((authMethod === 'none') !== (record.clientSecretHash === null)) {
+      throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch between public and confidential');
+    }
     const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
     const scope = normalizeScope(meta.scope);
 
