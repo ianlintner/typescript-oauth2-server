@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
+import { registerExtensionRoutes } from './device-grant.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 
 export interface Deps {
@@ -16,6 +17,8 @@ export interface Deps {
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
+  /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
+  dynamicRegistration?: boolean | undefined;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
@@ -51,6 +54,16 @@ export function buildServer(deps: Deps): FastifyInstance {
   });
 
   registerOAuthRoutes(app, deps);
+
+  registerExtensionRoutes(app, {
+    store: deps.store,
+    signer: deps.signer,
+    random: deps.random,
+    clock: deps.clock,
+    issuer: deps.issuer,
+    authenticate: deps.authenticate,
+    dynamicRegistration: deps.dynamicRegistration,
+  });
 
   return app;
 }

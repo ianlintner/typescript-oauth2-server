@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, RefreshTokenRecord, Store } from './ports.js';
+import type {
+  AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, DeviceCodeStatus, ParRecord, RefreshTokenRecord, Store,
+} from './ports.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS clients (
@@ -8,7 +10,8 @@ CREATE TABLE IF NOT EXISTS clients (
   redirect_uris TEXT NOT NULL,
   grant_types TEXT NOT NULL,
   scopes TEXT NOT NULL,
-  enabled INTEGER NOT NULL
+  enabled INTEGER NOT NULL,
+  registration TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -42,6 +45,24 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   consumed_at INTEGER,
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS device_codes (
+  device_code_hash TEXT PRIMARY KEY,
+  user_code_hash TEXT NOT NULL UNIQUE,
+  client_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  interval INTEGER NOT NULL,
+  last_polled_at INTEGER,
+  status TEXT NOT NULL,
+  subject TEXT
+);
+CREATE TABLE IF NOT EXISTS par_requests (
+  request_uri_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  params TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  consumed_at INTEGER
 );`;
 
 interface ClientRow {
@@ -51,6 +72,42 @@ interface ClientRow {
   grant_types: string;
   scopes: string;
   enabled: number;
+  registration: string | null;
+}
+
+interface DeviceRow {
+  device_code_hash: string;
+  user_code_hash: string;
+  client_id: string;
+  scope: string;
+  expires_at: number;
+  interval: number;
+  last_polled_at: number | null;
+  status: string;
+  subject: string | null;
+}
+
+interface ParRow {
+  request_uri_hash: string;
+  client_id: string;
+  params: string;
+  expires_at: number;
+  consumed_at: number | null;
+}
+
+function rowToDevice(r: DeviceRow): DeviceCodeRecord {
+  return {
+    deviceCodeHash: r.device_code_hash, userCodeHash: r.user_code_hash, clientId: r.client_id, scope: r.scope,
+    expiresAt: r.expires_at, interval: r.interval, lastPolledAt: r.last_polled_at,
+    status: r.status as DeviceCodeStatus, subject: r.subject,
+  };
+}
+
+function rowToPar(r: ParRow): ParRecord {
+  return {
+    requestUriHash: r.request_uri_hash, clientId: r.client_id, params: JSON.parse(r.params) as Record<string, string>,
+    expiresAt: r.expires_at, consumedAt: r.consumed_at,
+  };
 }
 
 interface CodeRow {
@@ -123,12 +180,80 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
-         scopes=excluded.scopes, enabled=excluded.enabled`,
-    ).run(c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes), c.enabled ? 1 : 0);
+         scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration`,
+    ).run(
+      c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
+      c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
+    );
+  },
+
+  deleteClient(db: DatabaseSync, clientId: string): boolean {
+    for (const table of ['authorization_codes', 'access_tokens', 'refresh_tokens', 'device_codes', 'par_requests']) {
+      db.prepare(`DELETE FROM ${table} WHERE client_id = ?`).run(clientId);
+    }
+    return Number(db.prepare('DELETE FROM clients WHERE client_id = ?').run(clientId).changes) > 0;
+  },
+
+  saveDeviceCode(db: DatabaseSync, d: DeviceCodeRecord): void {
+    db.prepare(
+      `INSERT INTO device_codes (device_code_hash, user_code_hash, client_id, scope, expires_at, interval, last_polled_at, status, subject)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(d.deviceCodeHash, d.userCodeHash, d.clientId, d.scope, d.expiresAt, d.interval, d.lastPolledAt, d.status, d.subject);
+  },
+
+  getDeviceCode(db: DatabaseSync, hash: string): DeviceCodeRecord | null {
+    const r = db.prepare('SELECT * FROM device_codes WHERE device_code_hash = ?').get(hash) as unknown as DeviceRow | undefined;
+    return r ? rowToDevice(r) : null;
+  },
+
+  recordDevicePoll(db: DatabaseSync, hash: string, now: number, interval: number): void {
+    db.prepare('UPDATE device_codes SET last_polled_at = ?, interval = ? WHERE device_code_hash = ?').run(now, interval, hash);
+  },
+
+  resolveDeviceCode(db: DatabaseSync, userCodeHash: string, status: 'approved' | 'denied', subject: string, now: number): boolean {
+    const r = db
+      .prepare(
+        `UPDATE device_codes SET status = ?, subject = ?
+         WHERE user_code_hash = ? AND status = 'pending' AND expires_at > ? RETURNING device_code_hash`,
+      )
+      .get(status, subject, userCodeHash, now);
+    return r !== undefined;
+  },
+
+  consumeDeviceCode(db: DatabaseSync, hash: string, now: number): DeviceCodeRecord | null {
+    const r = db
+      .prepare(
+        `UPDATE device_codes SET status = 'consumed'
+         WHERE device_code_hash = ? AND status = 'approved' AND expires_at > ? RETURNING *`,
+      )
+      .get(hash, now) as unknown as DeviceRow | undefined;
+    return r ? { ...rowToDevice(r), status: 'approved' } : null;
+  },
+
+  savePar(db: DatabaseSync, p: ParRecord): void {
+    db.prepare('INSERT INTO par_requests (request_uri_hash, client_id, params, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?)')
+      .run(p.requestUriHash, p.clientId, JSON.stringify(p.params), p.expiresAt, p.consumedAt);
+  },
+
+  getPar(db: DatabaseSync, hash: string, now: number): ParRecord | null {
+    const r = db
+      .prepare('SELECT * FROM par_requests WHERE request_uri_hash = ? AND consumed_at IS NULL AND expires_at > ?')
+      .get(hash, now) as unknown as ParRow | undefined;
+    return r ? rowToPar(r) : null;
+  },
+
+  consumePar(db: DatabaseSync, hash: string, clientId: string, now: number): ParRecord | null {
+    const r = db
+      .prepare(
+        `UPDATE par_requests SET consumed_at = ?
+         WHERE request_uri_hash = ? AND client_id = ? AND consumed_at IS NULL AND expires_at > ? RETURNING *`,
+      )
+      .get(now, hash, clientId, now) as unknown as ParRow | undefined;
+    return r ? { ...rowToPar(r), consumedAt: now } : null;
   },
 
   getClient(db: DatabaseSync, clientId: string): ClientRecord | null {
@@ -141,6 +266,7 @@ const ops = {
       grantTypes: JSON.parse(r.grant_types) as string[],
       scopes: JSON.parse(r.scopes) as string[],
       enabled: r.enabled === 1,
+      ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
 
@@ -326,6 +452,33 @@ class TxStore implements Store {
   getClient(id: string): Promise<ClientRecord | null> {
     return this.#use((db) => ops.getClient(db, id));
   }
+  deleteClient(id: string): Promise<boolean> {
+    return this.#use((db) => ops.deleteClient(db, id));
+  }
+  saveDeviceCode(d: DeviceCodeRecord): Promise<void> {
+    return this.#use((db) => ops.saveDeviceCode(db, d));
+  }
+  getDeviceCode(h: string): Promise<DeviceCodeRecord | null> {
+    return this.#use((db) => ops.getDeviceCode(db, h));
+  }
+  recordDevicePoll(h: string, now: number, interval: number): Promise<void> {
+    return this.#use((db) => ops.recordDevicePoll(db, h, now, interval));
+  }
+  resolveDeviceCode(u: string, status: 'approved' | 'denied', subject: string, now: number): Promise<boolean> {
+    return this.#use((db) => ops.resolveDeviceCode(db, u, status, subject, now));
+  }
+  consumeDeviceCode(h: string, now: number): Promise<DeviceCodeRecord | null> {
+    return this.#use((db) => ops.consumeDeviceCode(db, h, now));
+  }
+  savePar(p: ParRecord): Promise<void> {
+    return this.#use((db) => ops.savePar(db, p));
+  }
+  getPar(h: string, now: number): Promise<ParRecord | null> {
+    return this.#use((db) => ops.getPar(db, h, now));
+  }
+  consumePar(h: string, c: string, now: number): Promise<ParRecord | null> {
+    return this.#use((db) => ops.consumePar(db, h, c, now));
+  }
   saveAuthorizationCode(c: AuthorizationCodeRecord): Promise<void> {
     return this.#use((db) => ops.saveCode(db, c));
   }
@@ -391,6 +544,9 @@ export class SqliteStore implements Store {
     const db = new DatabaseSync(this.#path);
     db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
     db.exec(SCHEMA);
+    // Databases created before dynamic registration lack the column.
+    const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
     this.#db = db;
   }
 
@@ -410,6 +566,33 @@ export class SqliteStore implements Store {
   }
   getClient(id: string): Promise<ClientRecord | null> {
     return this.#enqueue((db) => ops.getClient(db, id));
+  }
+  deleteClient(id: string): Promise<boolean> {
+    return this.#enqueue((db) => ops.deleteClient(db, id));
+  }
+  saveDeviceCode(d: DeviceCodeRecord): Promise<void> {
+    return this.#enqueue((db) => ops.saveDeviceCode(db, d));
+  }
+  getDeviceCode(h: string): Promise<DeviceCodeRecord | null> {
+    return this.#enqueue((db) => ops.getDeviceCode(db, h));
+  }
+  recordDevicePoll(h: string, now: number, interval: number): Promise<void> {
+    return this.#enqueue((db) => ops.recordDevicePoll(db, h, now, interval));
+  }
+  resolveDeviceCode(u: string, status: 'approved' | 'denied', subject: string, now: number): Promise<boolean> {
+    return this.#enqueue((db) => ops.resolveDeviceCode(db, u, status, subject, now));
+  }
+  consumeDeviceCode(h: string, now: number): Promise<DeviceCodeRecord | null> {
+    return this.#enqueue((db) => ops.consumeDeviceCode(db, h, now));
+  }
+  savePar(p: ParRecord): Promise<void> {
+    return this.#enqueue((db) => ops.savePar(db, p));
+  }
+  getPar(h: string, now: number): Promise<ParRecord | null> {
+    return this.#enqueue((db) => ops.getPar(db, h, now));
+  }
+  consumePar(h: string, c: string, now: number): Promise<ParRecord | null> {
+    return this.#enqueue((db) => ops.consumePar(db, h, c, now));
   }
   saveAuthorizationCode(c: AuthorizationCodeRecord): Promise<void> {
     return this.#enqueue((db) => ops.saveCode(db, c));

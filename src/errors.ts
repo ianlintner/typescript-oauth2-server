@@ -7,7 +7,14 @@ export type OAuthErrorCode =
   | 'invalid_scope'
   | 'access_denied'
   | 'server_error'
-  | 'temporarily_unavailable';
+  | 'temporarily_unavailable'
+  | 'invalid_client_metadata'
+  | 'invalid_redirect_uri'
+  | 'authorization_pending'
+  | 'slow_down'
+  | 'expired_token'
+  | 'invalid_request_uri'
+  | 'unsupported_response_type';
 
 const STATUS: Record<OAuthErrorCode, number> = {
   invalid_request: 400,
@@ -19,6 +26,13 @@ const STATUS: Record<OAuthErrorCode, number> = {
   access_denied: 403,
   server_error: 500,
   temporarily_unavailable: 503,
+  invalid_client_metadata: 400,
+  invalid_redirect_uri: 400,
+  authorization_pending: 400,
+  slow_down: 400,
+  expired_token: 400,
+  invalid_request_uri: 400,
+  unsupported_response_type: 400,
 };
 
 export class OAuthError extends Error {

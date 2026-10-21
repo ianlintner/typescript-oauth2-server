@@ -29,9 +29,12 @@ test('every entry names a Rust reference', () => {
   }
 });
 
-test('no entry is yet marked passing, because the TS server has no endpoints', () => {
-  const passing = MATRIX.filter((entry) => entry.status === 'passing');
-  assert.equal(passing.length, 0, 'nothing may be passing until a TS endpoint is exercised');
+test('every passing entry names an exercised TS reference', () => {
+  for (const entry of MATRIX) {
+    if (entry.status === 'passing') {
+      assert.ok(entry.tsReference, `${entry.id} is passing but has no tsReference`);
+    }
+  }
 });
 
 test('matrix covers every route-method in the pinned Rust route table', () => {
