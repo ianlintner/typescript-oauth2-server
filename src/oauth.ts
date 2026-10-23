@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
+import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
 
@@ -137,6 +138,21 @@ export function bearerToken(req: FastifyRequest): string | undefined {
   return m ? m[1] : undefined;
 }
 
+/** Access token and scheme from the Authorization header (RFC 6750 Bearer or RFC 9449 DPoP). */
+function presentedToken(req: FastifyRequest): { token: string; scheme: 'Bearer' | 'DPoP' } | undefined {
+  const m = /^(Bearer|DPoP) (\S+)$/i.exec(req.headers.authorization ?? '');
+  if (!m) return undefined;
+  return { token: m[2]!, scheme: m[1]!.toLowerCase() === 'dpop' ? 'DPoP' : 'Bearer' };
+}
+
+/** cnf.jkt of a verified access-token payload, or null when the token is not sender-constrained. */
+function boundJkt(payload: Record<string, unknown>): string | null {
+  const cnf = payload.cnf;
+  if (typeof cnf !== 'object' || cnf === null) return null;
+  const jkt = (cnf as Record<string, unknown>).jkt;
+  return typeof jkt === 'string' && jkt !== '' ? jkt : null;
+}
+
 /**
  * RFC 8628 §3.4 device token grant. Returns the token reply. On a pending
  * authorization the reply carries the authorization_pending error and a
@@ -216,6 +232,17 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
     done(null, new URLSearchParams(body as string));
   });
+
+  /**
+   * Validate the request's DPoP proof, if any (RFC 9449 §5). Returns the proof
+   * key thumbprint to bind the issued tokens to, or null when no proof was sent
+   * (plain Bearer issuance). A present-but-invalid proof always fails closed.
+   */
+  const tokenEndpointProof = async (req: FastifyRequest): Promise<string | null> => {
+    const header = req.headers.dpop;
+    if (header === undefined) return null;
+    return (await validateDpopProof(deps, header, { method: 'POST', url: `${deps.issuer}/oauth/token` })).jkt;
+  };
 
   app.get('/oauth/authorize', async (req, reply) => {
     let params = new URL(req.url, 'http://localhost').searchParams;
@@ -335,6 +362,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (grantType === 'authorization_code') {
       const client = await authenticateClient(deps, req, form);
       if (!client.grantTypes.includes('authorization_code')) throw new OAuthError('unauthorized_client');
+      // Validate the proof before consuming the code so a bad proof cannot burn it.
+      const jkt = await tokenEndpointProof(req);
 
       const code = single(form, 'code');
       const redirectUri = single(form, 'redirect_uri');
@@ -373,6 +402,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (scopes !== '') claims.scope = scopes;
+      if (jkt) claims.cnf = { jkt };
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -382,7 +412,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       const body: Record<string, unknown> = {
         access_token: accessToken,
-        token_type: 'Bearer',
+        token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         ...(scopes !== '' ? { scope: scopes } : {}),
       };
@@ -409,7 +439,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           jti: rtJti, clientId: client.clientId, subject: record.subject,
           scope: scopes, expiresAt: iat + refreshTtl,
           family: rtJti, // each auth code creates a new family
-          parentJti: null, revokedByReplayAt: null, revokedAt: null,
+          parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
         });
         body.refresh_token = rtJti;
       }
@@ -423,6 +453,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       // public clients may not use client_credentials
       if (client.clientSecretHash === null) throw new OAuthError('invalid_client', 'public clients cannot use client_credentials');
       if (!client.grantTypes.includes('client_credentials')) throw new OAuthError('unauthorized_client');
+      const jkt = await tokenEndpointProof(req);
 
       const scope = (single(form, 'scope') ?? '').trim();
       const scopesList = scope ? scope.split(' ') : [];
@@ -440,6 +471,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (scope) claims.scope = scope;
+      if (jkt) claims.cnf = { jkt };
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -449,7 +481,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       return reply.header('pragma', 'no-cache').send({
         access_token: accessToken,
-        token_type: 'Bearer',
+        token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         ...(scope ? { scope } : {}),
       });
@@ -459,6 +491,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (grantType === 'refresh_token') {
       const client = await authenticateClient(deps, req, form);
       if (!client.grantTypes.includes('refresh_token')) throw new OAuthError('unauthorized_client');
+      const proofJkt = await tokenEndpointProof(req);
 
       const rtValue = single(form, 'refresh_token');
       if (!rtValue) throw new OAuthError('invalid_request', 'refresh_token is required');
@@ -468,6 +501,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (!lookedUp || lookedUp.clientId !== client.clientId) {
         throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
       }
+      // RFC 9449 §5: a DPoP-bound refresh token is only usable with a proof from the same key.
+      if (lookedUp.dpopJkt && proofJkt !== lookedUp.dpopJkt) {
+        throw new OAuthError('invalid_dpop_proof', 'refresh token is bound to a different DPoP key');
+      }
+      const jkt = proofJkt;
 
       const consumed = await deps.store.consumeRefreshToken(rtValue, deps.clock.now());
       if (!consumed) throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
@@ -500,6 +538,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (allowedScope) claims.scope = allowedScope;
+      if (jkt) claims.cnf = { jkt };
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -513,12 +552,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         scope: allowedScope, expiresAt: iat + refreshTtl,
         family: consumed.family,
         parentJti: consumed.jti,
-        revokedByReplayAt: null, revokedAt: null,
+        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
       });
 
       const body: Record<string, unknown> = {
         access_token: accessToken,
-        token_type: 'Bearer',
+        token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         refresh_token: rtJti,
         ...(allowedScope ? { scope: allowedScope } : {}),
@@ -633,7 +672,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
             active: true,
             scope: stored.scope || undefined,
             client_id: stored.clientId,
-            token_type: 'Bearer',
+            token_type: boundJkt(decoded) ? 'DPoP' : 'Bearer',
+            ...(boundJkt(decoded) ? { cnf: { jkt: boundJkt(decoded) } } : {}),
             exp: stored.expiresAt,
             iat: typeof decoded.iat === 'number' ? decoded.iat : undefined,
             jti: stored.jti,
@@ -672,6 +712,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['ES256'],
+    dpop_signing_alg_values_supported: [...DPOP_SIGNING_ALGS],
   } as const;
 
   app.get('/.well-known/oauth-authorization-server', async (_req, reply) => {
@@ -684,15 +725,35 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
   // -- UserInfo --
   app.get('/oauth/userinfo', async (req, reply) => {
-    const token = bearerToken(req);
-    if (!token) {
+    const presented = presentedToken(req);
+    if (!presented) {
       return reply.status(401).header('www-authenticate', 'Bearer').send({ error: 'invalid_token' });
     }
+    const { token, scheme } = presented;
 
     // Verify the JWT
     const payload = await verifyAccessJwt(deps, token);
     if (!payload) {
-      return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
+      return reply.status(401).header('www-authenticate', `${scheme} error="invalid_token"`).send({ error: 'invalid_token' });
+    }
+
+    // RFC 9449 §7: a sender-constrained token needs the DPoP scheme plus a fresh proof (ath) from the bound key,
+    // and the DPoP scheme is not valid for an unbound token. Never downgrade to Bearer.
+    const bound = boundJkt(payload);
+    if ((bound !== null) !== (scheme === 'DPoP')) {
+      return reply.status(401).header('www-authenticate', `${bound !== null ? 'DPoP' : 'Bearer'} error="invalid_token"`).send({ error: 'invalid_token' });
+    }
+    if (bound !== null) {
+      try {
+        const { jkt } = await validateDpopProof(deps, req.headers.dpop, { method: 'GET', url: `${deps.issuer}/oauth/userinfo`, accessToken: token });
+        if (jkt !== bound) {
+          return reply.status(401).header('www-authenticate', 'DPoP error="invalid_token"').send({ error: 'invalid_token' });
+        }
+      } catch (err) {
+        if (!(err instanceof OAuthError) || err.code !== 'invalid_dpop_proof') throw err;
+        return reply.status(401).header('www-authenticate', `DPoP error="invalid_dpop_proof", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
+          .send({ error: 'invalid_dpop_proof', ...(err.description ? { error_description: err.description } : {}) });
+      }
     }
 
     // Verify token is still alive in store (not revoked)
