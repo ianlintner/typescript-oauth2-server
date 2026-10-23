@@ -10,7 +10,7 @@
 # ratchet: an undeclared failure is a regression, and a deviation that stops
 # failing must be removed.
 implementation: ts-oauth2-server
-contract: 1ad9330a2954314cda9e2b462e36adaadfcd5061
+contract: 985fef7aca4835a7ab4fb92c94e8f979f7308189
 profiles: [core, token-lifecycle, oidc-basic]
 endpoint: http://localhost:8080
 deviations:

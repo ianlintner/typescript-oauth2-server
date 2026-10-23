@@ -101,6 +101,8 @@ export interface RefreshTokenRecord {
   revokedByReplayAt: number | null;
   /** Simple revocation (not replay). */
   revokedAt: number | null;
+  /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
+  dpopJkt?: string | null;
 }
 
 export interface Store {
@@ -162,6 +164,14 @@ export interface Store {
    * already revoked). Call on replay detection.
    */
   revokeTokenFamily(family: string, now: number): Promise<number>;
+
+  /**
+   * Atomically record a DPoP proof identifier (RFC 9449 §11.1). Returns true
+   * if `key` was unseen (and is now recorded until `expiresAt`), false if it
+   * was already recorded and still live (replay). Entries with
+   * expiresAt <= now are purged. Must be safe across processes sharing the store.
+   */
+  consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean>;
 
   /** Run `fn` atomically; commits on resolve, rolls back and rethrows on reject. Not reentrant. */
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T>;

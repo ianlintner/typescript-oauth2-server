@@ -5,6 +5,7 @@ export type OAuthErrorCode =
   | 'unauthorized_client'
   | 'unsupported_grant_type'
   | 'invalid_scope'
+  | 'invalid_dpop_proof'
   | 'access_denied'
   | 'server_error'
   | 'temporarily_unavailable'
@@ -23,6 +24,7 @@ const STATUS: Record<OAuthErrorCode, number> = {
   unauthorized_client: 400,
   unsupported_grant_type: 400,
   invalid_scope: 400,
+  invalid_dpop_proof: 400,
   access_denied: 403,
   server_error: 500,
   temporarily_unavailable: 503,
