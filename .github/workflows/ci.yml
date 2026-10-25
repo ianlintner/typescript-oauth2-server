@@ -27,7 +27,7 @@ jobs:
       - name: Start disposable transactional databases
         run: |
           docker run -d --rm --name parity-postgres -e POSTGRES_PASSWORD=localtest -e POSTGRES_DB=oauth2 -p 127.0.0.1:55433:5432 postgres:17
-          docker run -d --name parity-mongo -p 127.0.0.1:57018:27017 mongo:7 --replSet rs0 --bind_ip_all
+          docker run -d --name parity-mongo -p 127.0.0.1:57018:27017 mongo:7 bash -c 'openssl rand -base64 756 > /data/keyfile && chmod 400 /data/keyfile && exec mongod --replSet rs0 --bind_ip_all --keyFile /data/keyfile'
           for attempt in $(seq 1 30); do
             if docker exec parity-postgres pg_isready -U postgres && docker exec parity-mongo mongosh --quiet --eval 'if (!db.hello().isWritablePrimary) quit(1)'; then break; fi
             docker exec parity-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})' || true
@@ -35,10 +35,11 @@ jobs:
           done
           docker exec parity-postgres pg_isready -U postgres
           docker exec parity-mongo mongosh --quiet --eval 'if (!db.hello().isWritablePrimary) quit(1)' || { docker logs parity-mongo; exit 1; }
+          docker exec parity-mongo mongosh --quiet --eval 'db.getSiblingDB("admin").createUser({user:"parity_admin",pwd:"localtest",roles:[{role:"root",db:"admin"}]})'
       - name: Transactional adapter parity (real databases)
         env:
           TEST_POSTGRES_URL: postgres://postgres:localtest@127.0.0.1:55433/oauth2
-          TEST_MONGO_URL: mongodb://127.0.0.1:57018/?directConnection=true
+          TEST_MONGO_URL: mongodb://parity_admin:localtest@127.0.0.1:57018/?directConnection=true&authSource=admin
         run: bash scripts/test-adapters.sh
 
   conformance:

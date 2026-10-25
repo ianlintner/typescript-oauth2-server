@@ -7,8 +7,14 @@ type Row = { _id: string; namespace: string; kind: string; id: string; data: unk
 export class MongoStore extends DocumentStore {
   private readonly client: MongoClient;
   private collection: Collection<Row> | null = null;
-  constructor(url: string, private readonly namespace = 'oauth2', database = 'oauth2') {
-    super(); this.client = new MongoClient(url); this.database = database;
+  constructor(url: string, private readonly namespace = 'oauth2', database?: string) {
+    super();
+    const uriDatabase = decodeURIComponent(new URL(url).pathname.slice(1));
+    if (uriDatabase && database && uriDatabase !== database) {
+      throw new Error('MongoDB URI database conflicts with explicit database');
+    }
+    this.client = new MongoClient(url);
+    this.database = database ?? (uriDatabase || 'oauth2');
   }
   private readonly database: string;
   async init(): Promise<void> {

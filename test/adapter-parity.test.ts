@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Store } from '../src/ports.js';
 import { PostgresStore } from '../src/postgres-store.js';
+import { MongoClient } from 'mongodb';
 import { MongoStore } from '../src/mongo-store.js';
 import { SqliteStore } from '../src/sqlite-store.js';
 
@@ -13,6 +14,61 @@ process.on('exit', () => rmSync(sqliteDir, { recursive: true, force: true }));
 const factories: Array<[string, () => Store]> = [['sqlite', () => new SqliteStore(join(sqliteDir, 'parity.db'))]];
 if (process.env.TEST_POSTGRES_URL) factories.push(['postgres', () => new PostgresStore(process.env.TEST_POSTGRES_URL!, 'adapter_parity')]);
 if (process.env.TEST_MONGO_URL) factories.push(['mongo', () => new MongoStore(process.env.TEST_MONGO_URL!, 'adapter_parity')]);
+
+test('mongo: URI database paths isolate clients and tokens with database-scoped credentials', { skip: !process.env.TEST_MONGO_URL }, async () => {
+  const base = new URL(process.env.TEST_MONGO_URL!);
+  const prefix = `uri_${crypto.randomUUID().replaceAll('-', '')}`;
+  const firstDb = `${prefix}_a`;
+  const secondDb = `${prefix}_b`;
+  const namespace = 'same_namespace';
+  const clientId = `client-${prefix}`;
+  const tokenId = `token-${prefix}`;
+  const uri = (db: string, user?: string, password?: string) => {
+    const url = new URL(base);
+    url.pathname = `/${db}`;
+    if (user && password) { url.username = user; url.password = password; url.searchParams.set('authSource', db); }
+    return url.toString();
+  };
+  const admin = new MongoClient(base.toString());
+  await admin.connect();
+  const first = new MongoStore(uri(firstDb), namespace);
+  const second = new MongoStore(uri(secondDb), namespace);
+  const password = crypto.randomUUID();
+  const user = `user_${prefix}`;
+  try {
+    await first.init(); await second.init();
+    await first.saveClient({clientId, clientSecretHash:null, redirectUris:[], grantTypes:[], scopes:[], enabled:true});
+    await first.saveRefreshToken({jti:tokenId, clientId, subject:'user', scope:'read', expiresAt:2000,
+      family:tokenId, parentJti:null, revokedAt:null, revokedByReplayAt:null});
+    assert.equal(await second.getClient(clientId), null);
+    assert.equal(await second.getRefreshToken(tokenId, 1000), null);
+    assert.equal(await admin.db(firstDb).collection('oauth2_documents').countDocuments({ namespace }), 3);
+    assert.equal(await admin.db(secondDb).collection('oauth2_documents').countDocuments({ namespace, kind: 'client' }), 0);
+    await admin.db(firstDb).command({ createUser: user, pwd: password, roles: [{ role: 'readWrite', db: firstDb }] });
+    const scoped = new MongoStore(uri(firstDb, user, password), namespace);
+    try {
+      await scoped.init();
+      assert.ok(await scoped.getClient(clientId));
+      assert.ok(await scoped.getRefreshToken(tokenId, 1000));
+      const deniedUrl = new URL(uri(secondDb, user, password));
+      deniedUrl.searchParams.set('authSource', firstDb);
+      const denied = new MongoClient(deniedUrl.toString());
+      try {
+        await denied.connect();
+        await assert.rejects(denied.db(secondDb).collection('oauth2_documents').findOne({ namespace }), /not authorized/);
+      } finally { await denied.close(); }
+    } finally { await scoped.close(); }
+  } finally {
+    await first.close(); await second.close();
+    await admin.db(firstDb).command({ dropDatabase: 1 });
+    await admin.db(secondDb).command({ dropDatabase: 1 });
+    await admin.close();
+  }
+});
+
+test('mongo: explicit database cannot contradict URI path', () => {
+  assert.throws(() => new MongoStore('mongodb://localhost/selected', 'oauth2', 'other'), /conflicts/);
+});
 
 for (const [name, make] of factories) {
   test(`${name}: PAR and device claims are single-use across restart and concurrent replicas`, async () => {
