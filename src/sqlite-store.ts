@@ -563,6 +563,9 @@ export class SqliteStore implements Store {
     // Databases created before dynamic registration lack the column.
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
+    // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
+    const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
+    if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
     this.#db = db;
   }
 

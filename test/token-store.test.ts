@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { AccessTokenRecord, RefreshTokenRecord, Store } from '../src/ports.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -175,6 +176,70 @@ test('data persists across process restart', async () => {
     assert.equal(await b.getAccessToken('at-001', 1000), null, 'revocation persists');
     assert.equal(await b.consumeRefreshToken('rt-001', 1000), null, 'consumption persists');
     await b.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// -- legacy (pre-DPoP) database upgrade --
+
+// refresh_tokens exactly as shipped before RFC 9449 support: no dpop_jkt column.
+const LEGACY_REFRESH_TOKENS = `
+CREATE TABLE refresh_tokens (
+  jti TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  family TEXT NOT NULL,
+  parent_jti TEXT,
+  consumed_at INTEGER,
+  revoked_at INTEGER,
+  revoked_by_replay_at INTEGER
+);`;
+
+test('legacy refresh_tokens table gains dpop_jkt on init; save, rotate and repeated init work', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-rt-'));
+  const path = join(dir, 'legacy.db');
+  try {
+    const legacy = new DatabaseSync(path);
+    legacy.exec(LEGACY_REFRESH_TOKENS);
+    legacy
+      .prepare('INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('rt-old', 'c1', 'u1', 'read', 10000, 'fam-old');
+    legacy.close();
+
+    const s = new SqliteStore(path);
+    await s.init();
+    try {
+      // A pre-upgrade token survives, unbound.
+      const old = await s.getRefreshToken('rt-old', 1000);
+      assert.ok(old);
+      assert.equal(old.dpopJkt ?? null, null);
+
+      // New tokens (bound) can be saved, then rotated.
+      await s.saveRefreshToken({ ...rt, jti: 'rt-bound', family: 'fam-new', dpopJkt: 'thumb-1' });
+      const consumed = await s.consumeRefreshToken('rt-bound', 1000);
+      assert.ok(consumed);
+      assert.equal(consumed.dpopJkt, 'thumb-1');
+      await s.saveRefreshToken({ ...rt, jti: 'rt-bound-2', family: 'fam-new', parentJti: 'rt-bound', dpopJkt: 'thumb-1' });
+      assert.equal((await s.getRefreshToken('rt-bound-2', 1000))?.dpopJkt, 'thumb-1');
+      assert.ok(await s.consumeRefreshToken('rt-old', 1000));
+    } finally {
+      await s.close();
+    }
+
+    // Repeated init is idempotent and keeps the data.
+    const again = new SqliteStore(path);
+    await again.init();
+    try {
+      await again.init();
+      assert.equal((await again.getRefreshToken('rt-bound-2', 1000))?.dpopJkt, 'thumb-1');
+      await again.saveRefreshToken({ ...rt, jti: 'rt-after-reinit', family: 'fam-3' });
+      assert.ok(await again.getRefreshToken('rt-after-reinit', 1000));
+    } finally {
+      await again.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
