@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   parent_jti TEXT,
   consumed_at INTEGER,
   revoked_at INTEGER,
-  revoked_by_replay_at INTEGER
+  revoked_by_replay_at INTEGER,
+  dpop_jkt TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT PRIMARY KEY,
@@ -63,6 +64,10 @@ CREATE TABLE IF NOT EXISTS par_requests (
   params TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   consumed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS dpop_proofs (
+  key TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
 );`;
 
 interface ClientRow {
@@ -144,6 +149,7 @@ interface RefreshTokenRow {
   consumed_at: number | null;
   revoked_at: number | null;
   revoked_by_replay_at: number | null;
+  dpop_jkt: string | null;
 }
 
 function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
@@ -169,6 +175,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     parentJti: r.parent_jti,
     revokedByReplayAt: r.revoked_by_replay_at,
     revokedAt: r.revoked_at,
+    dpopJkt: r.dpop_jkt,
   };
 }
 
@@ -328,9 +335,15 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt);
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null);
+  },
+
+  // INSERT OR IGNORE on the primary key: the database decides the winner across connections and processes.
+  consumeDpopJti(db: DatabaseSync, key: string, expiresAt: number, now: number): boolean {
+    db.prepare('DELETE FROM dpop_proofs WHERE expires_at <= ?').run(now);
+    return Number(db.prepare('INSERT OR IGNORE INTO dpop_proofs (key, expires_at) VALUES (?, ?)').run(key, expiresAt).changes) === 1;
   },
 
   consumeRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
@@ -506,6 +519,9 @@ class TxStore implements Store {
   revokeRefreshToken(jti: string, now: number): Promise<boolean> {
     return this.#use((db) => ops.revokeRefreshToken(db, jti, now));
   }
+  consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
+    return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
+  }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#use((db) => ops.revokeTokenFamily(db, family, now));
   }
@@ -547,6 +563,9 @@ export class SqliteStore implements Store {
     // Databases created before dynamic registration lack the column.
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
+    // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
+    const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
+    if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
     this.#db = db;
   }
 
@@ -620,6 +639,9 @@ export class SqliteStore implements Store {
   }
   revokeRefreshToken(jti: string, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.revokeRefreshToken(db, jti, now));
+  }
+  consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
+    return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
