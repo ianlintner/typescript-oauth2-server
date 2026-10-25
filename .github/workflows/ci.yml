@@ -24,6 +24,22 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      - name: Start disposable transactional databases
+        run: |
+          docker run -d --rm --name parity-postgres -e POSTGRES_PASSWORD=localtest -e POSTGRES_DB=oauth2 -p 127.0.0.1:55433:5432 postgres:17
+          docker run -d --rm --name parity-mongo -p 127.0.0.1:57018:27017 mongo:8 --replSet rs0 --bind_ip_all
+          for attempt in $(seq 1 30); do
+            if docker exec parity-postgres pg_isready -U postgres && docker exec parity-mongo mongosh --quiet --eval 'if (!db.hello().isWritablePrimary) quit(1)'; then break; fi
+            docker exec parity-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})' || true
+            sleep 2
+          done
+          docker exec parity-postgres pg_isready -U postgres
+          docker exec parity-mongo mongosh --quiet --eval 'if (!db.hello().isWritablePrimary) quit(1)'
+      - name: Transactional adapter parity (real databases)
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:localtest@127.0.0.1:55433/oauth2
+          TEST_MONGO_URL: mongodb://127.0.0.1:57018/?directConnection=true
+        run: bash scripts/test-adapters.sh
 
   conformance:
     name: Conformance (oauth2-conformance core)
