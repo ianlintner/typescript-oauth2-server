@@ -4,6 +4,10 @@ import { cryptoRandom, systemClock } from './runtime.js';
 import { buildServer } from './server.js';
 import { createJoseSigner } from './signer.js';
 import { SqliteStore } from './sqlite-store.js';
+import { PostgresStore } from './postgres-store.js';
+import { MongoStore } from './mongo-store.js';
+import { Metrics } from './metrics.js';
+import type { Store } from './ports.js';
 import { assertSafeForConformance, conformanceModeFromEnv } from './sut/mode.js';
 import { applySeed, assertProvisionable, loadSeed } from './sut/seed.js';
 import { createTestRegistry, LOGIN_PATH, makeConsent, makeTestAuthenticate, makeTestAuthTime, makeTestEndSession, registerTestLoginRoutes } from './sut/routes.js';
@@ -23,7 +27,9 @@ export interface RunningServer {
 export async function startServer(env: Record<string, string | undefined>): Promise<RunningServer> {
   const config = loadConfig(env);
   const signer = await createJoseSigner(config.signingKeyPem, config.signingKeyId);
-  const store = new SqliteStore(config.databasePath);
+  const store: Store = config.storage === 'postgres'
+    ? new PostgresStore(config.databaseUrl!)
+    : config.storage === 'mongo' ? new MongoStore(config.databaseUrl!) : new SqliteStore(config.databasePath);
   await store.init();
 
   const mode = conformanceModeFromEnv(env);
@@ -45,6 +51,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     clock: systemClock,
     random: cryptoRandom,
     issuer: config.issuer,
+    metrics: config.metricsEnabled ? new Metrics() : undefined,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
     consent,
@@ -59,7 +66,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
 
 async function listen(
   server: import('fastify').FastifyInstance,
-  store: SqliteStore,
+  store: Store,
   config: { host: string; port: number },
 ): Promise<RunningServer> {
   try {

@@ -11,6 +11,9 @@ export interface Config {
   host: string;
   port: number;
   databasePath: string;
+  storage: 'sqlite' | 'postgres' | 'mongo';
+  databaseUrl: string | null;
+  metricsEnabled: boolean;
   sessionSecret: string;
   signingKeyPem: string;
   signingKeyId: string;
@@ -79,8 +82,24 @@ export function loadConfig(env: Env): Config {
   const signingKeyPem = required(env, 'OAUTH2_SIGNING_KEY_PEM');
   const signingKeyId = required(env, 'OAUTH2_SIGNING_KEY_ID');
 
+  const storage = env.OAUTH2_STORAGE ?? 'sqlite';
+  if (storage !== 'sqlite' && storage !== 'postgres' && storage !== 'mongo') throw new ConfigError('OAUTH2_STORAGE must be sqlite, postgres or mongo');
+  let databaseUrl: string | null = null;
+  if (storage !== 'sqlite') {
+    databaseUrl = required(env, 'OAUTH2_DATABASE_URL');
+    let url: URL;
+    try { url = new URL(databaseUrl); } catch { throw new ConfigError('OAUTH2_DATABASE_URL is invalid'); }
+    if (storage === 'postgres' ? !['postgres:', 'postgresql:'].includes(url.protocol) : !['mongodb:', 'mongodb+srv:'].includes(url.protocol)) {
+      throw new ConfigError('OAUTH2_DATABASE_URL has wrong scheme');
+    }
+  }
+  const metricsEnabled = env.OAUTH2_METRICS_ENABLED === '1';
+  if (env.OAUTH2_METRICS_ENABLED && !['0', '1'].includes(env.OAUTH2_METRICS_ENABLED)) throw new ConfigError('OAUTH2_METRICS_ENABLED must be 0 or 1');
+  const host = env.OAUTH2_HOST?.trim() || '127.0.0.1';
+  if (metricsEnabled && !LOOPBACK.has(host)) throw new ConfigError('OAUTH2_METRICS_ENABLED requires a loopback host');
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
-  if (production) {
+  if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
       throw new ConfigError('OAUTH2_DATABASE_PATH must be a persistent file path in production');
     }
@@ -91,9 +110,12 @@ export function loadConfig(env: Env): Config {
   return {
     env: mode,
     issuer,
-    host: env.OAUTH2_HOST?.trim() || '127.0.0.1',
+    host,
     port: parsePort(env.OAUTH2_PORT),
     databasePath: databasePath as string,
+    storage,
+    databaseUrl,
+    metricsEnabled,
     sessionSecret,
     signingKeyPem,
     signingKeyId,

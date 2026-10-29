@@ -67,7 +67,7 @@ export function assertSafeForConformance(env: Record<string, string | undefined>
       );
     }
   }
-  if (!inMemorySqlite(config.databasePath)) {
+  if (config.storage !== 'sqlite' || !inMemorySqlite(config.databasePath)) {
     throw new ConfigError(
       'conformance mode refused: it requires an in-memory database so seeded test credentials are never persisted to a shared or production store',
     );

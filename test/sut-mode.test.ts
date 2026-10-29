@@ -77,6 +77,11 @@ test('guard refuses any other profile variable naming a non-test environment', (
   }
 });
 
+test('guard refuses network storage even when sqlite default is in memory', () => {
+  refused({ ...base, OAUTH2_STORAGE: 'postgres', OAUTH2_DATABASE_URL: 'postgres://localhost/oauth2' }, /in-memory/);
+  refused({ ...base, OAUTH2_STORAGE: 'mongo', OAUTH2_DATABASE_URL: 'mongodb://localhost/oauth2' }, /in-memory/);
+});
+
 test('guard refuses persistent database paths', () => {
   refused({ ...base, OAUTH2_DATABASE_PATH: '/var/lib/oauth2/db.sqlite' }, /in-memory/);
   refused({ ...base, OAUTH2_DATABASE_PATH: 'file::memory:?cache=shared' }, /in-memory/);

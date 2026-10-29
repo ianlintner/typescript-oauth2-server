@@ -18,6 +18,14 @@ const prod = {
   OAUTH2_DATABASE_PATH: '/var/lib/oauth2/db.sqlite',
 };
 
+test('persistent adapters need a valid URL and metrics require loopback binding', () => {
+  assert.equal(loadConfig({ ...prod, OAUTH2_STORAGE: 'postgres', OAUTH2_DATABASE_URL: 'postgres://localhost/oauth2' }).storage, 'postgres');
+  assert.equal(loadConfig({ ...prod, OAUTH2_STORAGE: 'mongo', OAUTH2_DATABASE_URL: 'mongodb://localhost/oauth2' }).storage, 'mongo');
+  rejects({ ...prod, OAUTH2_STORAGE: 'mongo' }, /OAUTH2_DATABASE_URL/);
+  rejects({ ...dev, OAUTH2_STORAGE: 'redis' }, /OAUTH2_STORAGE/);
+  rejects({ ...prod, OAUTH2_STORAGE: 'postgres', OAUTH2_DATABASE_URL: 'postgres://user:pass@localhost/db', OAUTH2_METRICS_ENABLED: '1', OAUTH2_HOST: '0.0.0.0' }, /OAUTH2_METRICS_ENABLED/);
+});
+
 function rejects(env: Record<string, string | undefined>, pattern: RegExp) {
   assert.throws(() => loadConfig(env), (e) => e instanceof ConfigError && pattern.test(e.message));
 }
