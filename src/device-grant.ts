@@ -1,6 +1,7 @@
 import { createHash, randomInt } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
+import { redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord } from './ports.js';
 // Reuse the core module's shared helpers and client auth so slice semantics stay identical.
@@ -158,7 +159,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     if (params.response_type !== undefined && params.response_type !== 'code') {
       throw new OAuthError('unsupported_response_type', 'only response_type=code is supported');
     }
-    if (params.redirect_uri !== undefined && !client.redirectUris.includes(params.redirect_uri)) {
+    if (params.redirect_uri !== undefined && !redirectUriMatches(client.redirectUris, params.redirect_uri)) {
       throw new OAuthError('invalid_request', 'redirect_uri is not registered for this client');
     }
 

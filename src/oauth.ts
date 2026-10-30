@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
+import { redirectUriMatches } from './redirect-uri.js';
 import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
@@ -282,9 +283,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (!clientId || !redirectUri) throw new OAuthError('invalid_request', 'client_id and redirect_uri are required');
     const client = await deps.store.getClient(clientId);
     if (!client || !client.enabled) {
-      throw new OAuthError('invalid_request', 'unknown client');
+      // RFC 6749 §4.1.1 / contract: an unknown client is invalid_client (401). It is shown to
+      // the user agent and never redirected, because redirect_uri is not yet trusted.
+      throw new OAuthError('invalid_client', 'unknown client');
     }
-    if (!client.redirectUris.includes(redirectUri)) {
+    if (!redirectUriMatches(client.redirectUris, redirectUri)) {
       if (requestUri !== undefined) {
         throw new OAuthError('invalid_request', 'redirect_uri not registered for this client');
       }
@@ -370,7 +373,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const verifier = single(form, 'code_verifier');
       if (!code) throw new OAuthError('invalid_request', 'code is required');
       if (!redirectUri) throw new OAuthError('invalid_request', 'redirect_uri is required');
-      if (!verifier) throw new OAuthError('invalid_request', 'code_verifier is required');
 
       // Consume atomically; a code presented by the wrong client is rolled back so it cannot be burned by others.
       const record = await deps.store.transaction(async (tx) => {
@@ -381,8 +383,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       });
       if (!record) throw new OAuthError('invalid_grant', 'authorization code is invalid, expired or already used');
       if (record.redirectUri !== redirectUri) throw new OAuthError('invalid_grant', 'redirect_uri mismatch');
-      const challenge = createHash('sha256').update(verifier).digest('base64url');
-      if (!VERIFIER_RE.test(verifier) || !safeEqual(challenge, record.codeChallenge)) {
+      // RFC 7636 §4.3: a challenge was bound at authorization, so an exchange without a
+      // verifier fails verification (invalid_grant); the code is already consumed above.
+      if (
+        !verifier || !VERIFIER_RE.test(verifier)
+        || !safeEqual(createHash('sha256').update(verifier).digest('base64url'), record.codeChallenge)
+      ) {
         throw new OAuthError('invalid_grant', 'PKCE verification failed');
       }
 

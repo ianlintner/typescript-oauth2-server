@@ -71,7 +71,7 @@ test('normal start exposes no test login, no seeded client, and authorize stays 
     assert.equal((await fetch(`${base}/auth/login`)).status, 404);
     assert.equal((await login(base, 'alice', 'test-only-password')).status, 404);
     // Unknown client: the seed was never applied.
-    assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 400);
+    assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 401);
   });
 });
 
@@ -79,7 +79,7 @@ test('a seed path without the mode switch is ignored', async () => {
   const env = { ...(await baseEnv()), OAUTH2_CONFORMANCE_SEED: SEED_PATH };
   await withServer(env, async (base) => {
     assert.equal((await fetch(`${base}/auth/login`)).status, 404);
-    assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 400);
+    assert.equal((await fetch(authorizeUrl(base, 'client-public'), { redirect: 'manual' })).status, 401);
   });
 });
 

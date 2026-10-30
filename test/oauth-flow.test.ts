@@ -89,9 +89,10 @@ test('authorize never redirects for unknown client, disabled client or unregiste
   const s = await setup();
   for (const p of [{ client_id: 'nope' }, { client_id: 'off' }, { redirect_uri: 'https://attacker.example/cb' }, { redirect_uri: `${CB}/` }, { redirect_uri: '' }, { client_id: '' }]) {
     const res = await authz(s.server, p);
-    assert.equal(res.statusCode, 400, JSON.stringify(p));
+    const unknownClient = p.client_id === 'nope' || p.client_id === 'off';
+    assert.equal(res.statusCode, unknownClient ? 401 : 400, JSON.stringify(p));
     assert.equal(res.headers.location, undefined);
-    assert.equal(res.json().error, 'invalid_request');
+    assert.equal(res.json().error, unknownClient ? 'invalid_client' : 'invalid_request');
   }
   await done(s);
 });
@@ -276,7 +277,6 @@ test('token endpoint rejects malformed requests', async () => {
     [{ grant_type: '' }, 400, 'invalid_request'],
     [{ code: '' }, 400, 'invalid_request'],
     [{ redirect_uri: '' }, 400, 'invalid_request'],
-    [{ code_verifier: '' }, 400, 'invalid_request'],
   ];
   for (const [extra, status, err] of cases) {
     const p = { ...exchange(code), ...extra };
