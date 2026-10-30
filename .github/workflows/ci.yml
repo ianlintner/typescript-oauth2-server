@@ -86,3 +86,13 @@ jobs:
         run: |
           CONFORMANCE_PROFILE=oidc-basic scripts/conformance-run.sh build/conformance-report-oidc-basic.json .contract
           node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-oidc-basic.json
+
+      - name: Run the extended-grants profile against the TypeScript server
+        run: |
+          CONFORMANCE_PROFILE=extended-grants scripts/conformance-run.sh build/conformance-report-extended-grants.json .contract
+          node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-extended-grants.json
+
+      - name: Run the sender-constrained profile against the TypeScript server
+        run: |
+          CONFORMANCE_PROFILE=sender-constrained scripts/conformance-run.sh build/conformance-report-sender-constrained.json .contract
+          node scripts/check-conformance-report.mjs conformance.yaml build/conformance-report-sender-constrained.json
