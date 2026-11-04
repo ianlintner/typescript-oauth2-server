@@ -24,6 +24,12 @@ export interface ClientRecord {
   grantTypes: string[];
   scopes: string[];
   enabled: boolean;
+  /** Registered authentication method; absent means secret-based (or none when clientSecretHash is null). */
+  tokenEndpointAuthMethod?: string | null | undefined;
+  /** Inline public JWKS for `private_key_jwt` (RFC 7523 §2.2). */
+  jwks?: Jwks | null | undefined;
+  /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
+  jwksUri?: string | null | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }

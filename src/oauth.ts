@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
@@ -100,9 +101,63 @@ export function formDecode(value: string): string {
   }
 }
 
+export const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
+/** Algorithms accepted for private_key_jwt client assertions (RFC 7523 §2.2). */
+export const CLIENT_ASSERTION_ALGS = ['RS256', 'ES256'] as const;
+
+/** A client with neither a secret nor a registered key cannot authenticate: it is public. */
+export const isPublicClient = (c: ClientRecord): boolean => c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt';
+
+function candidateKeys(client: ClientRecord, alg: string, kid: string | undefined): JWK[] {
+  const kty = alg === 'ES256' ? 'EC' : 'RSA';
+  return (client.jwks?.keys ?? []).filter((k) => k.kty === kty && k.use !== 'enc' && (k.alg === undefined || k.alg === alg) &&
+    (kid === undefined || k.kid === kid)) as JWK[];
+}
+
+/** private_key_jwt (RFC 7523 §2.2 / OIDC Core 9): every failure is the same opaque invalid_client. */
+async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claimedId: string | undefined): Promise<ClientRecord> {
+  const invalid = new OAuthError('invalid_client', 'client authentication failed');
+  let iss: unknown, alg: string, kid: string | undefined;
+  try {
+    const header = decodeProtectedHeader(assertion);
+    alg = String(header.alg); kid = header.kid;
+    const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8')) as Record<string, unknown>;
+    iss = payload.iss;
+  } catch { throw invalid; }
+  if (typeof iss !== 'string' || iss === '' || (claimedId !== undefined && claimedId !== iss)) throw invalid;
+  if (!(CLIENT_ASSERTION_ALGS as readonly string[]).includes(alg)) throw invalid;
+  const client = await deps.store.getClient(iss);
+  if (!client || !client.enabled || client.tokenEndpointAuthMethod !== 'private_key_jwt') throw invalid;
+  const now = deps.clock.now();
+  let exp: number | undefined, jti: string | undefined;
+  for (const jwk of candidateKeys(client, alg, kid)) {
+    try {
+      const { payload } = await jwtVerify(assertion, await importJWK(jwk, alg), {
+        algorithms: [alg], issuer: client.clientId, subject: client.clientId,
+        audience: [`${deps.issuer}/oauth/token`, deps.issuer], currentDate: new Date(now * 1000), requiredClaims: ['exp', 'jti'],
+      });
+      if (typeof payload.jti !== 'string' || payload.jti === '') continue;
+      exp = payload.exp; jti = payload.jti;
+      break;
+    } catch { /* try next candidate key */ }
+  }
+  if (exp === undefined || jti === undefined) throw invalid;
+  // RFC 7523 §3 / RFC 9700: a (client, jti) pair is accepted once within the assertion's lifetime.
+  if (!await deps.store.consumeDpopJti(`cja:${client.clientId}:${jti}`, exp, now)) throw invalid;
+  return client;
+}
+
 export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
+  const assertionType = single(form, 'client_assertion_type');
+  const assertion = single(form, 'client_assertion');
+  if (assertionType !== undefined || assertion !== undefined) {
+    // RFC 6749 §2.3: one authentication method per request.
+    if (req.headers.authorization !== undefined || secret !== undefined) throw new OAuthError('invalid_request', 'multiple client authentication methods');
+    if (assertionType !== CLIENT_ASSERTION_TYPE || assertion === undefined) throw new OAuthError('invalid_client', 'client authentication failed');
+    return authenticateByAssertion(deps, assertion, id);
+  }
   const header = req.headers.authorization;
   if (header !== undefined) {
     const match = /^Basic ([A-Za-z0-9+/=]+)$/i.exec(header);
@@ -124,6 +179,7 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
     if (secret) await verifyClientSecret(secret, await hashClientSecret('dummy-secret'));
     throw invalid;
   }
+  if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
   if (client.clientSecretHash === null) {
     if (secret) throw invalid; // public clients never authenticate with a secret
     return client;
@@ -457,7 +513,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     if (grantType === 'client_credentials') {
       const client = await authenticateClient(deps, req, form);
       // public clients may not use client_credentials
-      if (client.clientSecretHash === null) throw new OAuthError('invalid_client', 'public clients cannot use client_credentials');
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use client_credentials');
       if (!client.grantTypes.includes('client_credentials')) throw new OAuthError('unauthorized_client');
       const jkt = await tokenEndpointProof(req);
 
@@ -583,7 +639,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // -- device_code (RFC 8628 §3.4) --
     if (grantType === 'urn:ietf:params:oauth:grant-type:device_code' || grantType === 'device_code') {
       const client = await authenticateClient(deps, req, form);
-      if (!client.clientSecretHash) throw new OAuthError('invalid_client', 'public clients cannot use device_code');
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use device_code');
       if (!client.grantTypes.includes('urn:ietf:params:oauth:grant-type:device_code') &&
           !client.grantTypes.includes('device_code')) {
         throw new OAuthError('unauthorized_client', 'client is not allowed to use device_code grant');
@@ -714,7 +770,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code'],
-    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
+    token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['ES256'],

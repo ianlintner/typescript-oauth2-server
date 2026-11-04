@@ -200,7 +200,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
 
     const now = deps.clock.now();
     const clientId = deps.random.token(16);
-    const clientSecret = authMethod === 'none' ? null : deps.random.token(32);
+    const jwks = authMethod === 'private_key_jwt' ? normalizeJwks(meta.jwks) : null;
+    const clientSecret = authMethod === 'none' || jwks ? null : deps.random.token(32);
     const regToken = deps.random.token(32);
     const clientSecretHash = clientSecret === null ? null : await hashClientSecret(clientSecret);
 
@@ -212,6 +213,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       response_types: responseTypes,
       scope,
     };
+    if (jwks) metadata.jwks = jwks;
     for (const k of ['client_uri', 'logo_uri', 'tos_uri', 'policy_uri', 'jwks_uri', 'contacts']) {
       if (meta[k] !== undefined) metadata[k] = meta[k];
     }
@@ -223,6 +225,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grantTypes,
       scopes: scope.split(' ').filter((s) => s !== ''),
       enabled: true,
+      ...(jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks } : {}),
       registration: { tokenHash: sha256(regToken), issuedAt: now, metadata },
     };
     await deps.store.saveClient(client);
@@ -330,10 +333,25 @@ function normalizeRedirectUris(value: unknown): string[] {
 
 function normalizeAuthMethod(value: unknown): string {
   if (value === undefined) return 'client_secret_basic';
-  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none') {
+  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none' && value !== 'private_key_jwt') {
     throw new OAuthError('invalid_client_metadata', 'unsupported token_endpoint_auth_method');
   }
   return value;
+}
+
+/** Inline public JWKS for private_key_jwt. jwks_uri is not fetched by this server, so it cannot stand in for keys. */
+function normalizeJwks(value: unknown): { keys: Array<Record<string, unknown>> } {
+  const bad = (why: string) => new OAuthError('invalid_client_metadata', why);
+  if (typeof value !== 'object' || value === null || !Array.isArray((value as { keys?: unknown }).keys)) {
+    throw bad('private_key_jwt requires an inline jwks');
+  }
+  const keys = (value as { keys: unknown[] }).keys;
+  if (keys.length === 0) throw bad('jwks must contain at least one key');
+  for (const k of keys) {
+    if (typeof k !== 'object' || k === null || !['RSA', 'EC'].includes(String((k as Record<string, unknown>).kty))) throw bad('jwks keys must be RSA or EC');
+    for (const priv of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k']) if (priv in k) throw bad('jwks must contain public keys only');
+  }
+  return { keys: keys as Array<Record<string, unknown>> };
 }
 
 function normalizeGrantTypes(value: unknown, authMethod: string): string[] {
