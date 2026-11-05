@@ -245,3 +245,30 @@ test('RFC 7592 PUT: same-method update replaces stored and echoed jwks (key rota
   assert.deepEqual(stored.jwks, { keys: [k2] });
   assert.deepEqual(stored.registration!.metadata.jwks, { keys: [k2] });
 });
+
+test('registration requires supplied key_ops to include verify before a key counts as usable', async () => {
+  const { reg, k } = await regSetup();
+  const base = { redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'] };
+  // key_ops: [] imports but yields a CryptoKey without verify usage: it must not count as usable.
+  const empty = await reg({ ...base, jwks: { keys: [{ ...k, key_ops: [] }] } });
+  assert.equal(empty.statusCode, 400, 'key_ops: [] must not satisfy the usable-key requirement');
+  assert.equal(empty.json().error, 'invalid_client_metadata');
+  // key_ops that omits verify is likewise unusable.
+  assert.equal((await reg({ ...base, jwks: { keys: [{ ...k, key_ops: ['sign'] }] } })).statusCode, 400);
+  // A usable key alongside an unusable one still registers.
+  assert.equal((await reg({ ...base, jwks: { keys: [{ ...k, key_ops: [] }, k] } })).statusCode, 201);
+  // key_ops containing verify is accepted, and omission stays valid.
+  assert.equal((await reg({ ...base, jwks: { keys: [{ ...k, key_ops: ['verify'] }] } })).statusCode, 201);
+  assert.equal((await reg({ ...base, jwks: { keys: [k] } })).statusCode, 201);
+});
+
+test('RFC 7592 PUT: rotation to a key without verify usage is rejected and keeps working keys', async () => {
+  const { store, reg, put, k } = await regSetup();
+  const base = { redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'] };
+  const pk = (await reg({ ...base, jwks: { keys: [k] } })).json();
+  const k2 = await exportJWK((await generateKeyPair('ES256', { extractable: true })).publicKey);
+  const r = await put(pk.client_id, pk.registration_access_token, { ...base, jwks: { keys: [{ ...k2, key_ops: [] }] } });
+  assert.equal(r.statusCode, 400);
+  assert.equal(r.json().error, 'invalid_client_metadata');
+  assert.deepEqual((await store.getClient(pk.client_id))!.jwks, { keys: [k] }); // working keys preserved
+});

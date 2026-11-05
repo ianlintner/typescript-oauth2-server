@@ -369,6 +369,10 @@ async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<strin
   for (const k of keys as Array<Record<string, unknown>>) {
     const alg = k.kty === 'RSA' ? 'RS256' : k.crv === 'P-256' ? 'ES256' : undefined;
     if (!alg || (k.alg !== undefined && k.alg !== alg) || (k.use !== undefined && k.use !== 'sig')) continue;
+    // RFC 7517 §4.3: a supplied key_ops restricts what the key may do. importJWK honours it, so a
+    // key that omits 'verify' (notably key_ops: []) imports without verify usage and can never
+    // authenticate an assertion; it must not satisfy the usable-key requirement.
+    if (k.key_ops !== undefined && !(Array.isArray(k.key_ops) && k.key_ops.includes('verify'))) continue;
     // RSA moduli under 2048 bits are not acceptable verification keys.
     if (alg === 'RS256' && (typeof k.n !== 'string' || Buffer.from(k.n, 'base64url').length < 256)) continue;
     try { await importJWK(k as unknown as JWK, alg); usable = true; break; } catch { /* unusable key */ }
