@@ -160,3 +160,52 @@ test('dynamic registration: private_key_jwt requires inline public jwks and issu
   assert.equal((await reg({ redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt' })).statusCode, 400);
   assert.equal((await reg({ redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt', jwks: { keys: [{ ...k, d: 'x' }] } })).statusCode, 400);
 });
+
+async function regSetup() {
+  const sigKey = await generateKeyPair('ES256', { extractable: true });
+  const store = new SqliteStore(':memory:'); await store.init();
+  const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 },
+    random: cryptoRandom, issuer: ISSUER, dynamicRegistration: true });
+  const reg = (body: unknown) => server.inject({ method: 'POST', url: '/connect/register', headers: { 'content-type': 'application/json' }, payload: JSON.stringify(body) });
+  const put = (id: string, token: string, body: unknown) => server.inject({ method: 'PUT', url: `/connect/register/${id}`,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, payload: JSON.stringify(body) });
+  const k = await exportJWK((await generateKeyPair('ES256', { extractable: true })).publicKey);
+  return { store, reg, put, k };
+}
+
+test('RFC 7592 PUT: unchanged private_key_jwt update succeeds; transitions to/from private_key_jwt are rejected', async () => {
+  const { reg, put, k } = await regSetup();
+  const cb = ['https://a.example/cb'];
+  const pk = (await reg({ redirect_uris: cb, token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'], jwks: { keys: [k] } })).json();
+  const same = await put(pk.client_id, pk.registration_access_token, { redirect_uris: ['https://b.example/cb'], token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'] });
+  assert.equal(same.statusCode, 200);
+  const toSecret = await put(pk.client_id, pk.registration_access_token, { redirect_uris: cb, token_endpoint_auth_method: 'client_secret_basic' });
+  assert.equal(toSecret.statusCode, 400);
+  assert.equal(toSecret.json().error, 'invalid_client_metadata');
+  const sec = (await reg({ redirect_uris: cb })).json();
+  const toKey = await put(sec.client_id, sec.registration_access_token, { redirect_uris: cb, token_endpoint_auth_method: 'private_key_jwt', jwks: { keys: [k] } });
+  assert.equal(toKey.statusCode, 400);
+  assert.equal(toKey.json().error, 'invalid_client_metadata');
+});
+
+test('registration rejects jwks with no usable RS256/ES256 verification key', async () => {
+  const { reg, k } = await regSetup();
+  const cb = ['https://a.example/cb'];
+  const base = { redirect_uris: cb, token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'] };
+  for (const bad of [{ kty: 'EC', crv: 'P-256', x: 'AA', y: 'AA' }, { kty: 'RSA', n: 'AQAB', e: 'AQAB' }, { ...k, alg: 'RS256' }, { ...k, use: 'enc' }]) {
+    const r = await reg({ ...base, jwks: { keys: [bad] } });
+    assert.equal(r.statusCode, 400, JSON.stringify(bad));
+    assert.equal(r.json().error, 'invalid_client_metadata');
+  }
+  assert.equal((await reg({ ...base, jwks: { keys: [{ kty: 'EC', crv: 'P-256', x: 'AA', y: 'AA' }, k] } })).statusCode, 201);
+});
+
+test('replay key is unambiguous across (client_id, jti) pairs containing colons', async () => {
+  const c = await setup();
+  const base = { redirectUris: [], grantTypes: ['client_credentials'], scopes: ['read'], enabled: true, clientSecretHash: null, tokenEndpointAuthMethod: 'private_key_jwt' };
+  const jwks = (await c.store.getClient('pk'))!.jwks;
+  await c.store.saveClient({ ...base, clientId: 'a:b', jwks });
+  await c.store.saveClient({ ...base, clientId: 'a', jwks });
+  assert.equal((await c.cc(await c.sign(c.es.privateKey, 'ES256', { iss: 'a:b', sub: 'a:b', jti: 'c' }))).statusCode, 200);
+  assert.equal((await c.cc(await c.sign(c.es.privateKey, 'ES256', { iss: 'a', sub: 'a', jti: 'b:c' }))).statusCode, 200);
+});

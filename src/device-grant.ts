@@ -1,4 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
+import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
 import { redirectUriMatches } from './redirect-uri.js';
@@ -200,7 +201,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
 
     const now = deps.clock.now();
     const clientId = deps.random.token(16);
-    const jwks = authMethod === 'private_key_jwt' ? normalizeJwks(meta.jwks) : null;
+    const jwks = authMethod === 'private_key_jwt' ? await normalizeJwks(meta.jwks) : null;
     const clientSecret = authMethod === 'none' || jwks ? null : deps.random.token(32);
     const regToken = deps.random.token(32);
     const clientSecretHash = clientSecret === null ? null : await hashClientSecret(clientSecret);
@@ -264,7 +265,13 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       ? String(record.registration?.metadata.token_endpoint_auth_method ?? 'client_secret_basic')
       : normalizeAuthMethod(meta.token_endpoint_auth_method);
     // Switching public<->confidential would need a new secret; not supported on update.
-    if ((authMethod === 'none') !== (record.clientSecretHash === null)) {
+    const wasKey = record.tokenEndpointAuthMethod === 'private_key_jwt';
+    if ((authMethod === 'private_key_jwt') !== wasKey) {
+      throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch to or from private_key_jwt on update');
+    }
+    // Key-authenticated clients are confidential even though they hold no secret hash.
+    const wasPublic = !wasKey && record.clientSecretHash === null;
+    if ((authMethod === 'none') !== wasPublic) {
       throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch between public and confidential');
     }
     const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
@@ -340,7 +347,7 @@ function normalizeAuthMethod(value: unknown): string {
 }
 
 /** Inline public JWKS for private_key_jwt. jwks_uri is not fetched by this server, so it cannot stand in for keys. */
-function normalizeJwks(value: unknown): { keys: Array<Record<string, unknown>> } {
+async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<string, unknown>> }> {
   const bad = (why: string) => new OAuthError('invalid_client_metadata', why);
   if (typeof value !== 'object' || value === null || !Array.isArray((value as { keys?: unknown }).keys)) {
     throw bad('private_key_jwt requires an inline jwks');
@@ -351,6 +358,16 @@ function normalizeJwks(value: unknown): { keys: Array<Record<string, unknown>> }
     if (typeof k !== 'object' || k === null || !['RSA', 'EC'].includes(String((k as Record<string, unknown>).kty))) throw bad('jwks keys must be RSA or EC');
     for (const priv of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k']) if (priv in k) throw bad('jwks must contain public keys only');
   }
+  // At least one key must import as a usable RS256 or ES256 public verification key.
+  let usable = false;
+  for (const k of keys as Array<Record<string, unknown>>) {
+    const alg = k.kty === 'RSA' ? 'RS256' : k.crv === 'P-256' ? 'ES256' : undefined;
+    if (!alg || (k.alg !== undefined && k.alg !== alg) || (k.use !== undefined && k.use !== 'sig')) continue;
+    // RSA moduli under 2048 bits are not acceptable verification keys.
+    if (alg === 'RS256' && (typeof k.n !== 'string' || Buffer.from(k.n, 'base64url').length < 256)) continue;
+    try { await importJWK(k as unknown as JWK, alg); usable = true; break; } catch { /* unusable key */ }
+  }
+  if (!usable) throw bad('jwks must contain at least one usable RS256 or ES256 public key');
   return { keys: keys as Array<Record<string, unknown>> };
 }
 

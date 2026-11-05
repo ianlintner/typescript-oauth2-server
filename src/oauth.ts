@@ -143,7 +143,7 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   }
   if (exp === undefined || jti === undefined) throw invalid;
   // RFC 7523 §3 / RFC 9700: a (client, jti) pair is accepted once within the assertion's lifetime.
-  if (!await deps.store.consumeDpopJti(`cja:${client.clientId}:${jti}`, exp, now)) throw invalid;
+  if (!await deps.store.consumeDpopJti(`cja:${createHash('sha256').update(JSON.stringify([client.clientId, jti])).digest('base64url')}`, exp, now)) throw invalid;
   return client;
 }
 
