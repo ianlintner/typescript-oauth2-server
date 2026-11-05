@@ -209,3 +209,39 @@ test('replay key is unambiguous across (client_id, jti) pairs containing colons'
   assert.equal((await c.cc(await c.sign(c.es.privateKey, 'ES256', { iss: 'a:b', sub: 'a:b', jti: 'c' }))).statusCode, 200);
   assert.equal((await c.cc(await c.sign(c.es.privateKey, 'ES256', { iss: 'a', sub: 'a', jti: 'b:c' }))).statusCode, 200);
 });
+
+test('registration rejects RSA jwks entries carrying private `oth` prime info', async () => {
+  const { reg, k } = await regSetup();
+  const rsa = await exportJWK((await generateKeyPair('RS256', { extractable: true, modulusLength: 2048 })).publicKey);
+  const r = await reg({ redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'],
+    jwks: { keys: [k, { ...rsa, oth: [{ r: 'AQAB', d: 'AQAB', t: 'AQAB' }] }] } });
+  assert.equal(r.statusCode, 400);
+  assert.equal(r.json().error, 'invalid_client_metadata');
+});
+
+test('RFC 7592 PUT: same-method update replaces stored and echoed jwks (key rotation); invalid replacement is rejected; omitted jwks keeps keys', async () => {
+  const { store, reg, put, k } = await regSetup();
+  const cb = ['https://a.example/cb'];
+  const base = { redirect_uris: cb, token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'] };
+  const pk = (await reg({ ...base, jwks: { keys: [k] } })).json();
+  const k2 = await exportJWK((await generateKeyPair('ES256', { extractable: true })).publicKey);
+
+  const keep = await put(pk.client_id, pk.registration_access_token, base);
+  assert.equal(keep.statusCode, 200);
+  assert.deepEqual((await store.getClient(pk.client_id))!.jwks, { keys: [k] });
+
+  const rsa = await exportJWK((await generateKeyPair('RS256', { extractable: true, modulusLength: 2048 })).publicKey);
+  for (const bad of [{ keys: [] }, { keys: [{ ...k2, d: 'x' }] }, { keys: [k2, { ...rsa, oth: [{ r: 'AQAB', d: 'AQAB', t: 'AQAB' }] }] }]) {
+    const r = await put(pk.client_id, pk.registration_access_token, { ...base, jwks: bad });
+    assert.equal(r.statusCode, 400);
+    assert.equal(r.json().error, 'invalid_client_metadata');
+  }
+  assert.deepEqual((await store.getClient(pk.client_id))!.jwks, { keys: [k] });
+
+  const rotated = await put(pk.client_id, pk.registration_access_token, { ...base, jwks: { keys: [k2] } });
+  assert.equal(rotated.statusCode, 200);
+  assert.deepEqual(rotated.json().jwks, { keys: [k2] });
+  const stored = (await store.getClient(pk.client_id))!;
+  assert.deepEqual(stored.jwks, { keys: [k2] });
+  assert.deepEqual(stored.registration!.metadata.jwks, { keys: [k2] });
+});

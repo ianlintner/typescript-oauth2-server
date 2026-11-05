@@ -276,6 +276,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     }
     const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
     const scope = normalizeScope(meta.scope);
+    // Key rotation: a supplied jwks replaces the stored set; omitted keeps the current keys.
+    const newJwks = authMethod === 'private_key_jwt' && meta.jwks !== undefined ? await normalizeJwks(meta.jwks) : null;
 
     const prev = record.registration ?? { tokenHash: '', issuedAt: 0, metadata: {} as Record<string, unknown> };
     prev.metadata = {
@@ -287,6 +289,10 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       scope,
     };
     if (typeof meta.client_name === 'string') prev.metadata.client_name = meta.client_name;
+    if (newJwks) {
+      prev.metadata.jwks = newJwks;
+      record.jwks = newJwks;
+    }
     record.registration = prev;
     record.redirectUris = redirectUris;
     record.grantTypes = grantTypes;
@@ -356,7 +362,7 @@ async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<strin
   if (keys.length === 0) throw bad('jwks must contain at least one key');
   for (const k of keys) {
     if (typeof k !== 'object' || k === null || !['RSA', 'EC'].includes(String((k as Record<string, unknown>).kty))) throw bad('jwks keys must be RSA or EC');
-    for (const priv of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k']) if (priv in k) throw bad('jwks must contain public keys only');
+    for (const priv of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k', 'oth']) if (priv in k) throw bad('jwks must contain public keys only');
   }
   // At least one key must import as a usable RS256 or ES256 public verification key.
   let usable = false;
