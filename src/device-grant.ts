@@ -1,4 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
+import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
 import { redirectUriMatches } from './redirect-uri.js';
@@ -200,7 +201,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
 
     const now = deps.clock.now();
     const clientId = deps.random.token(16);
-    const clientSecret = authMethod === 'none' ? null : deps.random.token(32);
+    const jwks = authMethod === 'private_key_jwt' ? await normalizeJwks(meta.jwks) : null;
+    const clientSecret = authMethod === 'none' || jwks ? null : deps.random.token(32);
     const regToken = deps.random.token(32);
     const clientSecretHash = clientSecret === null ? null : await hashClientSecret(clientSecret);
 
@@ -212,6 +214,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       response_types: responseTypes,
       scope,
     };
+    if (jwks) metadata.jwks = jwks;
     for (const k of ['client_uri', 'logo_uri', 'tos_uri', 'policy_uri', 'jwks_uri', 'contacts']) {
       if (meta[k] !== undefined) metadata[k] = meta[k];
     }
@@ -223,6 +226,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grantTypes,
       scopes: scope.split(' ').filter((s) => s !== ''),
       enabled: true,
+      ...(jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks } : {}),
       registration: { tokenHash: sha256(regToken), issuedAt: now, metadata },
     };
     await deps.store.saveClient(client);
@@ -261,11 +265,19 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       ? String(record.registration?.metadata.token_endpoint_auth_method ?? 'client_secret_basic')
       : normalizeAuthMethod(meta.token_endpoint_auth_method);
     // Switching public<->confidential would need a new secret; not supported on update.
-    if ((authMethod === 'none') !== (record.clientSecretHash === null)) {
+    const wasKey = record.tokenEndpointAuthMethod === 'private_key_jwt';
+    if ((authMethod === 'private_key_jwt') !== wasKey) {
+      throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch to or from private_key_jwt on update');
+    }
+    // Key-authenticated clients are confidential even though they hold no secret hash.
+    const wasPublic = !wasKey && record.clientSecretHash === null;
+    if ((authMethod === 'none') !== wasPublic) {
       throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch between public and confidential');
     }
     const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
     const scope = normalizeScope(meta.scope);
+    // Key rotation: a supplied jwks replaces the stored set; omitted keeps the current keys.
+    const newJwks = authMethod === 'private_key_jwt' && meta.jwks !== undefined ? await normalizeJwks(meta.jwks) : null;
 
     const prev = record.registration ?? { tokenHash: '', issuedAt: 0, metadata: {} as Record<string, unknown> };
     prev.metadata = {
@@ -277,6 +289,10 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       scope,
     };
     if (typeof meta.client_name === 'string') prev.metadata.client_name = meta.client_name;
+    if (newJwks) {
+      prev.metadata.jwks = newJwks;
+      record.jwks = newJwks;
+    }
     record.registration = prev;
     record.redirectUris = redirectUris;
     record.grantTypes = grantTypes;
@@ -330,10 +346,39 @@ function normalizeRedirectUris(value: unknown): string[] {
 
 function normalizeAuthMethod(value: unknown): string {
   if (value === undefined) return 'client_secret_basic';
-  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none') {
+  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none' && value !== 'private_key_jwt') {
     throw new OAuthError('invalid_client_metadata', 'unsupported token_endpoint_auth_method');
   }
   return value;
+}
+
+/** Inline public JWKS for private_key_jwt. jwks_uri is not fetched by this server, so it cannot stand in for keys. */
+async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<string, unknown>> }> {
+  const bad = (why: string) => new OAuthError('invalid_client_metadata', why);
+  if (typeof value !== 'object' || value === null || !Array.isArray((value as { keys?: unknown }).keys)) {
+    throw bad('private_key_jwt requires an inline jwks');
+  }
+  const keys = (value as { keys: unknown[] }).keys;
+  if (keys.length === 0) throw bad('jwks must contain at least one key');
+  for (const k of keys) {
+    if (typeof k !== 'object' || k === null || !['RSA', 'EC'].includes(String((k as Record<string, unknown>).kty))) throw bad('jwks keys must be RSA or EC');
+    for (const priv of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k', 'oth']) if (priv in k) throw bad('jwks must contain public keys only');
+  }
+  // At least one key must import as a usable RS256 or ES256 public verification key.
+  let usable = false;
+  for (const k of keys as Array<Record<string, unknown>>) {
+    const alg = k.kty === 'RSA' ? 'RS256' : k.crv === 'P-256' ? 'ES256' : undefined;
+    if (!alg || (k.alg !== undefined && k.alg !== alg) || (k.use !== undefined && k.use !== 'sig')) continue;
+    // RFC 7517 §4.3: a supplied key_ops restricts what the key may do. importJWK honours it, so a
+    // key that omits 'verify' (notably key_ops: []) imports without verify usage and can never
+    // authenticate an assertion; it must not satisfy the usable-key requirement.
+    if (k.key_ops !== undefined && !(Array.isArray(k.key_ops) && k.key_ops.includes('verify'))) continue;
+    // RSA moduli under 2048 bits are not acceptable verification keys.
+    if (alg === 'RS256' && (typeof k.n !== 'string' || Buffer.from(k.n, 'base64url').length < 256)) continue;
+    try { await importJWK(k as unknown as JWK, alg); usable = true; break; } catch { /* unusable key */ }
+  }
+  if (!usable) throw bad('jwks must contain at least one usable RS256 or ES256 public key');
+  return { keys: keys as Array<Record<string, unknown>> };
 }
 
 function normalizeGrantTypes(value: unknown, authMethod: string): string[] {

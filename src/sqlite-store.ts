@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS clients (
   grant_types TEXT NOT NULL,
   scopes TEXT NOT NULL,
   enabled INTEGER NOT NULL,
-  registration TEXT
+  registration TEXT,
+  token_endpoint_auth_method TEXT,
+  jwks TEXT,
+  jwks_uri TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -78,6 +81,9 @@ interface ClientRow {
   scopes: string;
   enabled: number;
   registration: string | null;
+  token_endpoint_auth_method: string | null;
+  jwks: string | null;
+  jwks_uri: string | null;
 }
 
 interface DeviceRow {
@@ -187,14 +193,16 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
-         scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration`,
+         scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
+         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
+      c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
     );
   },
 
@@ -273,6 +281,9 @@ const ops = {
       grantTypes: JSON.parse(r.grant_types) as string[],
       scopes: JSON.parse(r.scopes) as string[],
       enabled: r.enabled === 1,
+      ...(r.token_endpoint_auth_method ? { tokenEndpointAuthMethod: r.token_endpoint_auth_method } : {}),
+      ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
+      ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
@@ -563,6 +574,10 @@ export class SqliteStore implements Store {
     // Databases created before dynamic registration lack the column.
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
+    // Databases created before private_key_jwt (RFC 7523 §2.2) lack the client key columns.
+    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri']) {
+      if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
+    }
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
