@@ -8,6 +8,23 @@ export const ASSERTION_ALGS = ['RS256', 'ES256', 'PS256'] as const;
 const JWKS_TIMEOUT_MS = 10_000; // mirrors the reference's 10s fetch timeout
 const JWKS_MAX_BYTES = 128 * 1024; // 128 KiB cap so a hostile endpoint cannot OOM the verifier
 
+/** How long a fetched JWKS document is reused before the endpoint is re-hit. */
+const JWKS_CACHE_TTL_MS = 300_000; // 5 minutes
+
+interface CachedJwks {
+  jwks: Jwks;
+  expiresAt: number;
+  /** A fetch currently in flight for this URI; concurrent requests share it. */
+  inFlight: Promise<Jwks> | null;
+}
+
+const jwksCache = new Map<string, CachedJwks>();
+
+/** Drop all cached documents (test seam). */
+export function clearJwksCache(): void {
+  jwksCache.clear();
+}
+
 /**
  * `sub` (subject claim) or `email` (email claim) — the two mappings the
  * reference permits. Drives which assertion claim becomes the token subject.
@@ -44,7 +61,7 @@ export function candidateKeys(jwks: Jwks | undefined, alg: string, kid: string |
  * the fetch. Every failure collapses to a single opaque invalid_client (no
  * oracle about which issuer/URI).
  */
-export async function fetchJwks(url: string): Promise<Jwks> {
+async function fetchJwksDocument(url: string): Promise<Jwks> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JWKS_TIMEOUT_MS);
   try {
@@ -88,5 +105,37 @@ export async function fetchJwks(url: string): Promise<Jwks> {
     // no timeout left to terminate it. Aborting after a successful read is a
     // no-op on an already-complete response.
     controller.abort();
+  }
+}
+
+/**
+ * Fetch a remote JWKS with a bounded-TTL cache and shared in-flight fetches,
+ * keyed by URI. A document within TTL is reused verbatim, so an unchanged
+ * keyset keeps verifying during a JWKS endpoint outage or rate limit; a
+ * document is refetched (and a concurrent burst coalesced onto one request)
+ * once the TTL elapses or a rotation requires fresh keys.
+ */
+export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> {
+  const now = Date.now();
+  const cached = jwksCache.get(url);
+  if (!forceFresh) {
+    if (cached && cached.expiresAt > now) return cached.jwks;
+    if (cached?.inFlight) return cached.inFlight;
+  } else if (cached?.inFlight) {
+    return cached.inFlight; // coalesce onto an in-flight refresh
+  }
+
+  const inFlight = fetchJwksDocument(url).then((jwks) => {
+    jwksCache.set(url, { jwks, expiresAt: Date.now() + JWKS_CACHE_TTL_MS, inFlight: null });
+    return jwks;
+  });
+  jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, inFlight });
+  try {
+    return await inFlight;
+  } catch (err) {
+    // A failed refresh must not wedge the guard entry for concurrent callers;
+    // drop it so the next request starts a clean fetch.
+    if (jwksCache.get(url)?.inFlight === inFlight) jwksCache.delete(url);
+    throw err;
   }
 }

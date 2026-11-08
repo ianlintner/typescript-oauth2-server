@@ -9,6 +9,7 @@ import { cryptoRandom } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { clearJwksCache } from '../src/jwks.js';
 
 const ISSUER = 'http://localhost:8080';
 const GT = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
@@ -394,4 +395,159 @@ test('an invalid DPoP proof does not consume the assertion', async () => {
   const retry = await c.jwtb(assertion);
   assert.equal(retry.statusCode, 200, retry.body);
   assert.ok(retry.json().access_token);
+});
+
+test('an unsupported scope does not consume the assertion for a corrected-scope retry', async () => {
+  const c = await setup();
+  const assertion = await c.sign({ jti: 'scope-retry' });
+  // A valid assertion with an unsupported scope must fail with invalid_scope
+  // *without* burning the assertion's replay entry, so retrying the same
+  // assertion with an allowed scope still succeeds.
+  const bad = await c.jwtb(assertion, { scope: 'admin' });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, 'invalid_scope');
+  const retry = await c.jwtb(assertion);
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.ok(retry.json().access_token);
+});
+
+test('jwksUri documents are cached: repeated exchanges do not refetch', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'cache-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string) => {
+    const body = { iss: 'https://cached.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'cache-1' }).sign(ext2.privateKey);
+  };
+  try {
+    clearJwksCache();
+    await c.store.saveTrustedIssuer({
+      id: 'ti-cache', issuer: 'https://cached.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('a'))).statusCode, 200);
+    assert.equal((await c.jwtb(await signFor('b'))).statusCode, 200);
+    assert.equal(fetches, 1);
+  } finally {
+    server.close();
+    clearJwksCache();
+  }
+});
+
+test('a JWKS endpoint outage does not invalidate cached verification keys', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'outage-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string) => {
+    const body = { iss: 'https://outage.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'outage-1' }).sign(ext2.privateKey);
+  };
+  try {
+    clearJwksCache();
+    await c.store.saveTrustedIssuer({
+      id: 'ti-outage', issuer: 'https://outage.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // Outage: the endpoint is now unreachable, but the cached document must
+    // still verify an unchanged assertion without another outbound request.
+    server.close();
+    const res = await c.jwtb(await signFor('2'));
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(fetches, 1);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('a rotated verification key is refreshed when the cached document lacks the kid', async () => {
+  const c = await setup();
+  const oldKey = await generateKeyPair('ES256', { extractable: true });
+  const newKey = await generateKeyPair('ES256', { extractable: true });
+  const oldJwk = { ...(await exportJWK(oldKey.publicKey)), kid: 'old' };
+  const newJwk = { ...(await exportJWK(newKey.publicKey)), kid: 'new' };
+  let current: object = { keys: [oldJwk] };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(current));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signWith = (key: CryptoKey, kid: string, jti: string) => {
+    const body = { iss: 'https://rotating.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(key);
+  };
+  try {
+    clearJwksCache();
+    await c.store.saveTrustedIssuer({
+      id: 'ti-rotate', issuer: 'https://rotating.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    // First exchange caches {keys:[old]}.
+    assert.equal((await c.jwtb(await signWith(oldKey.privateKey, 'old', '1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // Rotate: the endpoint now publishes only the new key. The assertion names
+    // a kid the cached document lacks, so the handler must refresh once.
+    current = { keys: [newJwk] };
+    const res = await c.jwtb(await signWith(newKey.privateKey, 'new', '2'));
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(fetches, 2);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('admin: Bearer scheme is accepted case-insensitively', async () => {
+  const sigKey = await generateKeyPair('ES256', { extractable: true });
+  const store = new SqliteStore(':memory:'); await store.init();
+  const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 }, random: cryptoRandom, issuer: ISSUER, adminToken: ADMIN_TOKEN });
+  const res = await server.inject({ method: 'GET', url: '/admin/trusted-issuers', headers: { authorization: `bearer ${ADMIN_TOKEN}` } });
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.json().trusted_issuers);
+});
+
+test('admin: an empty inline JWKS is rejected before upsert', async () => {
+  const sigKey = await generateKeyPair('ES256', { extractable: true });
+  const store = new SqliteStore(':memory:'); await store.init();
+  const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 }, random: cryptoRandom, issuer: ISSUER, adminToken: ADMIN_TOKEN });
+  const res = await server.inject({ method: 'POST', url: '/admin/trusted-issuers', headers: { 'content-type': 'application/json', authorization: `Bearer ${ADMIN_TOKEN}` }, payload: JSON.stringify({ issuer: 'https://x.example', jwks: { keys: [] } }) });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+  assert.equal((await store.listTrustedIssuers()).length, 0);
 });
