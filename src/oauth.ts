@@ -346,11 +346,14 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       throw new OAuthError('unauthorized_client', 'client is not allowed to use this issuer');
     }
 
-    // Resolve the verification keys: inline jwks, else a guarded fetch of jwksUri.
+    // Resolve the verification keys: inline jwks, else a guarded fetch of jwksUri
+    // (bounded-TTL cached with shared in-flight fetches; refresh on key rotation).
     let jwks = trusted.jwks ?? undefined;
+    let fetched = false;
     if (!jwks && trusted.jwksUri) {
       try {
         jwks = await fetchJwks(trusted.jwksUri);
+        fetched = true;
       } catch { throw invalid; }
     }
 
@@ -376,6 +379,27 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         break;
       } catch { /* try next candidate key */ }
     }
+    // A URI-backed document that yielded no matching key may simply be stale
+    // (the issuer rotated keys); force one fresh fetch and retry before failing.
+    if (verifiedPayload === undefined && fetched && trusted.jwksUri) {
+      try {
+        jwks = await fetchJwks(trusted.jwksUri, true);
+      } catch { throw invalid; }
+      for (const jwk of jwksCandidateKeys(jwks, alg, kid)) {
+        try {
+          const { payload: p } = await jwtVerify(assertion, await importJWK(jwk, alg), {
+            algorithms: [alg],
+            issuer: trusted.issuer,
+            audience: allowedAud,
+            currentDate: new Date(now * 1000),
+            requiredClaims: ['exp', 'iat', 'jti'],
+          });
+          if (typeof p.sub !== 'string' || p.sub === '' || typeof p.jti !== 'string' || p.jti === '') continue;
+          verifiedPayload = p;
+          break;
+        } catch { /* try next candidate key */ }
+      }
+    }
     if (verifiedPayload === undefined) throw invalid;
 
     // Validate the DPoP proof (if any) before consuming the assertion, mirroring
@@ -384,22 +408,26 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // invalid_grant despite no token having been issued.
     const jkt = await tokenEndpointProof(req);
 
-    const jti = verifiedPayload.jti as string;
-    const exp = verifiedPayload.exp as number;
-
-    // jti replay: (issuer, jti) accepted once within the assertion's lifetime.
-    const replayKey = `${JWT_BEARER_JTI_PREFIX}${createHash('sha256').update(JSON.stringify([trusted.issuer, jti])).digest('base64url')}`;
-    if (!await deps.store.consumeDpopJti(replayKey, exp, now)) throw invalid;
-
     // Subject mapping: sub (default) or email.
     const subject = trusted.subjectMapping === 'email'
       ? (typeof verifiedPayload.email === 'string' && verifiedPayload.email !== '' ? verifiedPayload.email : undefined)
       : verifiedPayload.sub as string;
     if (subject === undefined) throw invalid;
 
+    // Validate the requested scope (and the mapped subject above) *before*
+    // committing the assertion's replay entry: an unsupported scope must return
+    // invalid_scope without burning the (issuer, jti) pair, so a retry with an
+    // allowed scope still succeeds instead of failing as a replay.
     const scope = (single(form, 'scope') ?? '').trim();
     const scopesList = scope ? scope.split(' ') : [];
     if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
+
+    const jti = verifiedPayload.jti as string;
+    const exp = verifiedPayload.exp as number;
+
+    // jti replay: (issuer, jti) accepted once within the assertion's lifetime.
+    const replayKey = `${JWT_BEARER_JTI_PREFIX}${createHash('sha256').update(JSON.stringify([trusted.issuer, jti])).digest('base64url')}`;
+    if (!await deps.store.consumeDpopJti(replayKey, exp, now)) throw invalid;
 
     const iat = deps.clock.now();
     const atJti = deps.random.token(16);

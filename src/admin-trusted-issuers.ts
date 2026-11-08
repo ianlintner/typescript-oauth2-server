@@ -31,7 +31,10 @@ export function registerAdminTrustedIssuerRoutes(app: FastifyInstance, deps: Adm
   if (!deps.adminToken) return;
   const authorize = async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
     const header = req.headers.authorization;
-    const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+    // HTTP authentication scheme names are case-insensitive (RFC 9110 §11.1);
+    // accept any casing of "Bearer" so a valid admin credential is not rejected.
+    const match = typeof header === 'string' ? /^Bearer (.+)$/i.exec(header) : null;
+    const token = match ? match[1]! : '';
     if (!safeEqual(token, deps.adminToken!)) {
       // 401 with an OAuth-style body; the reference uses the same shape for its
       // Bearer branch (invalid_token / Bearer token is invalid).
@@ -67,8 +70,8 @@ export function registerAdminTrustedIssuerRoutes(app: FastifyInstance, deps: Adm
     if (jwksUri !== undefined) {
       validateJwksUri(jwksUri);
     }
-    if (jwks !== undefined && (!jwks || typeof jwks !== 'object' || !Array.isArray(jwks.keys))) {
-      throw new OAuthError('invalid_request', 'jwks must be a JWKS document with a keys array');
+    if (jwks !== undefined && (!jwks || typeof jwks !== 'object' || !Array.isArray(jwks.keys) || jwks.keys.length === 0)) {
+      throw new OAuthError('invalid_request', 'jwks must be a JWKS document with at least one key');
     }
     if (jwks !== undefined) {
       // Reject private key material before persisting: this is a public verification-key
