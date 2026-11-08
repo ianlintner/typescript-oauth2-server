@@ -31,6 +31,23 @@ test('fetchJwks rejects a redirect rather than following it', async () => {
   }
 });
 
+test('fetchJwks aborts the fetch on an early exit so the connection is released', async () => {
+  const prev = globalThis.fetch;
+  let captured: AbortSignal | undefined;
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    captured = init?.signal ?? undefined;
+    return new Response(null, { status: 302, headers: { location: 'http://evil.example/jwks.json' } });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(fetchJwks('https://idp.example/jwks.json'), /redirected/);
+    // The cleanup must abort the controller (not just clear the timeout) so a
+    // streaming/failed response's connection is released on every early exit.
+    assert.equal(captured?.aborted, true);
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
 test('fetchJwks aborts as soon as the body exceeds 128 KiB', async () => {
   const prev = globalThis.fetch;
   // A chunked body without content-length that streams more than the cap.

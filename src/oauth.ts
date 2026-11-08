@@ -323,7 +323,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const assertion = single(form, 'assertion');
     if (!assertion) throw new OAuthError('invalid_request', 'assertion is required');
 
-    const now = deps.clock.now();
     let header: { alg?: unknown; kid?: unknown };
     let payload: Record<string, unknown>;
     try {
@@ -355,6 +354,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       } catch { throw invalid; }
     }
 
+    // Read the clock after the (potentially slow) JWKS fetch, so an assertion
+    // that expires while keys are being retrieved is rejected rather than
+    // verified against a stale timestamp and then exchanged for a token.
+    const now = deps.clock.now();
+
     const allowedAud = [deps.issuer, `${deps.issuer}/oauth/token`, ...trusted.allowedAudiences];
 
     let verifiedPayload: Record<string, unknown> | undefined;
@@ -374,6 +378,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     }
     if (verifiedPayload === undefined) throw invalid;
 
+    // Validate the DPoP proof (if any) before consuming the assertion, mirroring
+    // the authorization-code branch: a malformed/expired/replayed proof must not
+    // burn the assertion jti, or a retry with a corrected proof would fail with
+    // invalid_grant despite no token having been issued.
+    const jkt = await tokenEndpointProof(req);
+
     const jti = verifiedPayload.jti as string;
     const exp = verifiedPayload.exp as number;
 
@@ -391,7 +401,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const scopesList = scope ? scope.split(' ') : [];
     if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
 
-    const jkt = await tokenEndpointProof(req);
     const iat = deps.clock.now();
     const atJti = deps.random.token(16);
     const claims: Record<string, unknown> = {

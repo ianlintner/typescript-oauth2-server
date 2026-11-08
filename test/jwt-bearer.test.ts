@@ -347,3 +347,51 @@ test('jwksUri fetch failures collapse to opaque invalid_grant', async () => {
   assert.equal(res.statusCode, 400);
   assert.equal(res.json().error, 'invalid_grant');
 });
+
+test('an assertion that expires during the JWKS fetch is rejected', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'ext2' };
+  await c.store.saveTrustedIssuer({
+    id: 'ti-4', issuer: 'https://expiring.example', jwksUri: 'https://expiring.example/jwks.json',
+    allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  // The assertion is valid for one more second when the request starts.
+  const exp = c.state.v + 1;
+  const body = { iss: 'https://expiring.example', sub: 'bob', aud: ISSUER, jti: randomUUID(), iat: c.state.v, exp };
+  const assertion = await new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'ext2' }).sign(ext2.privateKey);
+
+  // Advance the clock from inside the fetch: this runs after the handler has
+  // already read its pre-fetch clock, so the assertion's expiry is crossed
+  // *during* key retrieval. Verification must read the clock again after the
+  // fetch and reject, rather than issuing a token from the stale timestamp.
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    c.state.v = exp + 5;
+    return new Response(JSON.stringify({ keys: [pubJwk] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const res = await c.jwtb(assertion);
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_grant');
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test('an invalid DPoP proof does not consume the assertion', async () => {
+  const c = await setup();
+  const assertion = await c.sign({ jti: 'keep-me' });
+  // A malformed proof is rejected before the assertion is consumed, so the same
+  // assertion remains usable on a retry without a proof (or with a valid one).
+  const bad = await c.post(
+    { grant_type: GT, client_id: 'conf', client_secret: 's3cret-value-long-enough', assertion },
+    { dpop: 'not-a-jwt' },
+  );
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, 'invalid_dpop_proof');
+  const retry = await c.jwtb(assertion);
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.ok(retry.json().access_token);
+});

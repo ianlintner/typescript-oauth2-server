@@ -100,8 +100,13 @@ export function loadConfig(env: Env): Config {
   if (metricsEnabled && !LOOPBACK.has(host)) throw new ConfigError('OAUTH2_METRICS_ENABLED requires a loopback host');
 
   const adminToken = env.OAUTH2_ADMIN_TOKEN?.trim() || undefined;
-  if (production && adminToken !== undefined && PLACEHOLDER.test(adminToken)) {
-    throw new ConfigError('OAUTH2_ADMIN_TOKEN looks like a placeholder; refusing to start in production');
+  if (production && adminToken !== undefined) {
+    if (PLACEHOLDER.test(adminToken)) {
+      throw new ConfigError('OAUTH2_ADMIN_TOKEN looks like a placeholder; refusing to start in production');
+    }
+    if (adminToken.length < MIN_SECRET_LENGTH) {
+      throw new ConfigError(`OAUTH2_ADMIN_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
+    }
   }
 
   let databasePath = env.OAUTH2_DATABASE_PATH;

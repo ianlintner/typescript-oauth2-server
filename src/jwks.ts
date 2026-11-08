@@ -83,5 +83,10 @@ export async function fetchJwks(url: string): Promise<Jwks> {
     return jwks;
   } finally {
     clearTimeout(timer);
+    // Abort the fetch on every early exit (oversized body, redirect, non-2xx,
+    // parse/schema failure) so a rejected response cannot keep streaming with
+    // no timeout left to terminate it. Aborting after a successful read is a
+    // no-op on an already-complete response.
+    controller.abort();
   }
 }
