@@ -44,6 +44,7 @@ const GRANT_TYPES = new Set([
   'refresh_token',
   'client_credentials',
   'urn:ietf:params:oauth:grant-type:device_code',
+  'urn:ietf:params:oauth:grant-type:jwt-bearer',
 ]);
 const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post']);
 const ALG_RE = /^(RS|ES|PS|HS)[0-9]{3}$/;

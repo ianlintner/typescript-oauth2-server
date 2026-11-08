@@ -32,15 +32,17 @@ export function candidateKeys(jwks: Jwks | undefined, alg: string, kid: string |
   if (!jwks) return [];
   const kty = alg.startsWith('ES') ? 'EC' : 'RSA';
   return (jwks.keys ?? []).filter(
-    (k) => k.kty === kty && k.use !== 'enc' && (k.alg === undefined || k.alg === alg) && (kid === undefined || k.kid === kid),
+    (k) => k !== null && typeof k === 'object' && k.kty === kty && k.use !== 'enc' && (k.alg === undefined || k.alg === alg) && (kid === undefined || k.kid === kid),
   ) as JWK[];
 }
 
 /**
  * Fetch a remote JWKS with the reference's guards: https-only is enforced at
  * registration; here we bound the timeout and the response size so a hostile
- * or misbehaving endpoint cannot stall or exhaust the verifier. Every failure
- * collapses to a single opaque invalid_client (no oracle about which issuer/URI).
+ * or misbehaving endpoint cannot stall or exhaust the verifier, and we reject
+ * redirects so an accepted https URL cannot silently downgrade to http during
+ * the fetch. Every failure collapses to a single opaque invalid_client (no
+ * oracle about which issuer/URI).
  */
 export async function fetchJwks(url: string): Promise<Jwks> {
   const controller = new AbortController();
@@ -49,16 +51,35 @@ export async function fetchJwks(url: string): Promise<Jwks> {
     const res = await fetch(url, {
       headers: { accept: 'application/json' },
       signal: controller.signal,
-      redirect: 'follow',
+      redirect: 'manual',
     });
+    // Reject any redirect rather than following an unvalidated destination:
+    // an https URL's 3xx may point at an http (or otherwise untrusted) endpoint.
+    if (res.status >= 300 && res.status < 400) throw new Error('JWKS endpoint redirected');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const contentLength = Number(res.headers.get('content-length') ?? '0');
-    if (contentLength > JWKS_MAX_BYTES) throw new Error('JWKS document too large');
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.byteLength > JWKS_MAX_BYTES) throw new Error('JWKS document too large');
-    const text = new TextDecoder().decode(buf);
+    if (!res.body) throw new Error('JWKS response has no body');
+    // Read the body incrementally and abort as soon as the accumulated byte count
+    // exceeds the cap, so a chunked or compressed response cannot allocate far
+    // beyond the limit before rejection.
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > JWKS_MAX_BYTES) throw new Error('JWKS document too large');
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
+    const text = new TextDecoder().decode(bytes);
     const jwks = JSON.parse(text) as Jwks;
     if (!Array.isArray(jwks.keys)) throw new Error("JWKS missing 'keys' array");
+    // Skip null/non-object entries so a malformed document cannot throw before
+    // the token handler's per-key handling, or block subsequent valid keys.
+    jwks.keys = jwks.keys.filter((k) => k !== null && typeof k === 'object');
     return jwks;
   } finally {
     clearTimeout(timer);

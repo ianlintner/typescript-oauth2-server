@@ -289,6 +289,22 @@ test('dynamic registration rejects privileged scopes', async () => {
   await s.server.close();
 });
 
+test('dynamic registration accepts the jwt-bearer grant type', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  const GT = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
+  const res = await s.server.inject({
+    method: 'POST', url: '/connect/register',
+    headers: { 'content-type': 'application/json' },
+    payload: JSON.stringify({ redirect_uris: ['https://new.example/cb'], token_endpoint_auth_method: 'client_secret_basic', grant_types: [GT] }),
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  assert.deepEqual(res.json().grant_types, [GT]);
+  const stored = await s.store.getClient(res.json().client_id);
+  assert.ok(stored);
+  assert.deepEqual(stored.grantTypes, [GT]);
+  await s.server.close();
+});
+
 test('registration access token reads, updates and deletes the client', async () => {
   const s = await setup({ dynamicRegistration: true });
   const reg = await s.server.inject({

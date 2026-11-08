@@ -328,7 +328,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     let payload: Record<string, unknown>;
     try {
       header = decodeProtectedHeader(assertion);
-      payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8')) as Record<string, unknown>;
+      const claims = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8'));
+      if (typeof claims !== 'object' || claims === null || Array.isArray(claims)) throw invalid;
+      payload = claims as Record<string, unknown>;
     } catch { throw invalid; }
 
     const alg = typeof header.alg === 'string' ? header.alg : '';

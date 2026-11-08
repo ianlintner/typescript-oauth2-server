@@ -80,6 +80,13 @@ test('production rejects http issuer, in-memory database and placeholder secrets
   rejects({ ...prod, OAUTH2_SESSION_SECRET: 'change-me'.padEnd(40, '!') }, /OAUTH2_SESSION_SECRET/);
 });
 
+test('admin token is optional, trimmed, and placeholder-gated in production', () => {
+  assert.equal(loadConfig(dev).adminToken, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: '  ' }).adminToken, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: ' good-admin-token ' }).adminToken, 'good-admin-token');
+  rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'change-me'.padEnd(40, '!') }, /OAUTH2_ADMIN_TOKEN/);
+});
+
 test('development allows http only for loopback issuers', () => {
   rejects({ ...dev, OAUTH2_ISSUER: 'http://auth.example.com' }, /https|loopback/);
   assert.equal(loadConfig({ ...dev, OAUTH2_ISSUER: 'http://127.0.0.1:9000' }).issuer, 'http://127.0.0.1:9000');

@@ -23,6 +23,11 @@ export interface Deps {
   dynamicRegistration?: boolean | undefined;
   /** Metrics endpoint is opt-in and should only be bound to a trusted interface. */
   metrics?: Metrics | undefined;
+  /**
+   * Shared secret authorizing the admin trusted-issuer routes. Fail-closed:
+   * leave unset and the admin routes are not registered.
+   */
+  adminToken?: string | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
 }
@@ -94,6 +99,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     store: deps.store,
     random: deps.random,
     clock: deps.clock,
+    adminToken: deps.adminToken,
   });
 
   return app;
