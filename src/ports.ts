@@ -44,6 +44,27 @@ export interface ClientRegistration {
 
 export type DeviceCodeStatus = 'pending' | 'approved' | 'denied' | 'consumed';
 
+/** RFC 7523 §2.1 trusted external issuer whose signed assertions may be exchanged for a token. */
+export interface TrustedIssuerRecord {
+  /** Unique id (opaque; admin delete key, mirrors the reference's UUID id). */
+  id: string;
+  /** Issuer URL (`iss` claim value). Unique. */
+  issuer: string;
+  /** Inline public JWKS used to verify assertions (alternative to jwksUri). */
+  jwks?: Jwks | null | undefined;
+  /** JWKS endpoint fetched to verify assertions (alternative to inline jwks). https-only. */
+  jwksUri?: string | null | undefined;
+  /** Audiences this issuer's tokens may target, in addition to our issuer/token endpoint. */
+  allowedAudiences: string[];
+  /** Which claim maps to the local subject: `sub` (default) or `email`. */
+  subjectMapping: 'sub' | 'email';
+  /** Client ids allowed to use this issuer. Empty means any. */
+  allowedClientIds: string[];
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** RFC 8628 device authorization. Codes are stored only as SHA-256 hashes. */
 export interface DeviceCodeRecord {
   deviceCodeHash: string;
@@ -120,6 +141,15 @@ export interface Store {
   getClient(clientId: string): Promise<ClientRecord | null>;
   /** Delete a client and everything issued to it. Returns false if unknown. */
   deleteClient(clientId: string): Promise<boolean>;
+
+  /** Upsert a trusted issuer, keyed by `issuer`. */
+  saveTrustedIssuer(record: TrustedIssuerRecord): Promise<void>;
+  /** Look up an enabled or disabled trusted issuer by its `issuer` value. */
+  getTrustedIssuer(issuer: string): Promise<TrustedIssuerRecord | null>;
+  /** List all trusted issuers (admin). */
+  listTrustedIssuers(): Promise<TrustedIssuerRecord[]>;
+  /** Delete a trusted issuer by id. Returns false if unknown. */
+  deleteTrustedIssuer(id: string): Promise<boolean>;
 
   saveDeviceCode(record: DeviceCodeRecord): Promise<void>;
   getDeviceCode(deviceCodeHash: string): Promise<DeviceCodeRecord | null>;

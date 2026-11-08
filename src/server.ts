@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
 import { registerExtensionRoutes } from './device-grant.js';
+import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
 
@@ -87,6 +88,12 @@ export function buildServer(deps: Deps): FastifyInstance {
     issuer: deps.issuer,
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
+  });
+
+  registerAdminTrustedIssuerRoutes(app, {
+    store: deps.store,
+    random: deps.random,
+    clock: deps.clock,
   });
 
   return app;

@@ -4,6 +4,7 @@ import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
+import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
 
@@ -104,6 +105,10 @@ export function formDecode(value: string): string {
 export const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 /** Algorithms accepted for private_key_jwt client assertions (RFC 7523 §2.2). */
 export const CLIENT_ASSERTION_ALGS = ['RS256', 'ES256'] as const;
+/** RFC 7523 §2.1 JWT-bearer authorization grant type. */
+export const JWT_BEARER_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
+/** jti replay namespace for JWT-bearer assertions, prefixed per the parity card (`jwtb:`) and scoped by issuer. */
+const JWT_BEARER_JTI_PREFIX = 'jwtb:';
 
 /** A client with neither a secret nor a registered key cannot authenticate: it is public. */
 export const isPublicClient = (c: ClientRecord): boolean => c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt';
@@ -299,6 +304,113 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const header = req.headers.dpop;
     if (header === undefined) return null;
     return (await validateDpopProof(deps, header, { method: 'POST', url: `${deps.issuer}/oauth/token` })).jkt;
+  };
+
+  /**
+   * RFC 7523 §2.1: exchange an external issuer's signed JWT assertion for a local
+   * access token. The asserting client authenticates normally (confidential) and
+   * must be allowed the jwt-bearer grant; the assertion identifies a trusted
+   * issuer whose keys (inline jwks or fetched jwksUri) verify the signature.
+   * Every verification failure collapses to a single opaque invalid_grant.
+   *
+   * The reference resolves the assertion subject to a *local* user id (with JIT
+   * provisioning against a user table). This port has no user store: the token
+   * subject is the assertion's mapped claim value (`sub` or `email`), treated as
+   * the opaque local subject the rest of this server already uses throughout.
+   */
+  const jwtBearerGrant = async (client: ClientRecord, form: URLSearchParams, req: FastifyRequest): Promise<Record<string, unknown>> => {
+    const invalid = new OAuthError('invalid_grant', 'assertion is invalid');
+    const assertion = single(form, 'assertion');
+    if (!assertion) throw new OAuthError('invalid_request', 'assertion is required');
+
+    const now = deps.clock.now();
+    let header: { alg?: unknown; kid?: unknown };
+    let payload: Record<string, unknown>;
+    try {
+      header = decodeProtectedHeader(assertion);
+      payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8')) as Record<string, unknown>;
+    } catch { throw invalid; }
+
+    const alg = typeof header.alg === 'string' ? header.alg : '';
+    const kid = typeof header.kid === 'string' && header.kid !== '' ? header.kid : undefined;
+    if (!(ASSERTION_ALGS as readonly string[]).includes(alg)) throw invalid;
+
+    const iss = typeof payload.iss === 'string' ? payload.iss : undefined;
+    if (!iss) throw invalid;
+    const trusted = await deps.store.getTrustedIssuer(iss);
+    if (!trusted || !trusted.enabled) throw invalid;
+
+    // allowedClientIds: when nonempty, only those client ids may use this issuer.
+    if (trusted.allowedClientIds.length > 0 && !trusted.allowedClientIds.includes(client.clientId)) {
+      throw new OAuthError('unauthorized_client', 'client is not allowed to use this issuer');
+    }
+
+    // Resolve the verification keys: inline jwks, else a guarded fetch of jwksUri.
+    let jwks = trusted.jwks ?? undefined;
+    if (!jwks && trusted.jwksUri) {
+      try {
+        jwks = await fetchJwks(trusted.jwksUri);
+      } catch { throw invalid; }
+    }
+
+    const allowedAud = [deps.issuer, `${deps.issuer}/oauth/token`, ...trusted.allowedAudiences];
+
+    let verifiedPayload: Record<string, unknown> | undefined;
+    for (const jwk of jwksCandidateKeys(jwks, alg, kid)) {
+      try {
+        const { payload: p } = await jwtVerify(assertion, await importJWK(jwk, alg), {
+          algorithms: [alg],
+          issuer: trusted.issuer,
+          audience: allowedAud,
+          currentDate: new Date(now * 1000),
+          requiredClaims: ['exp', 'iat', 'jti'],
+        });
+        if (typeof p.sub !== 'string' || p.sub === '' || typeof p.jti !== 'string' || p.jti === '') continue;
+        verifiedPayload = p;
+        break;
+      } catch { /* try next candidate key */ }
+    }
+    if (verifiedPayload === undefined) throw invalid;
+
+    const jti = verifiedPayload.jti as string;
+    const exp = verifiedPayload.exp as number;
+
+    // jti replay: (issuer, jti) accepted once within the assertion's lifetime.
+    const replayKey = `${JWT_BEARER_JTI_PREFIX}${createHash('sha256').update(JSON.stringify([trusted.issuer, jti])).digest('base64url')}`;
+    if (!await deps.store.consumeDpopJti(replayKey, exp, now)) throw invalid;
+
+    // Subject mapping: sub (default) or email.
+    const subject = trusted.subjectMapping === 'email'
+      ? (typeof verifiedPayload.email === 'string' && verifiedPayload.email !== '' ? verifiedPayload.email : undefined)
+      : verifiedPayload.sub as string;
+    if (subject === undefined) throw invalid;
+
+    const scope = (single(form, 'scope') ?? '').trim();
+    const scopesList = scope ? scope.split(' ') : [];
+    if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
+
+    const jkt = await tokenEndpointProof(req);
+    const iat = deps.clock.now();
+    const atJti = deps.random.token(16);
+    const claims: Record<string, unknown> = {
+      iss: deps.issuer, sub: subject, aud: client.clientId, client_id: client.clientId,
+      iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
+    };
+    if (scope) claims.scope = scope;
+    if (jkt) claims.cnf = { jkt };
+    const accessToken = await deps.signer.sign(claims);
+
+    await deps.store.saveAccessToken({
+      jti: atJti, clientId: client.clientId, subject, scope,
+      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+    });
+
+    return {
+      access_token: accessToken,
+      token_type: jkt ? 'DPoP' : 'Bearer',
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      ...(scope ? { scope } : {}),
+    };
   };
 
   app.get('/oauth/authorize', async (req, reply) => {
@@ -650,6 +762,15 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return deviceCodeGrant(deps, client, hash);
     }
 
+    // -- jwt-bearer (RFC 7523 §2.1) --
+    if (grantType === JWT_BEARER_GRANT_TYPE) {
+      const client = await authenticateClient(deps, req, form);
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use jwt-bearer');
+      if (!client.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
+      const body = await jwtBearerGrant(client, form, req);
+      return reply.header('pragma', 'no-cache').send(body);
+    }
+
     throw new OAuthError('unsupported_grant_type');
   });
 
@@ -769,7 +890,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     registration_endpoint: `${deps.issuer}/connect/register`,
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
