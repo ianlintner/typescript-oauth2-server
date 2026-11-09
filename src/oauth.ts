@@ -6,7 +6,7 @@ import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
-import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
+import type { ClientRecord, Clock, Jwks, Random, Signer, Store } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
 export const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -336,6 +336,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const kid = typeof header.kid === 'string' && header.kid !== '' ? header.kid : undefined;
     if (!(ASSERTION_ALGS as readonly string[]).includes(alg)) throw invalid;
 
+    // Validate the requested scope against the authenticated client *before*
+    // resolving the trusted issuer (and any JWKS fetch). RFC 7523 keeps the
+    // assertion opaque: an unsupported scope must fail the same way whether or
+    // not the named issuer is trusted, so a caller cannot use the error
+    // difference to probe which issuers exist. Empty tokens (from doubled
+    // separators) are dropped, never matched against a registered scope.
+    const scope = (single(form, 'scope') ?? '').trim();
+    const scopesList = scope ? scope.split(' ').filter((s) => s !== '') : [];
+    if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
+
     const iss = typeof payload.iss === 'string' ? payload.iss : undefined;
     if (!iss) throw invalid;
     const trusted = await deps.store.getTrustedIssuer(iss);
@@ -364,28 +374,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     const allowedAud = [deps.issuer, `${deps.issuer}/oauth/token`, ...trusted.allowedAudiences];
 
-    let verifiedPayload: Record<string, unknown> | undefined;
-    for (const jwk of jwksCandidateKeys(jwks, alg, kid)) {
-      try {
-        const { payload: p } = await jwtVerify(assertion, await importJWK(jwk, alg), {
-          algorithms: [alg],
-          issuer: trusted.issuer,
-          audience: allowedAud,
-          currentDate: new Date(now * 1000),
-          requiredClaims: ['exp', 'iat', 'jti'],
-        });
-        if (typeof p.sub !== 'string' || p.sub === '' || typeof p.jti !== 'string' || p.jti === '') continue;
-        verifiedPayload = p;
-        break;
-      } catch { /* try next candidate key */ }
-    }
-    // A URI-backed document that yielded no matching key may simply be stale
-    // (the issuer rotated keys); force one fresh fetch and retry before failing.
-    if (verifiedPayload === undefined && fetched && trusted.jwksUri) {
-      try {
-        jwks = await fetchJwks(trusted.jwksUri, true);
-      } catch { throw invalid; }
-      for (const jwk of jwksCandidateKeys(jwks, alg, kid)) {
+    // Verify the assertion signature against each candidate key, returning the
+    // verified payload (or undefined). Every key that fails (wrong key, wrong
+    // kid, or an assertion whose `sub`/`jti` is missing or empty) is skipped,
+    // so a mismatch collapses to the shared opaque invalid_grant.
+    const verifyAssertion = async (keys: Jwks | undefined): Promise<Record<string, unknown> | undefined> => {
+      for (const jwk of jwksCandidateKeys(keys, alg, kid)) {
         try {
           const { payload: p } = await jwtVerify(assertion, await importJWK(jwk, alg), {
             algorithms: [alg],
@@ -395,10 +389,21 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
             requiredClaims: ['exp', 'iat', 'jti'],
           });
           if (typeof p.sub !== 'string' || p.sub === '' || typeof p.jti !== 'string' || p.jti === '') continue;
-          verifiedPayload = p;
-          break;
+          return p;
         } catch { /* try next candidate key */ }
       }
+      return undefined;
+    };
+
+    let verifiedPayload = await verifyAssertion(jwks);
+    // A URI-backed document that yielded no matching key may simply be stale
+    // (the issuer rotated keys); force one fresh fetch and retry before failing.
+    if (verifiedPayload === undefined && fetched && trusted.jwksUri) {
+      const uri = trusted.jwksUri;
+      try {
+        jwks = await fetchJwks(uri, true);
+      } catch { throw invalid; }
+      verifiedPayload = await verifyAssertion(jwks);
     }
     if (verifiedPayload === undefined) throw invalid;
 
@@ -413,14 +418,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       ? (typeof verifiedPayload.email === 'string' && verifiedPayload.email !== '' ? verifiedPayload.email : undefined)
       : verifiedPayload.sub as string;
     if (subject === undefined) throw invalid;
-
-    // Validate the requested scope (and the mapped subject above) *before*
-    // committing the assertion's replay entry: an unsupported scope must return
-    // invalid_scope without burning the (issuer, jti) pair, so a retry with an
-    // allowed scope still succeeds instead of failing as a replay.
-    const scope = (single(form, 'scope') ?? '').trim();
-    const scopesList = scope ? scope.split(' ') : [];
-    if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
 
     const jti = verifiedPayload.jti as string;
     const exp = verifiedPayload.exp as number;
