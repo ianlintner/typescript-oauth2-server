@@ -17,6 +17,7 @@ export interface Config {
   sessionSecret: string;
   signingKeyPem: string;
   signingKeyId: string;
+  adminToken: string | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -98,6 +99,16 @@ export function loadConfig(env: Env): Config {
   const host = env.OAUTH2_HOST?.trim() || '127.0.0.1';
   if (metricsEnabled && !LOOPBACK.has(host)) throw new ConfigError('OAUTH2_METRICS_ENABLED requires a loopback host');
 
+  const adminToken = env.OAUTH2_ADMIN_TOKEN?.trim() || undefined;
+  if (production && adminToken !== undefined) {
+    if (PLACEHOLDER.test(adminToken)) {
+      throw new ConfigError('OAUTH2_ADMIN_TOKEN looks like a placeholder; refusing to start in production');
+    }
+    if (adminToken.length < MIN_SECRET_LENGTH) {
+      throw new ConfigError(`OAUTH2_ADMIN_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
+    }
+  }
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -119,5 +130,6 @@ export function loadConfig(env: Env): Config {
     sessionSecret,
     signingKeyPem,
     signingKeyId,
+    adminToken,
   };
 }

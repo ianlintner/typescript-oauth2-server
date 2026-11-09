@@ -80,6 +80,23 @@ test('production rejects http issuer, in-memory database and placeholder secrets
   rejects({ ...prod, OAUTH2_SESSION_SECRET: 'change-me'.padEnd(40, '!') }, /OAUTH2_SESSION_SECRET/);
 });
 
+test('admin token is optional, trimmed, and placeholder-gated in production', () => {
+  assert.equal(loadConfig(dev).adminToken, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: '  ' }).adminToken, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: ' good-admin-token ' }).adminToken, 'good-admin-token');
+  rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'change-me'.padEnd(40, '!') }, /OAUTH2_ADMIN_TOKEN/);
+});
+
+test('production admin token must be at least MIN_SECRET_LENGTH characters', () => {
+  // A single character would otherwise pass the placeholder gate and become the
+  // sole authorization check for the trusted-issuer registry.
+  rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'a' }, /OAUTH2_ADMIN_TOKEN/);
+  rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'short-admin-token' }, /OAUTH2_ADMIN_TOKEN/);
+  // A strong token in development is unaffected, and a long token loads in production.
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: 'short' }).adminToken, 'short');
+  assert.equal(loadConfig({ ...prod, OAUTH2_ADMIN_TOKEN: 's'.repeat(32) }).adminToken, 's'.repeat(32));
+});
+
 test('development allows http only for loopback issuers', () => {
   rejects({ ...dev, OAUTH2_ISSUER: 'http://auth.example.com' }, /https|loopback/);
   assert.equal(loadConfig({ ...dev, OAUTH2_ISSUER: 'http://127.0.0.1:9000' }).issuer, 'http://127.0.0.1:9000');

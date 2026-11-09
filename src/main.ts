@@ -52,6 +52,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     random: cryptoRandom,
     issuer: config.issuer,
     metrics: config.metricsEnabled ? new Metrics() : undefined,
+    adminToken: config.adminToken,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
     consent,

@@ -1,4 +1,4 @@
-import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, ParRecord, RefreshTokenRecord, Store } from './ports.js';
+import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, ParRecord, RefreshTokenRecord, Store, TrustedIssuerRecord } from './ports.js';
 
 /** Database-specific primitives; callers hold a real backend transaction. */
 export interface Documents {
@@ -27,6 +27,14 @@ export abstract class DocumentStore implements Store {
     }
     await db.remove('client', id);
     return true;
+  }); }
+  saveTrustedIssuer(t: TrustedIssuerRecord): Promise<void> { return this.run(db => db.put('trusted_issuer', t.issuer, t)); }
+  getTrustedIssuer(issuer: string): Promise<TrustedIssuerRecord | null> { return this.run(db => db.get('trusted_issuer', issuer)); }
+  listTrustedIssuers(): Promise<TrustedIssuerRecord[]> { return this.run(db => db.list('trusted_issuer')); }
+  deleteTrustedIssuer(id: string): Promise<boolean> { return this.run(async db => {
+    const matches = (await db.list<TrustedIssuerRecord>('trusted_issuer')).filter(t => t.id === id);
+    for (const t of matches) await db.remove('trusted_issuer', t.issuer);
+    return matches.length > 0;
   }); }
   saveDeviceCode(d: DeviceCodeRecord): Promise<void> { return this.run(async db => {
     if ((await db.list<DeviceCodeRecord>('device')).some(x => x.userCodeHash === d.userCodeHash)) throw new Error('duplicate user code');

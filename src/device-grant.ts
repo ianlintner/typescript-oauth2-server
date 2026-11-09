@@ -8,7 +8,7 @@ import type { ClientRecord } from './ports.js';
 // Reuse the core module's shared helpers and client auth so slice semantics stay identical.
 import {
   authenticateClient, bearerToken, rejectDuplicates, safeEqual, single,
-  type OAuthDeps,
+  type OAuthDeps, JWT_BEARER_GRANT_TYPE,
 } from './oauth.js';
 
 export const DEVICE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
@@ -382,7 +382,7 @@ async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<strin
 }
 
 function normalizeGrantTypes(value: unknown, authMethod: string): string[] {
-  const allowed = ['authorization_code', 'refresh_token', 'client_credentials', DEVICE_GRANT_TYPE, DEVICE_GRANT_TYPE_ALIAS];
+  const allowed = ['authorization_code', 'refresh_token', 'client_credentials', DEVICE_GRANT_TYPE, DEVICE_GRANT_TYPE_ALIAS, JWT_BEARER_GRANT_TYPE];
   if (value === undefined) {
     const out = ['authorization_code'];
     if (authMethod === 'none') return out;

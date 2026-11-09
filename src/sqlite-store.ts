@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, DeviceCodeStatus, ParRecord, RefreshTokenRecord, Store,
+  TrustedIssuerRecord,
 } from './ports.js';
 
 const SCHEMA = `
@@ -71,6 +72,18 @@ CREATE TABLE IF NOT EXISTS par_requests (
 CREATE TABLE IF NOT EXISTS dpop_proofs (
   key TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trusted_issuers (
+  id TEXT PRIMARY KEY,
+  issuer TEXT NOT NULL UNIQUE,
+  jwks TEXT,
+  jwks_uri TEXT,
+  allowed_audiences TEXT NOT NULL,
+  subject_mapping TEXT NOT NULL,
+  allowed_client_ids TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );`;
 
 interface ClientRow {
@@ -104,6 +117,34 @@ interface ParRow {
   params: string;
   expires_at: number;
   consumed_at: number | null;
+}
+
+interface TrustedIssuerRow {
+  id: string;
+  issuer: string;
+  jwks: string | null;
+  jwks_uri: string | null;
+  allowed_audiences: string;
+  subject_mapping: string;
+  allowed_client_ids: string;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+function rowToTrustedIssuer(r: TrustedIssuerRow): TrustedIssuerRecord {
+  return {
+    id: r.id,
+    issuer: r.issuer,
+    ...(r.jwks ? { jwks: JSON.parse(r.jwks) as TrustedIssuerRecord['jwks'] } : {}),
+    ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
+    allowedAudiences: JSON.parse(r.allowed_audiences) as string[],
+    subjectMapping: r.subject_mapping as 'sub' | 'email',
+    allowedClientIds: JSON.parse(r.allowed_client_ids) as string[],
+    enabled: r.enabled === 1,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
 }
 
 function rowToDevice(r: DeviceRow): DeviceCodeRecord {
@@ -286,6 +327,37 @@ const ops = {
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
+  },
+
+  // -- trusted issuers --
+
+  saveTrustedIssuer(db: DatabaseSync, t: TrustedIssuerRecord): void {
+    db.prepare(
+      `INSERT INTO trusted_issuers (id, issuer, jwks, jwks_uri, allowed_audiences, subject_mapping, allowed_client_ids, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(issuer) DO UPDATE SET jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
+         allowed_audiences=excluded.allowed_audiences, subject_mapping=excluded.subject_mapping,
+         allowed_client_ids=excluded.allowed_client_ids, enabled=excluded.enabled,
+         updated_at=excluded.updated_at`,
+    ).run(
+      t.id, t.issuer, t.jwks ? JSON.stringify(t.jwks) : null, t.jwksUri ?? null,
+      JSON.stringify(t.allowedAudiences), t.subjectMapping, JSON.stringify(t.allowedClientIds),
+      t.enabled ? 1 : 0, t.createdAt, t.updatedAt,
+    );
+  },
+
+  getTrustedIssuer(db: DatabaseSync, issuer: string): TrustedIssuerRecord | null {
+    const r = db.prepare('SELECT * FROM trusted_issuers WHERE issuer = ?').get(issuer) as unknown as TrustedIssuerRow | undefined;
+    return r ? rowToTrustedIssuer(r) : null;
+  },
+
+  listTrustedIssuers(db: DatabaseSync): TrustedIssuerRecord[] {
+    const rows = db.prepare('SELECT * FROM trusted_issuers ORDER BY created_at').all() as unknown as TrustedIssuerRow[];
+    return rows.map(rowToTrustedIssuer);
+  },
+
+  deleteTrustedIssuer(db: DatabaseSync, id: string): boolean {
+    return Number(db.prepare('DELETE FROM trusted_issuers WHERE id = ?').run(id).changes) > 0;
   },
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
@@ -479,6 +551,18 @@ class TxStore implements Store {
   deleteClient(id: string): Promise<boolean> {
     return this.#use((db) => ops.deleteClient(db, id));
   }
+  saveTrustedIssuer(t: TrustedIssuerRecord): Promise<void> {
+    return this.#use((db) => ops.saveTrustedIssuer(db, t));
+  }
+  getTrustedIssuer(issuer: string): Promise<TrustedIssuerRecord | null> {
+    return this.#use((db) => ops.getTrustedIssuer(db, issuer));
+  }
+  listTrustedIssuers(): Promise<TrustedIssuerRecord[]> {
+    return this.#use((db) => ops.listTrustedIssuers(db));
+  }
+  deleteTrustedIssuer(id: string): Promise<boolean> {
+    return this.#use((db) => ops.deleteTrustedIssuer(db, id));
+  }
   saveDeviceCode(d: DeviceCodeRecord): Promise<void> {
     return this.#use((db) => ops.saveDeviceCode(db, d));
   }
@@ -603,6 +687,18 @@ export class SqliteStore implements Store {
   }
   deleteClient(id: string): Promise<boolean> {
     return this.#enqueue((db) => ops.deleteClient(db, id));
+  }
+  saveTrustedIssuer(t: TrustedIssuerRecord): Promise<void> {
+    return this.#enqueue((db) => ops.saveTrustedIssuer(db, t));
+  }
+  getTrustedIssuer(issuer: string): Promise<TrustedIssuerRecord | null> {
+    return this.#enqueue((db) => ops.getTrustedIssuer(db, issuer));
+  }
+  listTrustedIssuers(): Promise<TrustedIssuerRecord[]> {
+    return this.#enqueue((db) => ops.listTrustedIssuers(db));
+  }
+  deleteTrustedIssuer(id: string): Promise<boolean> {
+    return this.#enqueue((db) => ops.deleteTrustedIssuer(db, id));
   }
   saveDeviceCode(d: DeviceCodeRecord): Promise<void> {
     return this.#enqueue((db) => ops.saveDeviceCode(db, d));
