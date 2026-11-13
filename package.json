@@ -14,7 +14,7 @@
     "start": "tsx src/main.ts"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
     "eslint": "^10.14.0",
     "tsx": "^4.0.0",
