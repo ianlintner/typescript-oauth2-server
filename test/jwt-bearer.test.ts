@@ -9,7 +9,7 @@ import { cryptoRandom } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
-import { clearJwksCache } from '../src/jwks.js';
+import { clearJwksCache, __setJwksClock } from '../src/jwks.js';
 
 const ISSUER = 'http://localhost:8080';
 const GT = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
@@ -522,11 +522,164 @@ test('a rotated verification key is refreshed when the cached document lacks the
     assert.equal((await c.jwtb(await signWith(oldKey.privateKey, 'old', '1'))).statusCode, 200);
     assert.equal(fetches, 1);
     // Rotate: the endpoint now publishes only the new key. The assertion names
-    // a kid the cached document lacks, so the handler must refresh once.
+    // a kid the cached document lacks, so the handler must refresh once -- but
+    // only after the forced-refresh cooldown has elapsed. Advance the JWKS clock
+    // past the cooldown so the rotation is actually re-fetched.
+    __setJwksClock(() => Date.now() + 60_000);
     current = { keys: [newJwk] };
     const res = await c.jwtb(await signWith(newKey.privateKey, 'new', '2'));
     assert.equal(res.statusCode, 200, res.body);
     assert.equal(fetches, 2);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('an outage past the cache TTL still verifies with the stale document (kept on failed refresh)', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'stale-1' };
+  let fetches = 0;
+  let up = true;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    if (!up) { res.writeHead(500); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string) => {
+    const body = { iss: 'https://stale.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'stale-1' }).sign(ext2.privateKey);
+  };
+  // A virtual wall-clock for the cache, decoupled from the handler's assertion clock.
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-stale', issuer: 'https://stale.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    // Populate the cache.
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // Advance past the TTL, then take the endpoint down. The stale document
+    // must still verify the assertion instead of failing closed.
+    cacheNow += 3600 * 1000;
+    up = false;
+    const res = await c.jwtb(await signFor('2'));
+    assert.equal(res.statusCode, 200, res.body);
+    // The stale document was returned, so the exchange still succeeded; the
+    // failed refresh attempt did increment the fetch counter.
+    assert.ok(fetches >= 2);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('forceFresh does not refetch a document younger than the cooldown', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'cool-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string, kid: string) => {
+    const body = { iss: 'https://cooldown.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
+  };
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-cool', issuer: 'https://cooldown.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('1', 'cool-1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // An unknown kid would normally trigger a forced refresh, but the document
+    // was fetched moments ago: the cooldown serves the cached doc instead of
+    // hitting the endpoint again, so this request fails without a second fetch.
+    const res = await c.jwtb(await signFor('2', 'other-kid'));
+    assert.equal(res.statusCode, 400);
+    assert.equal(fetches, 1);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('subject_mapping=email with an empty email is an opaque invalid_grant', async () => {
+  const c = await setup();
+  await c.store.saveTrustedIssuer({
+    id: 'ti-1', issuer: EXT, jwks: (await c.store.getTrustedIssuer(EXT))!.jwks,
+    allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  const res = await c.jwtb(await c.sign({ sub: 'x', email: '' }));
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_grant');
+});
+
+test('scope with doubled separators filters empty tokens and rejects unknown scope', async () => {
+  const c = await setup();
+  // 'read' is allowed, 'admin' is not; the empty token between doubled spaces
+  // must be dropped rather than matched (and thus must not itself fail).
+  const res = await c.jwtb(await c.sign(), { scope: 'read  admin' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_scope');
+  // Purely doubled separators around an allowed scope resolve to just 'read'.
+  const ok = await c.jwtb(await c.sign(), { scope: ' read ' });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.ok(ok.json().access_token);
+});
+
+test('concurrent exchanges coalesce onto a single in-flight JWKS fetch', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'coalesce-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string) => {
+    const body = { iss: 'https://coalesce.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'coalesce-1' }).sign(ext2.privateKey);
+  };
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-coalesce', issuer: 'https://coalesce.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    const results = await Promise.all([c.jwtb(await signFor('1')), c.jwtb(await signFor('2')), c.jwtb(await signFor('3'))]);
+    for (const r of results) assert.equal(r.statusCode, 200, r.body);
+    // All three shared the single fetch already in flight.
+    assert.equal(fetches, 1);
   } finally {
     if (server.listening) server.close();
     clearJwksCache();
