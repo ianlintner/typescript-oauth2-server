@@ -536,7 +536,7 @@ test('a rotated verification key is refreshed when the cached document lacks the
   }
 });
 
-test('an outage past the cache TTL still verifies with the stale document (kept on failed refresh)', async () => {
+test('an outage past the cache TTL is served stale for matching kids, but an unknown kid fails closed', async () => {
   const c = await setup();
   const ext2 = await generateKeyPair('ES256', { extractable: true });
   const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'stale-1' };
@@ -554,9 +554,9 @@ test('an outage past the cache TTL still verifies with the stale document (kept 
   });
   const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
   const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
-  const signFor = (jti: string) => {
+  const signFor = (jti: string, kid = 'stale-1') => {
     const body = { iss: 'https://stale.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
-    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'stale-1' }).sign(ext2.privateKey);
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
   };
   // A virtual wall-clock for the cache, decoupled from the handler's assertion clock.
   let cacheNow = Date.now();
@@ -570,15 +570,27 @@ test('an outage past the cache TTL still verifies with the stale document (kept 
     // Populate the cache.
     assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
     assert.equal(fetches, 1);
-    // Advance past the TTL, then take the endpoint down. The stale document
-    // must still verify the assertion instead of failing closed.
+    // Advance past the TTL, then take the endpoint down. A kid the stale
+    // document covers must still verify: the failed non-forced refresh keeps
+    // the stale entry, so the in-handler forced retry is served from it during
+    // the cooldown instead of failing closed.
     cacheNow += 3600 * 1000;
     up = false;
     const res = await c.jwtb(await signFor('2'));
     assert.equal(res.statusCode, 200, res.body);
-    // The stale document was returned, so the exchange still succeeded; the
-    // failed refresh attempt did increment the fetch counter.
-    assert.ok(fetches >= 2);
+    // The expired entry hit the endpoint once; its stale fallback sets no
+    // `fetchedAt`, so the in-handler forced retry was served from cache and
+    // the endpoint was not hit a second time.
+    assert.equal(fetches, 2);
+    // An unknown kid cannot be verified from the stale document; once the
+    // cooldown has passed the forced refresh fails and must fail closed rather
+    // than be papered over with stale keys.
+    cacheNow += 60_000;
+    const unknown = await c.jwtb(await signFor('3', 'rotated-away'));
+    assert.equal(unknown.statusCode, 400);
+    assert.equal(unknown.json().error, 'invalid_grant');
+    // One more cache-miss fetch, joined by the forced retry via the cooldown.
+    assert.equal(fetches, 4);
   } finally {
     if (server.listening) server.close();
     clearJwksCache();
@@ -619,6 +631,64 @@ test('forceFresh does not refetch a document younger than the cooldown', async (
     const res = await c.jwtb(await signFor('2', 'other-kid'));
     assert.equal(res.statusCode, 400);
     assert.equal(fetches, 1);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('a failed forceFresh refresh past the cooldown does not serve stale keys (no fetch amplification)', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'fresh-1' };
+  let fetches = 0;
+  let up = true;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    if (!up) { res.writeHead(500); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string, kid: string) => {
+    const body = { iss: 'https://fresh.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
+  };
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-fresh', issuer: 'https://fresh.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('1', 'fresh-1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+
+    // Past the TTL, with the endpoint down. The initial lookup cannot refresh,
+    // so it serves the stale document; the unknown kid then forces a refresh,
+    // which fails. That failure must surface (opaque invalid_grant) rather than
+    // returning the stale document, which would look like a key mismatch and
+    // let the next request hit the dead endpoint all over again.
+    cacheNow += 3600 * 1000;
+    up = false;
+    const first = await c.jwtb(await signFor('2', 'unknown-kid'));
+    assert.equal(first.statusCode, 400);
+    assert.equal(first.json().error, 'invalid_grant');
+    // Initial setup (1) + cache-miss lookup (2) + forced retry (3).
+    assert.equal(fetches, 3);
+    // Once the cooldown elapses a third exchange refetches once, fails, and
+    // still fails closed — never succeeding off stale keys.
+    cacheNow += 60_000;
+    const second = await c.jwtb(await signFor('3', 'unknown-kid'));
+    assert.equal(second.statusCode, 400);
+    assert.equal(second.json().error, 'invalid_grant');
+    assert.equal(fetches, 5);
   } finally {
     if (server.listening) server.close();
     clearJwksCache();

@@ -39,7 +39,7 @@ export function clearJwksCache(): void {
   jwksNow = () => Date.now();
 }
 
-/** Override the cache clock (test seam); reset via `clearJwksCache`. */
+/** Override the cache clock (test seam); reset via `clearJwksCache`. @internal */
 export function __setJwksClock(fn: () => number): void {
   jwksNow = fn;
 }
@@ -149,7 +149,8 @@ export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> 
   }
 
   const inFlight = fetchJwksDocument(url).then((jwks) => {
-    jwksCache.set(url, { jwks, expiresAt: jwksNow() + JWKS_CACHE_TTL_MS, fetchedAt: jwksNow(), inFlight: null });
+    const fetchedAt = jwksNow();
+    jwksCache.set(url, { jwks, expiresAt: fetchedAt + JWKS_CACHE_TTL_MS, fetchedAt, inFlight: null });
     return jwks;
   });
   jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, fetchedAt: cached?.fetchedAt ?? 0, inFlight });
@@ -158,14 +159,15 @@ export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> 
   } catch (err) {
     // A failed refresh must not wedge the guard entry for concurrent callers:
     // clear only the in-flight promise, preserving the previously cached (now
-    // stale) document so a transient outage past TTL still verifies. On the
-    // very first fetch there is no stale document, so we rethrow.
+    // stale) document so a transient outage past TTL still verifies on
+    // non-forced lookups. On forced refreshes (or when no stale keys exist) we
+    // rethrow so callers fail closed instead of looping on stale keys.
     const entry = jwksCache.get(url);
     if (entry && entry.inFlight === inFlight) {
       jwksCache.set(url, { jwks: entry.jwks, expiresAt: entry.expiresAt, fetchedAt: entry.fetchedAt, inFlight: null });
     }
-    const stale = cached?.jwks;
-    if (stale && (stale.keys?.length ?? 0) > 0) return stale;
+    const stale = entry?.jwks ?? cached?.jwks;
+    if (!forceFresh && stale && (stale.keys?.length ?? 0) > 0) return stale;
     throw err;
   }
 }
