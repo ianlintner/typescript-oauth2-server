@@ -25,3 +25,5 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 - `src/ports.ts`: clock, random, signer and store interfaces. `src/sqlite-store.ts` is the SQLite adapter (`node:sqlite`) with serialized transactions and atomic one-time authorization-code consumption; `src/signer.ts` is the `jose` ES256 signer.
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
+
+Refresh tokens rotate on every use. Presenting a refresh token that was already used revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2).

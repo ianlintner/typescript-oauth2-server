@@ -239,6 +239,49 @@ test('refresh_token rotation replay revokes the token family', async () => {
   await done(s);
 });
 
+async function rotate(s: Awaited<ReturnType<typeof setup>>, rt: string) {
+  return token(s.server, { grant_type: 'refresh_token', refresh_token: rt, client_id: 'conf', client_secret: SECRET });
+}
+
+async function chain(s: Awaited<ReturnType<typeof setup>>, rotations: number): Promise<string[]> {
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, { client_id: 'conf', client_secret: SECRET });
+  const rts: string[] = [first.json().refresh_token];
+  for (let i = 0; i < rotations; i++) {
+    const res = await rotate(s, rts[i]!);
+    assert.equal(res.statusCode, 200);
+    rts.push(res.json().refresh_token);
+  }
+  return rts;
+}
+
+test('refresh replay after four rotations still revokes the live family', async () => {
+  for (let replayIdx = 0; replayIdx < 4; replayIdx++) {
+    const s = await setup();
+    const rts = await chain(s, 4);
+    const replay = await rotate(s, rts[replayIdx]!);
+    assert.equal(replay.statusCode, 400);
+    assert.equal(replay.json().error, 'invalid_grant');
+    const live = await rotate(s, rts[4]!);
+    assert.equal(live.statusCode, 400);
+    assert.equal(live.json().error, 'invalid_grant');
+    await done(s);
+  }
+});
+
+test('linear rotation never flags a replay', async () => {
+  const s = await setup();
+  const rts = await chain(s, 3); // rt1..rt4, every rotation accepted
+  assert.equal(rts.length, 4);
+  // Nothing was revoked by rotating: the newest token is still redeemable via lookup.
+  assert.ok(await s.store.getRefreshToken(rts[3]!, 1_000_000));
+  assert.equal((await rotate(s, rts[0]!)).statusCode, 400);
+  const afterFirst = await rotate(s, rts[3]!);
+  assert.equal(afterFirst.statusCode, 400);
+  assert.equal((await rotate(s, rts[1]!)).statusCode, 400);
+  assert.equal((await rotate(s, rts[3]!)).statusCode, 400);
+  await done(s);
+});
+
 test('refresh_token cannot escalate scope', async () => {
   const s = await setup();
   const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' },

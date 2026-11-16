@@ -721,7 +721,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const jkt = proofJkt;
 
       const consumed = await deps.store.consumeRefreshToken(rtValue, deps.clock.now());
-      if (!consumed) throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
+      if (!consumed) {
+        // The token passed the lookup but could not be consumed: another request already used it.
+        await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
+        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
+      }
 
       // Check replay: if the family was revoked by replay, fail.
       if (consumed.revokedByReplayAt !== null) throw new OAuthError('invalid_grant');
