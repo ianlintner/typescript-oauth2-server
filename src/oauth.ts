@@ -179,13 +179,14 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
   if (source && source.count >= limits.maxFailuresPerSource) throw tooManyRequests(source.resetAt, now);
   const client = id ? await deps.store.peekWindow(failureKey.client(id), now) : null;
   if (client && client.count >= limits.maxFailuresPerClient) throw tooManyRequests(client.resetAt, now);
+  const lookup: ClientLookup = { registered: false };
   try {
-    return await authenticateClientUnthrottled(deps, req, form);
+    return await authenticateClientUnthrottled(deps, req, form, lookup);
   } catch (err) {
     if (err instanceof OAuthError && err.code === 'invalid_client') {
       await deps.store.recordWindowHit(sourceKey, limits.windowSeconds, now);
       // Only registered ids get their own counter, so rotating random ids cannot grow storage.
-      if (id && await deps.store.getClient(id)) await deps.store.recordWindowHit(failureKey.client(id), limits.windowSeconds, now);
+      if (id !== undefined && lookup.registered) await deps.store.recordWindowHit(failureKey.client(id), limits.windowSeconds, now);
     }
     throw err;
   }
@@ -193,7 +194,10 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
 
 let dummySecretHash: Promise<string> | undefined;
 
-async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
+/** Filled in by the credential check: whether the presented id resolved to a stored client. */
+interface ClientLookup { registered: boolean }
+
+async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams, lookup: ClientLookup = { registered: false }): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
   const assertionType = single(form, 'client_assertion_type');
@@ -220,6 +224,7 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
   const invalid = new OAuthError('invalid_client', 'client authentication failed');
   if (!id) throw invalid;
   const client = await deps.store.getClient(id);
+  lookup.registered = client !== null;
   if (!client || !client.enabled) {
     // Equalise work so response timing does not reveal which client ids exist.
     dummySecretHash ??= hashClientSecret('dummy-secret');
