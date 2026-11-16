@@ -228,7 +228,7 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
   if (!client || !client.enabled) {
     // Equalise work so response timing does not reveal which client ids exist.
     dummySecretHash ??= hashClientSecret('dummy-secret');
-    if (secret) await verifyClientSecret(secret, await dummySecretHash);
+    await verifyClientSecret(secret ?? '', await dummySecretHash);
     throw invalid;
   }
   if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
