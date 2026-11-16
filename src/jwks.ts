@@ -1,6 +1,9 @@
 import type { JWK } from 'jose';
 import { OAuthError } from './errors.js';
 import type { Jwks } from './ports.js';
+import { assertPublicHost, isIpLiteral, isPublicAddress } from './net-guard.js';
+
+export { setNetGuard as setJwksNetGuard } from './net-guard.js';
 
 /** Algorithms accepted for RFC 7523 JWT-bearer assertions (§2.2). RS/ES/PS are the RFC 7518 asymmetric families. */
 export const ASSERTION_ALGS = ['RS256', 'ES256', 'PS256'] as const;
@@ -20,9 +23,14 @@ interface CachedJwks {
 
 const jwksCache = new Map<string, CachedJwks>();
 
+/** Minimum spacing between forced (rotation-driven) refreshes of the same URI. */
+const JWKS_FORCED_REFRESH_WINDOW_MS = 10_000;
+const lastForcedRefresh = new Map<string, number>();
+
 /** Drop all cached documents (test seam). */
 export function clearJwksCache(): void {
   jwksCache.clear();
+  lastForcedRefresh.clear();
 }
 
 /**
@@ -42,6 +50,10 @@ export function validateJwksUri(uri: string): void {
   if (parsed.protocol !== 'https:') throw new OAuthError('invalid_request', 'jwks_uri must use the https scheme');
   if (parsed.hostname === '') throw new OAuthError('invalid_request', 'jwks_uri must include a host');
   if (parsed.hash !== '') throw new OAuthError('invalid_request', 'jwks_uri must not contain a fragment');
+  // Literal addresses can be judged now; names are checked against their resolved addresses at fetch time.
+  if (isIpLiteral(parsed.hostname) && !isPublicAddress(parsed.hostname)) {
+    throw new OAuthError('invalid_request', 'jwks_uri must not use a non-public address');
+  }
 }
 
 /** Candidate verification keys for a given alg/kid, filtered from a JWKS document. */
@@ -65,6 +77,8 @@ async function fetchJwksDocument(url: string): Promise<Jwks> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JWKS_TIMEOUT_MS);
   try {
+    // Judge the addresses the host resolves to now, immediately before connecting.
+    await assertPublicHost(new URL(url).hostname);
     const res = await fetch(url, {
       headers: { accept: 'application/json' },
       signal: controller.signal,
@@ -123,6 +137,15 @@ export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> 
     if (cached?.inFlight) return cached.inFlight;
   } else if (cached?.inFlight) {
     return cached.inFlight; // coalesce onto an in-flight refresh
+  } else {
+    // Bound forced refreshes: within the window, reuse the cached document
+    // (or fail) instead of making another outbound request.
+    const last = lastForcedRefresh.get(url);
+    if (last !== undefined && now - last < JWKS_FORCED_REFRESH_WINDOW_MS) {
+      if (cached) return cached.jwks;
+      throw new Error('JWKS refresh rate-limited');
+    }
+    lastForcedRefresh.set(url, now);
   }
 
   const inFlight = fetchJwksDocument(url).then((jwks) => {
