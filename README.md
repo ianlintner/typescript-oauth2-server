@@ -25,3 +25,8 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 - `src/ports.ts`: clock, random, signer and store interfaces. `src/sqlite-store.ts` is the SQLite adapter (`node:sqlite`) with serialized transactions and atomic one-time authorization-code consumption; `src/signer.ts` is the `jose` ES256 signer.
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
+
+## Token typing and resource indicators
+
+- Access tokens are JWTs with JOSE header `typ: at+jwt` (RFC 9068 §2.1); ID tokens keep `typ: JWT`. Resource servers that validate access tokens statelessly should require `typ` to be `at+jwt` (compare case-insensitively, per RFC 8725 §3.11). The discovery document lists `access_token_signing_alg_values_supported`. This server's own userinfo, introspection and revocation endpoints accept only `at+jwt` tokens, and `id_token_hint` at `/oauth/logout` accepts only ID tokens. Access tokens issued before this change carry `typ: JWT` and are no longer accepted by those endpoints.
+- `resource` (RFC 8707) is accepted at the token endpoint on every grant. `ClientRecord.resources` is the per-client allow-list of resource identifiers; a value outside it (or any value for a client with no list) is refused with `invalid_target` before a code or refresh token is consumed or a token is stored. When accepted, the access token's `aud` is exactly that resource. Without `resource`, `aud` remains the client id. A refresh token keeps the resource of the grant it came from: a refresh request may repeat it but not change it or add one. One `resource` per request; `resource` on the authorization endpoint is not read.

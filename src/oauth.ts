@@ -215,13 +215,43 @@ function boundJkt(payload: Record<string, unknown>): string | null {
   return typeof jkt === 'string' && jkt !== '' ? jkt : null;
 }
 
+/** JOSE `typ` of JWT access tokens (RFC 9068 §2.1). ID tokens keep the default `JWT`. */
+export const ACCESS_TOKEN_TYP = 'at+jwt';
+
+/**
+ * RFC 8707 §2: the optional `resource` parameter. Absent means no resource was requested; a value the
+ * client is not registered for is refused with invalid_target before anything is issued or consumed.
+ */
+function requestedResource(client: ClientRecord, form: URLSearchParams): string | undefined {
+  const resource = single(form, 'resource');
+  if (resource === undefined) return undefined;
+  if (!client.resources?.includes(resource)) throw new OAuthError('invalid_target', 'resource is not permitted for this client');
+  return resource;
+}
+
+/**
+ * The single place access-token claims and header are decided. `aud` is the requested resource when one
+ * was accepted (RFC 8707 §2, a single string), otherwise the client id.
+ */
+async function signAccessToken(deps: OAuthDeps, client: ClientRecord, t: {
+  subject: string; iat: number; jti: string; scope: string; jkt?: string | null | undefined; resource?: string | null | undefined;
+}): Promise<string> {
+  const claims: Record<string, unknown> = {
+    iss: deps.issuer, sub: t.subject, aud: t.resource ?? client.clientId, client_id: client.clientId,
+    iat: t.iat, exp: t.iat + ACCESS_TOKEN_TTL_SECONDS, jti: t.jti,
+  };
+  if (t.scope !== '') claims.scope = t.scope;
+  if (t.jkt) claims.cnf = { jkt: t.jkt };
+  return deps.signer.sign(claims, { typ: ACCESS_TOKEN_TYP });
+}
+
 /**
  * RFC 8628 §3.4 device token grant. Returns the token reply. On a pending
  * authorization the reply carries the authorization_pending error and a
  * Cache-Control: no-store (RFC 8628 §3.5). A poll faster than the device's
  * interval gets slow_down (+5s).
  */
-async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: string): Promise<Record<string, unknown>> {
+async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: string, resource: string | undefined): Promise<Record<string, unknown>> {
   const now = deps.clock.now();
   const record = await deps.store.getDeviceCode(hash);
   if (!record || record.clientId !== client.clientId) throw new OAuthError('invalid_grant', 'device_code is invalid');
@@ -251,12 +281,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
 
   const iat = now;
   const atJti = deps.random.token(16);
-  const claims: Record<string, unknown> = {
-    iss: deps.issuer, sub: subject, aud: client.clientId, client_id: client.clientId,
-    iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
-  };
-  if (scopes !== '') claims.scope = scopes;
-  const accessToken = await deps.signer.sign(claims);
+  const accessToken = await signAccessToken(deps, client, { subject, iat, jti: atJti, scope: scopes, resource });
 
   await deps.store.saveAccessToken({
     jti: atJti, clientId: client.clientId, subject, scope: scopes,
@@ -280,7 +305,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
     const rtJti = deps.random.token(24);
     await deps.store.saveRefreshToken({
       jti: rtJti, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
-      family: rtJti, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+      family: rtJti, parentJti: null, revokedByReplayAt: null, revokedAt: null, resource: resource ?? null,
     });
     body.refresh_token = rtJti;
   }
@@ -421,6 +446,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const scope = (single(form, 'scope') ?? '').trim();
     const scopesList = scope ? scope.split(' ') : [];
     if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
+    const resource = requestedResource(client, form);
 
     const jti = verifiedPayload.jti as string;
     const exp = verifiedPayload.exp as number;
@@ -431,13 +457,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     const iat = deps.clock.now();
     const atJti = deps.random.token(16);
-    const claims: Record<string, unknown> = {
-      iss: deps.issuer, sub: subject, aud: client.clientId, client_id: client.clientId,
-      iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
-    };
-    if (scope) claims.scope = scope;
-    if (jkt) claims.cnf = { jkt };
-    const accessToken = await deps.signer.sign(claims);
+    const accessToken = await signAccessToken(deps, client, { subject, iat, jti: atJti, scope, jkt, resource });
 
     await deps.store.saveAccessToken({
       jti: atJti, clientId: client.clientId, subject, scope,
@@ -574,6 +594,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (!client.grantTypes.includes('authorization_code')) throw new OAuthError('unauthorized_client');
       // Validate the proof before consuming the code so a bad proof cannot burn it.
       const jkt = await tokenEndpointProof(req);
+      const resource = requestedResource(client, form);
 
       const code = single(form, 'code');
       const redirectUri = single(form, 'redirect_uri');
@@ -605,18 +626,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const includesOpenid = scopesList.includes('openid');
 
       const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: record.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (scopes !== '') claims.scope = scopes;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
+      const accessToken = await signAccessToken(deps, client, { subject: record.subject, iat, jti: atJti, scope: scopes, jkt, resource });
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: record.subject,
@@ -652,7 +662,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           jti: rtJti, clientId: client.clientId, subject: record.subject,
           scope: scopes, expiresAt: iat + refreshTtl,
           family: rtJti, // each auth code creates a new family
-          parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+          parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt, resource: resource ?? null,
         });
         body.refresh_token = rtJti;
       }
@@ -671,21 +681,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const scope = (single(form, 'scope') ?? '').trim();
       const scopesList = scope ? scope.split(' ') : [];
       if (scopesList.some((s) => !client.scopes.includes(s))) throw new OAuthError('invalid_scope');
+      const resource = requestedResource(client, form);
 
       const iat = deps.clock.now();
       const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: client.clientId,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (scope) claims.scope = scope;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
+      const accessToken = await signAccessToken(deps, client, { subject: client.clientId, iat, jti: atJti, scope, jkt, resource });
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: client.clientId,
@@ -719,6 +719,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         throw new OAuthError('invalid_dpop_proof', 'refresh token is bound to a different DPoP key');
       }
       const jkt = proofJkt;
+      // RFC 8707 §2.2: a refreshed token keeps its resource; a request may repeat it but never change it.
+      const resource = lookedUp.resource ?? undefined;
+      const requestedRes = single(form, 'resource');
+      if (requestedRes !== undefined && requestedRes !== resource) {
+        throw new OAuthError('invalid_target', 'resource does not match the original grant');
+      }
 
       const consumed = await deps.store.consumeRefreshToken(rtValue, deps.clock.now());
       if (!consumed) throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
@@ -741,18 +747,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const includesOpenid = scopesList.includes('openid');
 
       const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: consumed.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (allowedScope) claims.scope = allowedScope;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
+      const accessToken = await signAccessToken(deps, client, { subject: consumed.subject, iat, jti: atJti, scope: allowedScope, jkt, resource });
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: consumed.subject,
@@ -765,7 +760,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         scope: allowedScope, expiresAt: iat + refreshTtl,
         family: consumed.family,
         parentJti: consumed.jti,
-        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt, resource: resource ?? null,
       });
 
       const body: Record<string, unknown> = {
@@ -795,10 +790,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           !client.grantTypes.includes('device_code')) {
         throw new OAuthError('unauthorized_client', 'client is not allowed to use device_code grant');
       }
+      const resource = requestedResource(client, form);
       const deviceCode = single(form, 'device_code');
       if (!deviceCode) throw new OAuthError('invalid_request', 'device_code is required');
       const hash = sha256Hex(deviceCode);
-      return deviceCodeGrant(deps, client, hash);
+      return deviceCodeGrant(deps, client, hash, resource);
     }
 
     // -- jwt-bearer (RFC 7523 §2.1) --
@@ -935,6 +931,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['ES256'],
+    access_token_signing_alg_values_supported: ['ES256'],
     dpop_signing_alg_values_supported: [...DPOP_SIGNING_ALGS],
   } as const;
 
@@ -1028,6 +1025,7 @@ async function verifyAccessJwt(deps: OAuthDeps, token: string): Promise<Record<s
     const result = await jwtVerify(token, key, {
       issuer: deps.issuer,
       algorithms: ['ES256'],
+      typ: ACCESS_TOKEN_TYP, // an ID token (typ JWT) is never an access token
       currentDate: new Date(deps.clock.now() * 1000),
     });
     return result.payload as Record<string, unknown>;
@@ -1035,7 +1033,7 @@ async function verifyAccessJwt(deps: OAuthDeps, token: string): Promise<Record<s
     return null;
   }
 }
-/** Verify a JWT this server signed (signature and issuer). `ignoreExpiry` is for id_token_hint only. */
+/** Verify an ID token this server signed (signature, issuer, `typ` JWT). `ignoreExpiry` is for id_token_hint only. */
 async function verifyOwnJwt(deps: OAuthDeps, token: string, ignoreExpiry: boolean): Promise<Record<string, unknown>> {
   const jwks = await deps.signer.publicJwks();
   const { jwtVerify, importJWK } = await import('jose');
@@ -1043,6 +1041,7 @@ async function verifyOwnJwt(deps: OAuthDeps, token: string, ignoreExpiry: boolea
   const result = await jwtVerify(token, key, {
     issuer: deps.issuer,
     algorithms: ['ES256'],
+    typ: 'JWT', // an access token (typ at+jwt) is never an ID token
     currentDate: ignoreExpiry ? new Date(0) : new Date(deps.clock.now() * 1000),
   });
   return result.payload as Record<string, unknown>;

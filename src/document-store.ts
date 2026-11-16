@@ -91,7 +91,7 @@ export abstract class DocumentStore implements Store {
     await db.put('access', id, { ...r, revokedAt: now });
     return true;
   }); }
-  saveRefreshToken(t: RefreshTokenRecord): Promise<void> { return this.run(db => db.insert('refresh', t.jti, { ...t, dpopJkt: t.dpopJkt ?? null, consumedAt: null })); }
+  saveRefreshToken(t: RefreshTokenRecord): Promise<void> { return this.run(db => db.insert('refresh', t.jti, { ...t, dpopJkt: t.dpopJkt ?? null, resource: t.resource ?? null, consumedAt: null })); }
   getRefreshToken(id: string, now: number): Promise<RefreshTokenRecord | null> { return this.run(async db => {
     const r = await db.get<RefreshTokenRecord>('refresh', id);
     return r && r.expiresAt > now && r.revokedAt === null && r.revokedByReplayAt === null ? r : null;

@@ -13,7 +13,8 @@ export interface Jwks {
 }
 
 export interface Signer {
-  sign(claims: Record<string, unknown>): Promise<string>;
+  /** Sign `claims` as a JWS. `header.typ` sets the JOSE `typ` header and defaults to `JWT`. */
+  sign(claims: Record<string, unknown>, header?: { typ?: string }): Promise<string>;
   publicJwks(): Promise<Jwks>;
 }
 
@@ -30,6 +31,8 @@ export interface ClientRecord {
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
   jwksUri?: string | null | undefined;
+  /** Resource indicators (RFC 8707) this client may request. Absent or empty means `resource` is refused. */
+  resources?: string[] | null | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }
@@ -130,6 +133,8 @@ export interface RefreshTokenRecord {
   revokedAt: number | null;
   /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
   dpopJkt?: string | null;
+  /** RFC 8707 resource the access tokens issued from this token are addressed to; absent/null when none. */
+  resource?: string | null;
 }
 
 export interface Store {

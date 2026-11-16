@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { exportPKCS8, generateKeyPair, jwtVerify, importJWK } from 'jose';
+import { decodeProtectedHeader, exportPKCS8, generateKeyPair, jwtVerify, importJWK } from 'jose';
 import { createJoseSigner } from '../src/signer.js';
 
 test('signs a JWT verifiable with the published JWKS and carries kid', async () => {
@@ -26,4 +26,11 @@ test('rejects an unparsable key', async () => {
 test('rejects an empty key id', async () => {
   const { privateKey } = await generateKeyPair('ES256', { extractable: true });
   await assert.rejects(createJoseSigner(await exportPKCS8(privateKey), ''), /kid/i);
+});
+
+test('sign defaults to typ JWT and accepts an explicit typ', async () => {
+  const { privateKey } = await generateKeyPair('ES256', { extractable: true });
+  const signer = await createJoseSigner(await exportPKCS8(privateKey), 'k1');
+  assert.equal(decodeProtectedHeader(await signer.sign({ sub: 'u1' })).typ, 'JWT');
+  assert.equal(decodeProtectedHeader(await signer.sign({ sub: 'u1' }, { typ: 'at+jwt' })).typ, 'at+jwt');
 });
