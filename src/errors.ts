@@ -40,12 +40,15 @@ const STATUS: Record<OAuthErrorCode, number> = {
 export class OAuthError extends Error {
   readonly code: OAuthErrorCode;
   readonly description: string | undefined;
+  /** Seconds until a throttled caller may retry; when set the response is 429 with Retry-After. */
+  readonly retryAfter: number | undefined;
 
-  constructor(code: OAuthErrorCode, description?: string) {
+  constructor(code: OAuthErrorCode, description?: string, retryAfter?: number) {
     super(description ?? code);
     this.name = 'OAuthError';
     this.code = code;
     this.description = description;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -68,6 +71,10 @@ export function errorResponse(err: unknown): ErrorResponse {
   // Server-side failure details are never exposed to clients.
   if (err.description !== undefined && err.code !== 'server_error') {
     body.error_description = err.description;
+  }
+  if (err.retryAfter !== undefined) {
+    headers['retry-after'] = String(Math.ceil(err.retryAfter));
+    return { status: 429, headers, body };
   }
   return { status: STATUS[err.code], headers, body };
 }
