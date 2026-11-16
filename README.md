@@ -25,3 +25,14 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 - `src/ports.ts`: clock, random, signer and store interfaces. `src/sqlite-store.ts` is the SQLite adapter (`node:sqlite`) with serialized transactions and atomic one-time authorization-code consumption; `src/signer.ts` is the `jose` ES256 signer.
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
+
+### Dynamic client registration policy
+
+Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a `registrationPolicy`. Every value a registrant supplies must appear on the matching allow-list, otherwise `POST` and `PUT /connect/register` return `invalid_client_metadata` or `invalid_redirect_uri`:
+
+- `allowedGrantTypes` (default `authorization_code`, `refresh_token`). `client_credentials`, the device grant and `urn:ietf:params:oauth:grant-type:jwt-bearer` are opt-in.
+- `allowedScopes` (default `openid`, `profile`, `email`).
+- `allowedRedirectSchemes` (default `https`). Plain `http` is accepted only for `127.0.0.1` and `[::1]`; custom app schemes are opt-in; credentials in the URI are always refused.
+- `initialAccessToken`: when set, `POST /connect/register` requires it as a Bearer token. Reading, updating and deleting a client continue to use that client's registration access token.
+
+Embedders that enabled registration without a policy now get these defaults; list any previously accepted grant types, scopes or schemes explicitly to keep them.

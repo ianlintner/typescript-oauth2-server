@@ -8,13 +8,14 @@ import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
 import { buildServer } from '../src/server.js';
+import type { RegistrationPolicy } from '../src/device-grant.js';
 
 const ISSUER = 'http://localhost:8080';
 const CB = 'https://app.example/cb';
 const DEVICE_SECRET = 'device-client-secret';
 const sha256 = (v: string) => createHash('sha256').update(v).digest('hex');
 
-async function setup(opts: { dynamicRegistration?: boolean } = {}) {
+async function setup(opts: { dynamicRegistration?: boolean; registrationPolicy?: RegistrationPolicy } = {}) {
   const { privateKey } = await generateKeyPair('ES256', { extractable: true });
   const signer = await createJoseSigner(await exportPKCS8(privateKey), 'k1');
   const store = new SqliteStore(':memory:');
@@ -34,6 +35,7 @@ async function setup(opts: { dynamicRegistration?: boolean } = {}) {
     store, signer, clock, random: cryptoRandom, issuer: ISSUER,
     authenticate: async () => 'user-1',
     dynamicRegistration: opts.dynamicRegistration ?? true,
+    registrationPolicy: opts.registrationPolicy,
   });
   return { server, store, signer, clock, advance: (s: number) => { now += s; } };
 }
@@ -289,9 +291,9 @@ test('dynamic registration rejects privileged scopes', async () => {
   await s.server.close();
 });
 
-test('dynamic registration accepts the jwt-bearer grant type', async () => {
-  const s = await setup({ dynamicRegistration: true });
+test('dynamic registration accepts the jwt-bearer grant type when the policy allows it', async () => {
   const GT = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
+  const s = await setup({ dynamicRegistration: true, registrationPolicy: { allowedGrantTypes: [GT] } });
   const res = await s.server.inject({
     method: 'POST', url: '/connect/register',
     headers: { 'content-type': 'application/json' },
@@ -398,5 +400,114 @@ test('device verify throttles repeated wrong user codes (RFC 8628 §5.1)', async
   assert.equal((await guess()).statusCode, 429);
   s.advance(61);
   assert.equal((await guess()).statusCode, 400);
+  await s.server.close();
+});
+
+// -- registration policy: allow-lists and initial access token --
+
+const regPost = (s: Awaited<ReturnType<typeof setup>>, body: unknown, headers: Record<string, string> = {}) => s.server.inject({
+  method: 'POST', url: '/connect/register', headers: { 'content-type': 'application/json', ...headers }, payload: JSON.stringify(body),
+});
+
+test('registration refuses non-allow-listed grant types by default', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  for (const g of ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'client_credentials']) {
+    const res = await regPost(s, { redirect_uris: [CB], grant_types: [g] });
+    assert.equal(res.statusCode, 400, g);
+    assert.equal(res.json().error, 'invalid_client_metadata');
+  }
+  const ok = await regPost(s, { redirect_uris: [CB], grant_types: ['authorization_code'] });
+  assert.equal(ok.statusCode, 201);
+  await s.server.close();
+});
+
+test('registration refuses scopes outside the allow-list', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  for (const scope of ['orders:manage', 'openid admin:read', 'superuser']) {
+    const res = await regPost(s, { redirect_uris: [CB], scope });
+    assert.equal(res.statusCode, 400, scope);
+    assert.equal(res.json().error, 'invalid_client_metadata');
+  }
+  const ok = await regPost(s, { redirect_uris: [CB], scope: 'openid profile' });
+  assert.equal(ok.statusCode, 201);
+  assert.deepEqual((await s.store.getClient(ok.json().client_id))?.scopes, ['openid', 'profile']);
+  await s.server.close();
+});
+
+test('registration scope and grant allow-lists are operator-configurable', async () => {
+  const s = await setup({ registrationPolicy: { allowedScopes: ['orders:manage'], allowedGrantTypes: ['client_credentials'] } });
+  const ok = await regPost(s, { redirect_uris: [CB], scope: 'orders:manage', grant_types: ['client_credentials'] });
+  assert.equal(ok.statusCode, 201);
+  assert.equal((await regPost(s, { redirect_uris: [CB], scope: 'openid' })).statusCode, 400);
+  await s.server.close();
+});
+
+test('registration refuses userinfo in a redirect URI', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  const bad = await regPost(s, { redirect_uris: ['https://user:pass@app.example/cb'] });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, 'invalid_redirect_uri');
+  assert.equal((await regPost(s, { redirect_uris: ['https://user@app.example/cb'] })).statusCode, 400);
+  assert.equal((await regPost(s, { redirect_uris: ['https://app.example/cb'] })).statusCode, 201);
+  await s.server.close();
+});
+
+test('registration redirect schemes are an allow-list; http is limited to loopback IP literals', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  for (const u of ['http://localhost:8080/cb', 'http://app.example/cb', 'com.example.app:/cb', 'javascript:alert(1)', 'data:text/html,x']) {
+    const res = await regPost(s, { redirect_uris: [u] });
+    assert.equal(res.statusCode, 400, u);
+    assert.equal(res.json().error, 'invalid_redirect_uri');
+  }
+  for (const u of ['http://127.0.0.1:8080/cb', 'http://[::1]:8080/cb']) {
+    assert.equal((await regPost(s, { redirect_uris: [u] })).statusCode, 201, u);
+  }
+  await s.server.close();
+  const custom = await setup({ registrationPolicy: { allowedRedirectSchemes: ['https', 'com.example.app', 'javascript'] } });
+  assert.equal((await regPost(custom, { redirect_uris: ['com.example.app:/cb'] })).statusCode, 201);
+  assert.equal((await regPost(custom, { redirect_uris: ['javascript:alert(1)'] })).statusCode, 400);
+  await custom.server.close();
+});
+
+test('PUT cannot widen grants or scopes past the policy', async () => {
+  const s = await setup({ dynamicRegistration: true });
+  const reg = (await regPost(s, { redirect_uris: [CB], grant_types: ['authorization_code'], scope: 'openid' })).json();
+  const stored = JSON.stringify(await s.store.getClient(reg.client_id));
+  const put = (body: unknown) => s.server.inject({
+    method: 'PUT', url: `/connect/register/${reg.client_id}`,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${reg.registration_access_token}` }, payload: JSON.stringify(body),
+  });
+  for (const body of [
+    { redirect_uris: [CB], grant_types: ['client_credentials'], scope: 'openid' },
+    { redirect_uris: [CB], grant_types: ['authorization_code'], scope: 'orders:manage' },
+  ]) {
+    const res = await put(body);
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_client_metadata');
+  }
+  assert.equal((await put({ redirect_uris: ['http://localhost/cb'], scope: 'openid' })).statusCode, 400);
+  assert.equal(JSON.stringify(await s.store.getClient(reg.client_id)), stored);
+  await s.server.close();
+});
+
+test('initial access token gates registration when configured', async () => {
+  const IAT = 'initial-access-token-value';
+  const s = await setup({ registrationPolicy: { initialAccessToken: IAT } });
+  const body = { redirect_uris: [CB] };
+  for (const headers of [{}, { authorization: 'Bearer wrong' }, { authorization: `Basic ${IAT}` }]) {
+    const res = await regPost(s, body, headers);
+    assert.equal(res.statusCode, 401);
+    assert.equal(res.json().error, 'invalid_client');
+  }
+  const ok = await regPost(s, body, { authorization: `Bearer ${IAT}` });
+  assert.equal(ok.statusCode, 201);
+  const { registration_client_uri: uri, registration_access_token: rat } = ok.json();
+  // Management methods stay gated by the per-client registration access token.
+  for (const method of ['GET', 'PUT', 'DELETE'] as const) {
+    const res = await s.server.inject({ method, url: uri, ...(method === 'PUT' ? { headers: { 'content-type': 'application/json' }, payload: JSON.stringify(body) } : {}) });
+    assert.equal(res.statusCode, 401, method);
+  }
+  assert.equal((await s.server.inject({ method: 'GET', url: uri, headers: { authorization: `Bearer ${IAT}` } })).statusCode, 401);
+  assert.equal((await s.server.inject({ method: 'GET', url: uri, headers: { authorization: `Bearer ${rat}` } })).statusCode, 200);
   await s.server.close();
 });
