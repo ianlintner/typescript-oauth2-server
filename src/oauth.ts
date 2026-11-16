@@ -258,9 +258,10 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   if (scopes !== '') claims.scope = scopes;
   const accessToken = await deps.signer.sign(claims);
 
+  const grant = deps.random.token(24);
   await deps.store.saveAccessToken({
     jti: atJti, clientId: client.clientId, subject, scope: scopes,
-    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant,
   });
 
   const body: Record<string, unknown> = {
@@ -280,7 +281,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
     const rtJti = deps.random.token(24);
     await deps.store.saveRefreshToken({
       jti: rtJti, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
-      family: rtJti, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+      family: grant, parentJti: null, revokedByReplayAt: null, revokedAt: null,
     });
     body.refresh_token = rtJti;
   }
@@ -441,7 +442,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     await deps.store.saveAccessToken({
       jti: atJti, clientId: client.clientId, subject, scope,
-      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
     });
 
     return {
@@ -584,7 +585,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       // Consume atomically; a code presented by the wrong client is rolled back so it cannot be burned by others.
       const record = await deps.store.transaction(async (tx) => {
         const consumed = await tx.consumeAuthorizationCode(sha256Hex(code), deps.clock.now());
-        if (!consumed) return null;
+        if (!consumed) {
+          // A code that cannot be redeemed again also withdraws whatever its earlier redemption issued.
+          await tx.revokeGrant(sha256Hex(code), deps.clock.now(), client.clientId);
+          return null;
+        }
         if (consumed.clientId !== client.clientId) throw new OAuthError('invalid_grant');
         return consumed;
       });
@@ -621,6 +626,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: record.subject,
         scope: scopes, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+        grant: record.codeHash,
       });
 
       const body: Record<string, unknown> = {
@@ -651,7 +657,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         await deps.store.saveRefreshToken({
           jti: rtJti, clientId: client.clientId, subject: record.subject,
           scope: scopes, expiresAt: iat + refreshTtl,
-          family: rtJti, // each auth code creates a new family
+          family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
           parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
         });
         body.refresh_token = rtJti;
@@ -689,7 +695,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: client.clientId,
-        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
       });
 
       return reply.header('pragma', 'no-cache').send({
@@ -720,10 +726,13 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       }
       const jkt = proofJkt;
 
-      const consumed = await deps.store.consumeRefreshToken(rtValue, deps.clock.now());
-      if (!consumed) {
+      const consumed = await deps.store.transaction(async (tx) => {
+        const c = await tx.consumeRefreshToken(rtValue, deps.clock.now());
         // The token passed the lookup but could not be consumed: another request already used it.
-        await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
+        if (!c) await tx.revokeGrant(lookedUp.family, deps.clock.now(), client.clientId);
+        return c;
+      });
+      if (!consumed) {
         throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
       }
 
@@ -761,6 +770,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: consumed.subject,
         scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+        grant: consumed.family,
       });
 
       const rtJti = deps.random.token(24);
@@ -850,7 +860,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const revokeRefresh = async (): Promise<boolean> => {
       const rt = await deps.store.getRefreshToken(token, now);
       if (!rt || rt.clientId !== client.clientId) return false;
-      await deps.store.revokeRefreshToken(token, now);
+      await deps.store.transaction(async (tx) => {
+        await tx.revokeRefreshToken(token, now);
+        await tx.revokeGrant(rt.family, now, client.clientId);
+      });
       return true;
     };
     if (hint === 'refresh_token') {

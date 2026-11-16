@@ -684,3 +684,99 @@ test('revoking an access token with a wrong refresh_token hint still revokes it'
   assert.equal(res.json().active, false);
   await done(s);
 });
+
+// -- Grant cascade --
+
+async function authorizeCode(server: FastifyInstance, clientId: string): Promise<string> {
+  const q = new URLSearchParams({
+    response_type: 'code', client_id: clientId, redirect_uri: CB, scope: 'read',
+    code_challenge: CHALLENGE, code_challenge_method: 'S256', state: 'st-1',
+  });
+  const res = await server.inject({ method: 'GET', url: `/oauth/authorize?${q.toString()}` });
+  assert.equal(res.statusCode, 302);
+  return new URL(res.headers.location as string).searchParams.get('code')!;
+}
+
+function redeemCode(server: FastifyInstance, code: string) {
+  return token(server, {
+    grant_type: 'authorization_code', code, redirect_uri: CB, code_verifier: VERIFIER,
+    client_id: 'conf', client_secret: SECRET,
+  });
+}
+
+const confAuth = { client_id: 'conf', client_secret: SECRET };
+
+async function accessTokenState(s: Awaited<ReturnType<typeof setup>>, at: string) {
+  const ui = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${at}` } });
+  const intro = await introspect(s.server, at, 'access_token', confAuth);
+  return { userinfo: ui.statusCode, active: intro.json().active as boolean };
+}
+
+test('authorization code replay revokes the tokens issued from it', async () => {
+  const s = await setup();
+  const code = await authorizeCode(s.server, 'conf');
+  const first = await redeemCode(s.server, code);
+  assert.equal(first.statusCode, 200);
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 200, active: true });
+
+  const again = await redeemCode(s.server, code);
+  assert.equal(again.statusCode, 400);
+  assert.equal(again.json().error, 'invalid_grant');
+
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 401, active: false });
+  const rot = await token(s.server, { grant_type: 'refresh_token', refresh_token: first.json().refresh_token, ...confAuth });
+  assert.equal(rot.statusCode, 400);
+  assert.equal(rot.json().error, 'invalid_grant');
+  await done(s);
+});
+
+test('authorization code replay leaves other grants of the same user untouched', async () => {
+  const s = await setup();
+  const one = await redeemCode(s.server, await authorizeCode(s.server, 'conf'));
+  const code2 = await authorizeCode(s.server, 'conf');
+  assert.equal((await redeemCode(s.server, code2)).statusCode, 200);
+  assert.equal((await redeemCode(s.server, code2)).statusCode, 400);
+  assert.deepEqual(await accessTokenState(s, one.json().access_token), { userinfo: 200, active: true });
+  assert.equal((await token(s.server, { grant_type: 'refresh_token', refresh_token: one.json().refresh_token, ...confAuth })).statusCode, 200);
+  await done(s);
+});
+
+test('refresh replay revokes access tokens issued from the family', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, confAuth);
+  const rt1 = first.json().refresh_token;
+  const rot = await token(s.server, { grant_type: 'refresh_token', refresh_token: rt1, ...confAuth });
+  assert.equal(rot.statusCode, 200);
+  const at2 = rot.json().access_token;
+  assert.deepEqual(await accessTokenState(s, at2), { userinfo: 200, active: true });
+
+  const replay = await token(s.server, { grant_type: 'refresh_token', refresh_token: rt1, ...confAuth });
+  assert.equal(replay.statusCode, 400);
+  assert.deepEqual(await accessTokenState(s, at2), { userinfo: 401, active: false });
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 401, active: false });
+  await done(s);
+});
+
+test('revoking a refresh token revokes its access tokens', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, confAuth);
+  const { access_token: at, refresh_token: rt } = first.json();
+  const res = await revoke(s.server, rt, 'refresh_token', confAuth);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body, '');
+  assert.deepEqual(await accessTokenState(s, at), { userinfo: 401, active: false });
+  await done(s);
+});
+
+test('revoking a refresh token with another client is a no-op that still answers 200', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, confAuth);
+  await s.store.saveClient({
+    clientId: 'other', clientSecretHash: await hashClientSecret('other-secret'), redirectUris: [CB],
+    grantTypes: ['authorization_code', 'refresh_token'], scopes: ['read'], enabled: true,
+  });
+  const res = await revoke(s.server, first.json().refresh_token, 'refresh_token', { client_id: 'other', client_secret: 'other-secret' });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 200, active: true });
+  await done(s);
+});

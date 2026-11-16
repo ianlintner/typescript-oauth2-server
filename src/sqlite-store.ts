@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS access_tokens (
   scope TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   revoked_at INTEGER,
-  token_hash TEXT
+  token_hash TEXT,
+  grant_id TEXT
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   jti TEXT PRIMARY KEY,
@@ -183,6 +184,7 @@ interface AccessTokenRow {
   expires_at: number;
   revoked_at: number | null;
   token_hash: string | null;
+  grant_id: string | null;
 }
 
 interface RefreshTokenRow {
@@ -208,6 +210,7 @@ function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
     expiresAt: r.expires_at,
     revokedAt: r.revoked_at,
     tokenHash: r.token_hash,
+    grant: r.grant_id,
   };
 }
 
@@ -395,9 +398,9 @@ const ops = {
 
   saveAccessToken(db: DatabaseSync, t: AccessTokenRecord): void {
     db.prepare(
-      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash);
+      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash, grant_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash, t.grant ?? null);
   },
 
   getAccessToken(db: DatabaseSync, jti: string, now: number): AccessTokenRecord | null {
@@ -480,11 +483,16 @@ const ops = {
     return res.changes > 0;
   },
 
-  revokeTokenFamily(db: DatabaseSync, family: string, now: number): number {
+  revokeGrant(db: DatabaseSync, grant: string, now: number, clientId?: string): number {
+    const client = clientId === undefined ? '' : ' AND client_id = ?';
+    const extra = clientId === undefined ? [] : [clientId];
+    db.prepare(
+      `UPDATE access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     const res = db.prepare(
       `UPDATE refresh_tokens SET revoked_at = ?
-       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL`,
-    ).run(now, family);
+       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     return Number(res.changes);
   },
 };
@@ -599,8 +607,8 @@ class TxStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#use((db) => ops.revokeTokenFamily(db, family, now));
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#use((db) => ops.revokeGrant(db, grant, now, clientId));
   }
 }
 
@@ -647,6 +655,9 @@ export class SqliteStore implements Store {
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
+    // Databases created before grant linking lack the access-token grant column.
+    const atCols = db.prepare('PRAGMA table_info(access_tokens)').all() as unknown as Array<{ name: string }>;
+    if (!atCols.some((c) => c.name === 'grant_id')) db.exec('ALTER TABLE access_tokens ADD COLUMN grant_id TEXT');
     this.#db = db;
   }
 
@@ -736,8 +747,8 @@ export class SqliteStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#enqueue((db) => ops.revokeGrant(db, grant, now, clientId));
   }
 
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T> {
