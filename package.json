@@ -11,6 +11,7 @@
     "test": "tsx --test test/*.test.ts",
     "check": "pnpm typecheck && pnpm lint && pnpm test",
     "conformance": "tsx src/conformance/cli.ts",
+    "refresh-cutover": "tsx src/refresh-cutover.ts",
     "start": "tsx src/main.ts"
   },
   "devDependencies": {
