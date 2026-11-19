@@ -1,7 +1,88 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { candidateKeys, fetchJwks } from '../src/jwks.js';
+import { candidateKeys, clearJwksCache, fetchJwks, setJwksNetGuard, validateJwksUri } from '../src/jwks.js';
+import { isPublicAddress } from '../src/net-guard.js';
 import type { Jwks } from '../src/ports.js';
+
+// Default for this file: names resolve to a public address (no real DNS).
+setJwksNetGuard({ resolver: async () => [{ address: '203.0.113.10', family: 4 }] });
+
+/** Run `fn` with a fetch spy; returns the number of fetch calls. */
+async function withFetchSpy(body: string, fn: () => Promise<unknown>): Promise<{ calls: number; error?: unknown }> {
+  const prev = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => { calls += 1; return new Response(body, { status: 200 }); }) as typeof fetch;
+  try {
+    await fn();
+    return { calls };
+  } catch (error) {
+    return { calls, error };
+  } finally {
+    globalThis.fetch = prev;
+    clearJwksCache();
+  }
+}
+
+test('fetchJwks refuses a loopback literal without fetching', async () => {
+  const r = await withFetchSpy('{"keys":[]}', () => fetchJwks('https://127.0.0.1:9443/jwks.json'));
+  assert.ok(r.error);
+  assert.equal(r.calls, 0);
+});
+
+test('fetchJwks refuses a name that resolves to a private address', async () => {
+  setJwksNetGuard({ resolver: async () => [{ address: '10.0.0.7', family: 4 }] });
+  try {
+    const r = await withFetchSpy('{"keys":[]}', () => fetchJwks('https://idp.internal.example/jwks.json'));
+    assert.ok(r.error);
+    assert.equal(r.calls, 0);
+  } finally {
+    setJwksNetGuard({ resolver: async () => [{ address: '203.0.113.10', family: 4 }] });
+  }
+});
+
+test('fetchJwks refuses when any resolved address is non-public', async () => {
+  setJwksNetGuard({ resolver: async () => [{ address: '203.0.113.10', family: 4 }, { address: '::1', family: 6 }] });
+  try {
+    const r = await withFetchSpy('{"keys":[]}', () => fetchJwks('https://idp.mixed.example/jwks.json'));
+    assert.ok(r.error);
+    assert.equal(r.calls, 0);
+  } finally {
+    setJwksNetGuard({ resolver: async () => [{ address: '203.0.113.10', family: 4 }] });
+  }
+});
+
+test('fetchJwks still fetches a public address', async () => {
+  const r = await withFetchSpy('{"keys":[]}', () => fetchJwks('https://idp.example/jwks.json'));
+  assert.equal(r.error, undefined);
+  assert.equal(r.calls, 1);
+});
+
+test('a forced refresh is limited to one outbound fetch per URI per window', async () => {
+  const r = await withFetchSpy('{"keys":[]}', async () => {
+    await fetchJwks('https://idp.example/jwks.json');
+    for (let i = 0; i < 5; i++) await fetchJwks('https://idp.example/jwks.json', true);
+  });
+  assert.equal(r.error, undefined);
+  assert.equal(r.calls, 2); // initial fetch + the first forced refresh
+});
+
+test('isPublicAddress classifies ranges', () => {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '224.0.0.1', '255.255.255.255',
+    '::1', '::', 'fe80::1', 'fc00::1', 'fd12::1', 'ff02::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:169.254.169.254', '64:ff9b::a00:1', 'not-an-ip']) {
+    assert.equal(isPublicAddress(ip), false, ip);
+  }
+  for (const ip of ['8.8.8.8', '203.0.113.10', '172.32.0.1', '2606:4700:4700::1111', '::ffff:8.8.8.8']) {
+    assert.equal(isPublicAddress(ip), true, ip);
+  }
+});
+
+test('validateJwksUri rejects non-public literals, including numeric forms', () => {
+  for (const uri of ['https://127.0.0.1/j', 'https://[::1]/j', 'https://169.254.169.254/j', 'https://10.0.0.5/j', 'https://2130706433/j', 'https://0x7f.1/j', 'https://[::ffff:10.0.0.1]/j']) {
+    assert.throws(() => validateJwksUri(uri), /non-public|valid URL/, uri);
+  }
+  assert.doesNotThrow(() => validateJwksUri('https://203.0.113.10/j'));
+  assert.doesNotThrow(() => validateJwksUri('https://idp.example/j'));
+});
 
 test('candidateKeys skips null and non-object entries and still returns valid keys', () => {
   const jwks: Jwks = {
