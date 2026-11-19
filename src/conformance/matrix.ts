@@ -414,7 +414,7 @@ export const MATRIX: readonly ConformanceEntry[] = [
     tsReference: "src/device-grant.ts (POST /connect/register)",
     milestone: 'stage5',
     status: 'deviation',
-    note: "Disabled unless dynamicRegistration is set (as in Rust); no software_statement support; privileged scopes (admin, write) rejected; plain-http redirect URIs only for loopback; registration access token stored as SHA-256 hash.",
+    note: "Disabled unless dynamicRegistration is set (as in Rust); no software_statement support; grant types, scopes and redirect schemes are checked against an operator allow-list (RegistrationPolicy; restrictive defaults); plain-http redirect URIs only for 127.0.0.1 and [::1]; optional initial access token; registration access token stored as SHA-256 hash.",
   },
   {
     id: "get-connect-register-client-id",
@@ -438,7 +438,7 @@ export const MATRIX: readonly ConformanceEntry[] = [
     tsReference: "src/device-grant.ts (PUT /connect/register/:client_id)",
     milestone: 'stage5',
     status: 'deviation',
-    note: "Replaces redirect_uris, grant_types, response_types, scope, client_name and auth method; privileged scopes rejected; no software_statement support.",
+    note: "Replaces redirect_uris, grant_types, response_types, scope, client_name and auth method; same allow-list policy as registration; no software_statement support.",
   },
   {
     id: "delete-connect-register-client-id",
