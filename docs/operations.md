@@ -7,3 +7,19 @@ For local parity tests, start disposable PostgreSQL and MongoDB replica-set inst
 `OAUTH2_METRICS_ENABLED=1` exposes `GET /metrics` only when `OAUTH2_HOST` is loopback. It emits Prometheus text counters and latency buckets labeled solely by fixed operation and response class; no client IDs, arbitrary paths, tokens or usernames. Put an authenticated proxy in front of metrics if exporting remotely. Applications embedding `buildServer` can supply an optional `trace(name)` callback that returns a span-ending function; names are fixed `oauth.http.<operation>` values with no dynamic attributes. Neither an exporter nor a tracing backend is bundled. Counters reset on process restart.
 
 `OAUTH2_ADMIN_TOKEN` enables the trusted-issuer admin routes and is a single shared secret. It is checked for length (32+ characters) and placeholder or well-known values in every environment, not only production. Outside production, a non-loopback `OAUTH2_HOST` together with an admin token is refused at startup; set `OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK=1` only when the process sits behind a trusted proxy. Operators using a shorter development token must rotate it.
+
+## Refresh-token digest cutover (storage format `rt1`)
+
+**Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier, `family` and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client, and every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.
+
+**What invalidates.** Rows written by earlier builds are keyed by the raw token. They can never match a lookup in this build, so every previously issued refresh token stops working and affected users/clients must re-authorize (session reset). Newly issued tokens keep the same wire format, rotation, replay-detection, DPoP-binding and revocation behavior. There is no legacy fallback.
+
+**Already-issued stateless tokens.** Access tokens and ID tokens are signed JWTs and are not part of this change. They stay valid until their own `exp` (access tokens: 1 hour, `ACCESS_TOKEN_TTL_SECONDS`) unless individually revoked by `jti`; the cutover does not and cannot recall them. If an earlier compromise of refresh values is suspected, rotate the signing key separately.
+
+**Operator procedure** (nothing runs on server startup; the server never deletes data by itself):
+1. Back up the database. Stop all server processes that share it, or accept that sessions reset as soon as the new build is deployed.
+2. Deploy this build. Legacy rows are inert from this moment.
+3. Dry run: `OAUTH2_STORAGE=... OAUTH2_DATABASE_PATH=... pnpm refresh-cutover` (or `OAUTH2_DATABASE_URL` for postgres/mongo). It prints `{"format":"rt1.sha256","legacyFound":N,"purged":0,"applied":false}` and changes nothing.
+4. Apply: re-run with `--apply` to delete the legacy rows (those whose identifier lacks the `rt1.` prefix). Digest-format rows are never touched. It is idempotent.
+
+**Rollback.** Redeploying the previous build restores the raw-identifier lookup, but it cannot read `rt1.` rows: sessions issued after the cutover are invalid under the old build, and users re-authorize again. Legacy rows deleted with `--apply` are gone; do not restore them from backup to the rollback target unless you accept that those old credentials become valid again. To keep old credentials invalid across a rollback, leave them purged, or revoke/purge after restoring. Do not keep a plaintext copy of the refresh values to enable downgrade.

@@ -3,6 +3,7 @@ import type {
   AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, DeviceCodeStatus, ParRecord, RefreshTokenRecord, Store,
   TrustedIssuerRecord,
 } from './ports.js';
+import { REFRESH_ID_PREFIX } from './token-digest.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS clients (
@@ -505,6 +506,17 @@ const ops = {
     ).run(now, family);
     return Number(res.changes);
   },
+
+  countLegacyRefreshTokens(db: DatabaseSync): number {
+    const r = db.prepare(`SELECT COUNT(*) AS n FROM refresh_tokens WHERE substr(jti, 1, ${REFRESH_ID_PREFIX.length}) != ?`)
+      .get(REFRESH_ID_PREFIX) as unknown as { n: number };
+    return Number(r.n);
+  },
+
+  purgeLegacyRefreshTokens(db: DatabaseSync): number {
+    return Number(db.prepare(`DELETE FROM refresh_tokens WHERE substr(jti, 1, ${REFRESH_ID_PREFIX.length}) != ?`)
+      .run(REFRESH_ID_PREFIX).changes);
+  },
 };
 
 /**
@@ -619,6 +631,12 @@ class TxStore implements Store {
   }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#use((db) => ops.revokeTokenFamily(db, family, now));
+  }
+  countLegacyRefreshTokens(): Promise<number> {
+    return this.#use((db) => ops.countLegacyRefreshTokens(db));
+  }
+  purgeLegacyRefreshTokens(): Promise<number> {
+    return this.#use((db) => ops.purgeLegacyRefreshTokens(db));
   }
 }
 
@@ -756,6 +774,12 @@ export class SqliteStore implements Store {
   }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
+  }
+  countLegacyRefreshTokens(): Promise<number> {
+    return this.#enqueue((db) => ops.countLegacyRefreshTokens(db));
+  }
+  purgeLegacyRefreshTokens(): Promise<number> {
+    return this.#enqueue((db) => ops.purgeLegacyRefreshTokens(db));
   }
 
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T> {
