@@ -1,4 +1,5 @@
 import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, ParRecord, RefreshTokenRecord, Store, TrustedIssuerRecord } from './ports.js';
+import { isDigestRefreshId } from './token-digest.js';
 
 /** Database-specific primitives; callers hold a real backend transaction. */
 export interface Documents {
@@ -119,6 +120,13 @@ export abstract class DocumentStore implements Store {
       await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
     }
     return count;
+  }); }
+  countLegacyRefreshTokens(): Promise<number> { return this.run(async db =>
+    (await db.list<RefreshTokenRecord>('refresh')).filter(r => !isDigestRefreshId(r.jti)).length); }
+  purgeLegacyRefreshTokens(): Promise<number> { return this.run(async db => {
+    const legacy = (await db.list<RefreshTokenRecord>('refresh')).filter(r => !isDigestRefreshId(r.jti));
+    for (const r of legacy) await db.remove('refresh', r.jti);
+    return legacy.length;
   }); }
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> { return this.run(async db => {
     const current = await db.get<{ expiresAt: number }>('proof', key);
