@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
@@ -277,12 +278,13 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   }
 
   if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-    const rtJti = deps.random.token(24);
+    const rtValue = deps.random.token(24);
+    const rtId = refreshTokenId(rtValue);
     await deps.store.saveRefreshToken({
-      jti: rtJti, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
-      family: rtJti, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+      jti: rtId, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
+      family: rtId, parentJti: null, revokedByReplayAt: null, revokedAt: null,
     });
-    body.refresh_token = rtJti;
+    body.refresh_token = rtValue;
   }
 
   return body;
@@ -647,14 +649,15 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       // Refresh token
       if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-        const rtJti = deps.random.token(24);
+        const rtValue = deps.random.token(24);
+        const rtId = refreshTokenId(rtValue);
         await deps.store.saveRefreshToken({
-          jti: rtJti, clientId: client.clientId, subject: record.subject,
+          jti: rtId, clientId: client.clientId, subject: record.subject,
           scope: scopes, expiresAt: iat + refreshTtl,
-          family: rtJti, // each auth code creates a new family
+          family: rtId, // each auth code creates a new family (digest of its first token)
           parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
         });
-        body.refresh_token = rtJti;
+        body.refresh_token = rtValue;
       }
 
       return reply.header('pragma', 'no-cache').send(body);
@@ -710,7 +713,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (!rtValue) throw new OAuthError('invalid_request', 'refresh_token is required');
 
       // Check client binding BEFORE consuming (don't burn someone else's token).
-      const lookedUp = await deps.store.getRefreshToken(rtValue, deps.clock.now());
+      const presentedId = refreshTokenId(rtValue);
+      const lookedUp = await deps.store.getRefreshToken(presentedId, deps.clock.now());
       if (!lookedUp || lookedUp.clientId !== client.clientId) {
         throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
       }
@@ -720,7 +724,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       }
       const jkt = proofJkt;
 
-      const consumed = await deps.store.consumeRefreshToken(rtValue, deps.clock.now());
+      const consumed = await deps.store.consumeRefreshToken(presentedId, deps.clock.now());
       if (!consumed) {
         // The token passed the lookup but could not be consumed: another request already used it.
         await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
@@ -763,9 +767,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
       });
 
-      const rtJti = deps.random.token(24);
+      const newRtValue = deps.random.token(24);
+      const newRtId = refreshTokenId(newRtValue);
       await deps.store.saveRefreshToken({
-        jti: rtJti, clientId: client.clientId, subject: consumed.subject,
+        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
         scope: allowedScope, expiresAt: iat + refreshTtl,
         family: consumed.family,
         parentJti: consumed.jti,
@@ -776,7 +781,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         access_token: accessToken,
         token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        refresh_token: rtJti,
+        refresh_token: newRtValue,
         ...(allowedScope ? { scope: allowedScope } : {}),
       };
 
@@ -848,9 +853,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return true;
     };
     const revokeRefresh = async (): Promise<boolean> => {
-      const rt = await deps.store.getRefreshToken(token, now);
+      const id = refreshTokenId(token);
+      const rt = await deps.store.getRefreshToken(id, now);
       if (!rt || rt.clientId !== client.clientId) return false;
-      await deps.store.revokeRefreshToken(token, now);
+      await deps.store.revokeRefreshToken(id, now);
       return true;
     };
     if (hint === 'refresh_token') {

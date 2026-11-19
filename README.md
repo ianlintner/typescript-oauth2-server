@@ -27,3 +27,7 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
 
 Refresh tokens rotate on every use. Presenting a refresh token that was already used revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2).
+
+## Remote key retrieval
+
+Trusted-issuer `jwks_uri` documents are fetched only from public addresses. A literal non-public address is rejected at registration, and every hostname is resolved at fetch time and refused if any resolved address is loopback, private, link-local, carrier-grade NAT, multicast, reserved or unspecified. Forced refreshes (used when a key rotates) are limited to one per URI every 10 seconds; within that window the cached document is used. Tests that serve keys from a local listener use the `setJwksNetGuard` test seam (`src/jwks.ts`); it is not configurable from the environment.
