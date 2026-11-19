@@ -206,6 +206,14 @@ export interface Store {
    * already revoked). Call on replay detection.
    */
   revokeTokenFamily(family: string, now: number): Promise<number>;
+  /**
+   * Cutover support (operator-initiated only, never called on startup): count
+   * refresh-token rows whose identifier is not in the current digest format
+   * (`rt1.` prefix). Such rows are already inert for protocol lookups.
+   */
+  countLegacyRefreshTokens(): Promise<number>;
+  /** Cutover support: delete every refresh-token row not in the digest format. Returns rows deleted. */
+  purgeLegacyRefreshTokens(): Promise<number>;
 
   /**
    * Atomically record a DPoP proof identifier (RFC 9449 §11.1). Returns true

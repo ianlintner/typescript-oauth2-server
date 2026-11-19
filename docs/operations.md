@@ -11,3 +11,19 @@ For local parity tests, start disposable PostgreSQL and MongoDB replica-set inst
 Failed client authentication on the token, revocation and introspection endpoints is counted per client id and per source address in fixed windows (default 60 s; 20 failures per registered client id, 10 per source). Device-authorization and pushed-authorization-request creation is limited per source (30 per window) and by caps on unexpired records (1,000 per client, 10,000 overall). A limited request receives `429` with `Retry-After`. Counters are stored in the configured store, so processes sharing a store share the limits. The source is the socket address (`req.ip`); forwarding headers are not read, so behind a proxy configure Fastify's `trustProxy` deliberately. `buildServer({ throttle })` overrides the limits, or `throttle: false` disables them. `bodyLimit` defaults to 64 KiB.
 
 Expired authorization codes, tokens, device codes, pushed requests, DPoP proofs and counter windows are removed by a sweep at start-up and every `OAUTH2_SWEEP_INTERVAL_SECONDS` (default 300; `0` disables). `Store.sweepExpired(now)` is idempotent and can be called from a scheduler instead. Lookups by client, user code and refresh-token family use indexes on all three backends.
+
+## Refresh-token digest cutover (storage format `rt1`)
+
+**Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier, `family` and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client, and every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.
+
+**What invalidates.** Rows written by earlier builds are keyed by the raw token. They can never match a lookup in this build, so every previously issued refresh token stops working and affected users/clients must re-authorize (session reset). Newly issued tokens keep the same wire format, rotation, replay-detection, DPoP-binding and revocation behavior. There is no legacy fallback.
+
+**Already-issued stateless tokens.** Access tokens and ID tokens are signed JWTs and are not part of this change. They stay valid until their own `exp` (access tokens: 1 hour, `ACCESS_TOKEN_TTL_SECONDS`) unless individually revoked by `jti`; the cutover does not and cannot recall them. If an earlier compromise of refresh values is suspected, rotate the signing key separately.
+
+**Operator procedure** (nothing runs on server startup; the server never deletes data by itself):
+1. Back up the database. Stop all server processes that share it, or accept that sessions reset as soon as the new build is deployed.
+2. Deploy this build. Legacy rows are inert from this moment.
+3. Dry run: `OAUTH2_STORAGE=... OAUTH2_DATABASE_PATH=... pnpm refresh-cutover` (or `OAUTH2_DATABASE_URL` for postgres/mongo). It prints `{"format":"rt1.sha256","legacyFound":N,"purged":0,"applied":false}` and changes nothing.
+4. Apply: re-run with `--apply` to delete the legacy rows (those whose identifier lacks the `rt1.` prefix). Digest-format rows are never touched. It is idempotent.
+
+**Rollback.** Redeploying the previous build restores the raw-identifier lookup, but it cannot read `rt1.` rows: sessions issued after the cutover are invalid under the old build, and users re-authorize again. Legacy rows deleted with `--apply` are gone; do not restore them from backup to the rollback target unless you accept that those old credentials become valid again. To keep old credentials invalid across a rollback, leave them purged, or revoke/purge after restoring. Do not keep a plaintext copy of the refresh values to enable downgrade.
