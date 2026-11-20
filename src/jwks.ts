@@ -22,6 +22,12 @@ const JWKS_CACHE_TTL_MS = 300_000; // 5 minutes
  */
 const JWKS_FORCE_FRESH_COOLDOWN_MS = 5_000; // 5 seconds
 
+/**
+ * Longest a document may keep verifying after its last successful fetch while
+ * refreshes are failing. Beyond this a removed issuer key must stop being trusted.
+ */
+const JWKS_STALE_MAX_AGE_MS = 24 * 3_600_000; // 24 hours
+
 interface CachedJwks {
   jwks: Jwks;
   expiresAt: number;
@@ -33,12 +39,23 @@ interface CachedJwks {
 
 const jwksCache = new Map<string, CachedJwks>();
 
+/** Most recent fetch attempt per URI (start time and outcome); drives the cooldown for failures too. */
+const lastAttempt = new Map<string, { at: number; ok: boolean }>();
+
+/** The last good document for `url` if it is within the stale grace period, else undefined. */
+function usableStale(url: string): Jwks | undefined {
+  const entry = jwksCache.get(url);
+  if (!entry || entry.fetchedAt === 0 || (entry.jwks.keys?.length ?? 0) === 0) return undefined;
+  return jwksNow() - entry.fetchedAt <= JWKS_STALE_MAX_AGE_MS ? entry.jwks : undefined;
+}
+
 /** Injectable clock so tests can advance time without sleeping (see `__setJwksClock`). */
 let jwksNow: () => number = () => Date.now();
 
 /** Drop all cached documents and reset the injected clock (test seam). */
 export function clearJwksCache(): void {
   jwksCache.clear();
+  lastAttempt.clear();
   jwksNow = () => Date.now();
 }
 
@@ -138,45 +155,61 @@ async function fetchJwksDocument(url: string): Promise<Jwks> {
 
 /**
  * Fetch a remote JWKS with a bounded-TTL cache and shared in-flight fetches,
- * keyed by URI. A document within TTL is reused verbatim, so an unchanged
- * keyset keeps verifying during a JWKS endpoint outage or rate limit; a
- * document is refetched (and a concurrent burst coalesced onto one request)
- * once the TTL elapses or a rotation requires fresh keys.
+ * keyed by URI. A document within TTL is reused verbatim. Past the TTL it is
+ * refetched (a concurrent burst coalesced onto one request); if that refresh
+ * fails, every non-forced caller -- the initiator and any joiner alike -- is
+ * served the last good document for up to `JWKS_STALE_MAX_AGE_MS` after its
+ * last successful fetch, after which verification fails closed. Forced
+ * (rotation-driven) callers never fall back to stale keys.
+ *
+ * Attempts, successful or not, are rate-limited per URI by the cooldown, so a
+ * dead endpoint is probed at most once per window rather than on every request.
  */
 export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> {
   const nowMs = jwksNow();
   const cached = jwksCache.get(url);
-  if (!forceFresh) {
-    if (cached && cached.expiresAt > nowMs) return cached.jwks;
-    if (cached?.inFlight) return cached.inFlight;
-  } else {
-    // Cooldown: never refetch a document fetched within the cooldown window,
-    // even when a forced refresh is requested. This both throttles refresh
-    // storms and lets a rotation take effect once the window has passed.
-    if (cached && cached.fetchedAt !== 0 && nowMs - cached.fetchedAt < JWKS_FORCE_FRESH_COOLDOWN_MS) return cached.jwks;
-    if (cached?.inFlight) return cached.inFlight; // coalesce onto an in-flight refresh
-  }
+  if (!forceFresh && cached && cached.expiresAt > nowMs) return cached.jwks;
 
-  const inFlight = fetchJwksDocument(url).then((jwks) => {
-    const fetchedAt = jwksNow();
-    jwksCache.set(url, { jwks, expiresAt: fetchedAt + JWKS_CACHE_TTL_MS, fetchedAt, inFlight: null });
-    return jwks;
-  });
-  jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, fetchedAt: cached?.fetchedAt ?? 0, inFlight });
+  let inFlight = cached?.inFlight ?? null;
+  if (!inFlight) {
+    const last = lastAttempt.get(url);
+    if (last !== undefined && nowMs - last.at < JWKS_FORCE_FRESH_COOLDOWN_MS && (forceFresh || !last.ok)) {
+      // Within the cooldown of the previous attempt: do not hit the endpoint.
+      if (!forceFresh) {
+        const stale = usableStale(url);
+        if (stale) return stale;
+        throw new Error('JWKS refresh in cooldown after a failed attempt');
+      }
+      if (cached && cached.fetchedAt !== 0 && (cached.expiresAt > nowMs || usableStale(url))) return cached.jwks;
+      throw new Error('JWKS refresh rate-limited');
+    }
+    const startedAt = nowMs;
+    inFlight = fetchJwksDocument(url).then(
+      (jwks) => {
+        const fetchedAt = jwksNow();
+        lastAttempt.set(url, { at: startedAt, ok: true });
+        jwksCache.set(url, { jwks, expiresAt: fetchedAt + JWKS_CACHE_TTL_MS, fetchedAt, inFlight: null });
+        return jwks;
+      },
+      (err: unknown) => {
+        lastAttempt.set(url, { at: startedAt, ok: false });
+        // Clear only the in-flight promise, keeping the last good document so
+        // non-forced callers can fall back to it within the stale bound.
+        const entry = jwksCache.get(url);
+        if (entry && entry.fetchedAt !== 0) jwksCache.set(url, { ...entry, inFlight: null });
+        else jwksCache.delete(url);
+        throw err;
+      },
+    );
+    jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, fetchedAt: cached?.fetchedAt ?? 0, inFlight });
+  }
   try {
     return await inFlight;
   } catch (err) {
-    // A failed refresh must not wedge the guard entry for concurrent callers:
-    // clear only the in-flight promise, preserving the previously cached (now
-    // stale) document so a transient outage past TTL still verifies on
-    // non-forced lookups. On forced refreshes (or when no stale keys exist) we
-    // rethrow so callers fail closed instead of looping on stale keys.
-    const entry = jwksCache.get(url);
-    if (entry && entry.inFlight === inFlight) {
-      jwksCache.set(url, { jwks: entry.jwks, expiresAt: entry.expiresAt, fetchedAt: entry.fetchedAt, inFlight: null });
+    if (!forceFresh) {
+      const stale = usableStale(url);
+      if (stale) return stale;
     }
-    const stale = entry?.jwks ?? cached?.jwks;
-    if (!forceFresh && stale && (stale.keys?.length ?? 0) > 0) return stale;
     throw err;
   }
 }

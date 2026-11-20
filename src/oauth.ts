@@ -392,7 +392,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // Read the clock after the (potentially slow) JWKS fetch, so an assertion
     // that expires while keys are being retrieved is rejected rather than
     // verified against a stale timestamp and then exchanged for a token.
-    const now = deps.clock.now();
+    let now = deps.clock.now();
 
     const allowedAud = [deps.issuer, `${deps.issuer}/oauth/token`, ...trusted.allowedAudiences];
 
@@ -425,6 +425,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       try {
         jwks = await fetchJwks(uri, true);
       } catch { throw invalid; }
+      // The forced fetch may itself be slow: re-read the clock so an assertion
+      // that expired during rotation is rejected, not verified at a stale instant.
+      now = deps.clock.now();
       verifiedPayload = await verifyAssertion(jwks);
     }
     if (verifiedPayload === undefined) throw invalid;
