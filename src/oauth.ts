@@ -313,7 +313,11 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   return body;
 }
 
-export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void {
+export function registerOAuthRoutes(
+  app: FastifyInstance,
+  deps: OAuthDeps,
+  routeLimits: { rateLimit: { max: number; timeWindow: number } },
+): void {
   const refreshTtl = deps.refreshTokenTtl ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
 
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
@@ -582,7 +586,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
   });
 
-  app.post('/oauth/token', async (req, reply) => {
+  app.post('/oauth/token', { config: { rateLimit: routeLimits.rateLimit } }, async (req, reply) => {
     const form = req.body;
     if (!(form instanceof URLSearchParams)) {
       throw new OAuthError('invalid_request', 'content-type must be application/x-www-form-urlencoded');
