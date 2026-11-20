@@ -781,3 +781,31 @@ test('revoking a refresh token with another client is a no-op that still answers
   assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 200, active: true });
   await done(s);
 });
+
+test('concurrent authorization code redemption leaves no live token from a replayed code', async () => {
+  const s = await setup();
+  const code = await authorizeCode(s.server, 'conf');
+  const results = await Promise.all([redeemCode(s.server, code), redeemCode(s.server, code), redeemCode(s.server, code)]);
+  for (const r of results) {
+    if (r.statusCode !== 200) continue;
+    assert.deepEqual(await accessTokenState(s, r.json().access_token), { userinfo: 401, active: false });
+    const rot = await token(s.server, { grant_type: 'refresh_token', refresh_token: r.json().refresh_token, ...confAuth });
+    assert.equal(rot.statusCode, 400);
+  }
+  await done(s);
+});
+
+test('concurrent refresh rotation leaves no live token once the grant is revoked', async () => {
+  const s = await setup();
+  const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, confAuth);
+  const rt = first.json().refresh_token;
+  const results = await Promise.all([1, 2, 3].map(() => token(s.server, { grant_type: 'refresh_token', refresh_token: rt, ...confAuth })));
+  assert.ok(results.some((r) => r.statusCode === 400));
+  for (const r of results) {
+    if (r.statusCode !== 200) continue;
+    assert.deepEqual(await accessTokenState(s, r.json().access_token), { userinfo: 401, active: false });
+    const rot = await token(s.server, { grant_type: 'refresh_token', refresh_token: r.json().refresh_token, ...confAuth });
+    assert.equal(rot.statusCode, 400);
+  }
+  await done(s);
+});
