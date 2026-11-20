@@ -367,7 +367,7 @@ test('dynamic registration with auth method none yields a public client without 
   // A public client authenticates with client_id only (PAR proves it passes client auth).
   const par = await s.server.inject({
     method: 'POST', url: '/oauth/par', headers: form(new URLSearchParams()),
-    payload: new URLSearchParams({ client_id: body.client_id, response_type: 'code', redirect_uri: CB }).toString(),
+    payload: new URLSearchParams({ client_id: body.client_id, response_type: 'code', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'S256' }).toString(),
   });
   assert.equal(par.statusCode, 201);
   await s.server.close();
@@ -385,8 +385,102 @@ test('PAR rejects unregistered redirect_uri and unsupported response_type at pus
   const badType = await push({ response_type: 'token', redirect_uri: CB });
   assert.equal(badType.statusCode, 400);
   assert.equal(badType.json().error, 'unsupported_response_type');
-  const ok = await push({ response_type: 'code', redirect_uri: CB });
+  const ok = await push({ response_type: 'code', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'S256' });
   assert.equal(ok.statusCode, 201);
+  await s.server.close();
+});
+
+const VERIFIER = 'v'.repeat(43);
+const CHALLENGE = createHash('sha256').update(VERIFIER).digest('base64url');
+
+async function pushPar(s: Awaited<ReturnType<typeof setup>>, extra: Record<string, string>, clientId = 'conf', secret = 'conf-secret') {
+  return s.server.inject({
+    method: 'POST', url: '/oauth/par', headers: form(new URLSearchParams()),
+    payload: new URLSearchParams({ client_id: clientId, client_secret: secret, ...extra }).toString(),
+  });
+}
+
+test('PAR rejects a push without code_challenge', async () => {
+  const s = await setup();
+  const res = await pushPar(s, { response_type: 'code', redirect_uri: CB });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_request');
+  const plain = await pushPar(s, { response_type: 'code', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'plain' });
+  assert.equal(plain.statusCode, 400);
+  await s.server.close();
+});
+
+test('PAR rejects a push without response_type', async () => {
+  const s = await setup();
+  const res = await pushPar(s, { redirect_uri: CB, code_challenge: 'x'.repeat(43), code_challenge_method: 'S256' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_request');
+  await s.server.close();
+});
+
+test('PAR rejects a push without redirect_uri', async () => {
+  const s = await setup();
+  const res = await pushPar(s, { response_type: 'code', code_challenge: 'x'.repeat(43), code_challenge_method: 'S256' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_request');
+  await s.server.close();
+});
+
+test('full push succeeds and authorize needs no front-channel parameters', async () => {
+  const s = await setup();
+  const ok = await pushPar(s, {
+    response_type: 'code', redirect_uri: CB, scope: 'read', state: 'st-1',
+    code_challenge: CHALLENGE, code_challenge_method: 'S256',
+  });
+  assert.equal(ok.statusCode, 201);
+  const res = await s.server.inject({
+    method: 'GET', url: `/oauth/authorize?request_uri=${encodeURIComponent(ok.json().request_uri)}&client_id=conf`,
+  });
+  assert.equal(res.statusCode, 302);
+  const loc = new URL(res.headers.location as string);
+  assert.ok(loc.searchParams.get('code'));
+  assert.equal(loc.searchParams.get('state'), 'st-1');
+  await s.server.close();
+});
+
+test('front-channel parameters do not extend a pushed request', async () => {
+  const s = await setup();
+  const push = await pushPar(s, {
+    response_type: 'code', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'S256',
+  });
+  assert.equal(push.statusCode, 201);
+  const res = await s.server.inject({
+    method: 'GET',
+    url: `/oauth/authorize?request_uri=${encodeURIComponent(push.json().request_uri)}&client_id=conf&scope=write&prompt=none&state=front`,
+  });
+  assert.equal(res.statusCode, 302);
+  const loc = new URL(res.headers.location as string);
+  const code = loc.searchParams.get('code');
+  assert.ok(code);
+  assert.equal(loc.searchParams.get('state'), null);
+  const tok = await s.server.inject({
+    method: 'POST', url: '/oauth/token', headers: form(new URLSearchParams()),
+    payload: new URLSearchParams({
+      grant_type: 'authorization_code', client_id: 'conf', client_secret: 'conf-secret',
+      code, redirect_uri: CB, code_verifier: VERIFIER,
+    }).toString(),
+  });
+  assert.equal(tok.statusCode, 200);
+  assert.ok(!String(tok.json().scope ?? '').includes('write'));
+  await s.server.close();
+});
+
+test('a denied pushed request does not consume the request_uri', async () => {
+  const s = await setup();
+  const push = await pushPar(s, {
+    response_type: 'code', redirect_uri: CB, scope: 'nope', code_challenge: CHALLENGE, code_challenge_method: 'S256',
+  });
+  const uri = encodeURIComponent(push.json().request_uri);
+  const denied = await s.server.inject({ method: 'GET', url: `/oauth/authorize?request_uri=${uri}&client_id=conf` });
+  assert.equal(denied.statusCode, 302);
+  assert.equal(new URL(denied.headers.location as string).searchParams.get('error'), 'invalid_scope');
+  const again = await s.server.inject({ method: 'GET', url: `/oauth/authorize?request_uri=${uri}&client_id=conf` });
+  assert.equal(new URL(again.headers.location as string).searchParams.get('error'), 'invalid_scope');
   await s.server.close();
 });
 

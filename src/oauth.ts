@@ -65,7 +65,7 @@ export function claimsForScope(scope: string, user: UserClaims | null): Record<s
 
 // RFC 7636 §4.1/§4.2: verifier 43-128 unreserved chars; S256 challenge is 43 base64url chars.
 const VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
-const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
+export const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex');
 
@@ -498,11 +498,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (parRedirectUri === undefined || parRedirectUri === '') {
         throw new OAuthError('invalid_request', 'pushed request is missing redirect_uri');
       }
-      // Merge: pushed params win; the client_id/redirect_uri come from the push.
-      const merged = new URLSearchParams();
-      for (const [k, v] of Object.entries(pushed.params)) if (k !== 'request_uri') merged.set(k, v);
-      for (const [k, v] of params.entries()) if (k !== 'request_uri' && !merged.has(k)) merged.set(k, v);
-      params = merged;
+      // RFC 9126 §4: the pushed request is processed as if it had arrived in the query
+      // component, and every other front-channel parameter is ignored. Only client_id and
+      // request_uri are read from the GET; nothing from it may add to or override the push.
+      const pushedParams = new URLSearchParams();
+      for (const [k, v] of Object.entries(pushed.params)) if (k !== 'request_uri') pushedParams.set(k, v);
+      params = pushedParams;
     }
 
     const clientId = single(params, 'client_id') ?? parClientId;
