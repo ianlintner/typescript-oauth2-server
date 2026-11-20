@@ -23,7 +23,7 @@ function rejects(mutate: (s: Record<string, unknown>) => void, needle: RegExp) {
 test('the pinned contract example seed parses', () => {
   const seed = parseSeed(EXAMPLE);
   assert.equal(seed.issuer, 'http://localhost:8080');
-  assert.equal(seed.clients.length, 8);
+  assert.equal(seed.clients.length, 10);
   assert.equal(seed.users[0]?.username, 'alice');
   const pub = seed.clients.find((c) => c.clientId === 'client-public');
   assert.equal(pub?.clientSecret, null);
@@ -62,7 +62,7 @@ test('schema violations are rejected', () => {
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.redirect_uris = ['https://a.example/cb#f']), /fragment/);
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.grant_types = ['implicit']), /grant type/);
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.scopes = ['a b']), /scope/);
-  rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.token_endpoint_auth_method = 'private_key_jwt'), /token_endpoint_auth_method/);
+  rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.token_endpoint_auth_method = 'private_key_jwt'), /private_key_jwt/);
   rejects((s) => ((s.users as Array<Record<string, unknown>>)[0]!.password = ''), /password/);
   rejects((s) => ((s.users as Array<Record<string, unknown>>)[0]!.email = 'x'), /email/);
 });
@@ -106,7 +106,7 @@ test('loadSeed aborts for a missing or unreadable file', async () => {
   await assert.rejects(loadSeed('/nonexistent/seed.yaml'), (e) => e instanceof SeedError && /cannot read/.test(e.message));
   await assert.rejects(loadSeed(new URL('./data', import.meta.url).pathname), SeedError);
   const seed = await loadSeed(SEED_PATH);
-  assert.equal(seed.clients.length, 8);
+  assert.equal(seed.clients.length, 10);
 });
 
 test('applySeed stores clients with hashed secrets and never the plaintext', async () => {
@@ -134,4 +134,26 @@ test('applySeed aborts on pre-existing conflicting state rather than overwriting
   await assert.rejects(applySeed(parseSeed(EXAMPLE), store), /already exists/);
   assert.equal((await store.getClient('client-a'))?.redirectUris[0], 'https://x.example/');
   await store.close();
+});
+
+test('a private_key_jwt seed client keeps its public jwks and needs no secret', async () => {
+  const seed = parseSeed(EXAMPLE);
+  const jwt = seed.clients.find((c) => c.clientId === 'client-jwt');
+  assert.equal(jwt?.clientSecret, null);
+  const store = new SqliteStore(':memory:');
+  await store.init();
+  await applySeed(seed, store);
+  const stored = await store.getClient('client-jwt');
+  assert.equal(stored?.clientSecretHash, null);
+  assert.equal(stored?.tokenEndpointAuthMethod, 'private_key_jwt');
+  assert.equal(stored?.jwks?.keys[0]?.kid, 'client-assertion');
+  await store.close();
+});
+
+test('private_key_jwt seed clients require a nonempty jwks and jwks is rejected elsewhere', () => {
+  const pkj = { client_id: 'k', token_endpoint_auth_method: 'private_key_jwt', redirect_uris: ['https://a.example/cb'] };
+  rejects((s) => { s.clients = [pkj]; }, /jwks/);
+  rejects((s) => { s.clients = [{ ...pkj, jwks: { keys: [] } }]; }, /jwks/);
+  rejects((s) => { s.clients = [{ ...pkj, client_secret: 's', jwks: { keys: [{ kty: 'EC' }] } }]; }, /secret/);
+  rejects((s) => { s.clients = [{ client_id: 'p', public: true, token_endpoint_auth_method: 'none', redirect_uris: ['https://a.example/cb'], jwks: { keys: [{ kty: 'EC' }] } }]; }, /jwks/);
 });

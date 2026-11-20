@@ -1,13 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { hashClientSecret } from '../client-auth.js';
-import type { ClientRecord, Store } from '../ports.js';
+import type { ClientRecord, Jwks, Store } from '../ports.js';
 
 /** Validated, normalized conformance seed (contract/sut-interface.md §2, schemas/seed.schema.json). */
 export interface SeedClient {
   clientId: string;
   /** Plaintext only until applySeed hashes it; null for public clients. */
   clientSecret: string | null;
+  /** private_key_jwt only: the client's public JWKS (RFC 7523 §2.2). */
+  jwks?: Jwks | undefined;
   redirectUris: string[];
   grantTypes: string[];
   scopes: string[];
@@ -46,7 +48,7 @@ const GRANT_TYPES = new Set([
   'urn:ietf:params:oauth:grant-type:device_code',
   'urn:ietf:params:oauth:grant-type:jwt-bearer',
 ]);
-const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post']);
+const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post', 'private_key_jwt']);
 const ALG_RE = /^(RS|ES|PS|HS)[0-9]{3}$/;
 /** The only signing algorithm this server can provision (see signer.ts). */
 const PROVISIONABLE_ALG = 'ES256';
@@ -93,7 +95,7 @@ function strArray(o: Obj, key: string, where: string, opts: { min?: number } = {
 function parseClient(raw: unknown, index: number): SeedClient {
   const at = `clients[${index}]`;
   const c = obj(raw, at);
-  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types'], at);
+  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types', 'jwks'], at);
   const clientId = str(c, 'client_id', at);
   const where = `client ${JSON.stringify(clientId)}`;
   optStr(c, 'name', where);
@@ -103,7 +105,18 @@ function parseClient(raw: unknown, index: number): SeedClient {
   if (c.public !== undefined && typeof c.public !== 'boolean') fail(`${where}: public must be a boolean`);
   const isPublic = c.public === true;
 
-  if (isPublic) {
+  let jwks: Jwks | undefined;
+  if (method === 'private_key_jwt') {
+    if (isPublic) fail(`${where}: a public client cannot use private_key_jwt`);
+    if (secret !== null) fail(`${where}: a private_key_jwt client must not carry a client_secret`);
+    const raw = c.jwks;
+    if (!isObj(raw) || !Array.isArray(raw.keys) || raw.keys.length === 0 || !raw.keys.every(isObj)) {
+      fail(`${where}: private_key_jwt needs jwks with at least one key`);
+    }
+    jwks = { keys: raw.keys as Obj[] };
+  } else if (c.jwks !== undefined) {
+    fail(`${where}: jwks is only valid with token_endpoint_auth_method private_key_jwt`);
+  } else if (isPublic) {
     if (secret !== null) fail(`${where}: a public client must not carry a secret`);
     if (method !== undefined && method !== 'none') fail(`${where}: a public client must use method none`);
   } else {
@@ -131,7 +144,7 @@ function parseClient(raw: unknown, index: number): SeedClient {
   for (const grant of grantTypes) {
     if (!GRANT_TYPES.has(grant)) fail(`${where}: unsupported grant type ${JSON.stringify(grant)}`);
   }
-  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes };
+  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -249,6 +262,7 @@ export async function applySeed(seed: Seed, store: Store): Promise<void> {
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
+      ...(c.jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks: c.jwks } : {}),
     });
   }
   await store.transaction(async (tx) => {
