@@ -1,3 +1,6 @@
+import { X509Certificate } from 'node:crypto';
+import { DEFAULT_CERT_HEADER, type MtlsConfig } from './mtls.js';
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -18,6 +21,8 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** RFC 8705 trusted-proxy mTLS ingress; undefined = mTLS disabled (fail closed). */
+  mtls: MtlsConfig | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -116,6 +121,22 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  let mtls: MtlsConfig | undefined;
+  const proxySecret = env.OAUTH2_MTLS_PROXY_SECRET?.trim();
+  if (proxySecret) {
+    if (proxySecret.length < MIN_SECRET_LENGTH) throw new ConfigError(`OAUTH2_MTLS_PROXY_SECRET must be at least ${MIN_SECRET_LENGTH} characters`);
+    if (PLACEHOLDER.test(proxySecret)) throw new ConfigError('OAUTH2_MTLS_PROXY_SECRET looks like a placeholder');
+    const certHeader = (env.OAUTH2_MTLS_CERT_HEADER?.trim() || DEFAULT_CERT_HEADER).toLowerCase();
+    if (!/^[a-z0-9-]+$/.test(certHeader) || certHeader === 'authorization') throw new ConfigError('OAUTH2_MTLS_CERT_HEADER is not a valid header name');
+    const caPem = env.OAUTH2_MTLS_CA_PEM?.trim() || undefined;
+    if (caPem !== undefined) {
+      try { new X509Certificate(caPem); } catch { throw new ConfigError('OAUTH2_MTLS_CA_PEM is not a valid PEM certificate'); }
+    }
+    mtls = { proxySecret, certHeader, caPem };
+  } else if (env.OAUTH2_MTLS_CERT_HEADER || env.OAUTH2_MTLS_CA_PEM) {
+    throw new ConfigError('OAUTH2_MTLS_CERT_HEADER / OAUTH2_MTLS_CA_PEM require OAUTH2_MTLS_PROXY_SECRET');
+  }
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -138,5 +159,6 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    mtls,
   };
 }

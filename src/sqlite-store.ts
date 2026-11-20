@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS clients (
   registration TEXT,
   token_endpoint_auth_method TEXT,
   jwks TEXT,
-  jwks_uri TEXT
+  jwks_uri TEXT,
+  mtls TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -98,6 +99,7 @@ interface ClientRow {
   token_endpoint_auth_method: string | null;
   jwks: string | null;
   jwks_uri: string | null;
+  mtls: string | null;
 }
 
 interface DeviceRow {
@@ -235,16 +237,17 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, mtls)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
-         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri`,
+         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri, mtls=excluded.mtls`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
       c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
+      c.mtls ? JSON.stringify(c.mtls) : null,
     );
   },
 
@@ -326,6 +329,7 @@ const ops = {
       ...(r.token_endpoint_auth_method ? { tokenEndpointAuthMethod: r.token_endpoint_auth_method } : {}),
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
+      ...(r.mtls ? { mtls: JSON.parse(r.mtls) as ClientRecord['mtls'] } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
@@ -677,7 +681,7 @@ export class SqliteStore implements Store {
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
     // Databases created before private_key_jwt (RFC 7523 §2.2) lack the client key columns.
-    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri']) {
+    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri', 'mtls']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
