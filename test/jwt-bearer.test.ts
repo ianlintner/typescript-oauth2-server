@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { test } from 'node:test';
-import { SignJWT, exportJWK, exportPKCS8, generateKeyPair, type CryptoKey, type JWK } from 'jose';
+import { SignJWT, decodeJwt, exportJWK, exportPKCS8, generateKeyPair, type CryptoKey, type JWK } from 'jose';
 import { hashClientSecret } from '../src/client-auth.js';
 import type { Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
@@ -50,7 +50,9 @@ async function setup() {
   return { store, server, state, ext, sign, post, jwtb };
 }
 
-test('valid assertion exchanges for a token with sub = assertion sub', async () => {
+const subOf = (jwt: string): unknown => decodeJwt(jwt).sub;
+
+test('valid assertion exchanges for a token with a namespaced subject', async () => {
   const c = await setup();
   const res = await c.jwtb(await c.sign());
   assert.equal(res.statusCode, 200, res.body);
@@ -67,9 +69,52 @@ test('subject_mapping=email uses the email claim as subject', async () => {
     allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
     createdAt: T0, updatedAt: T0,
   });
-  const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com' }));
+  const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', email_verified: true }));
   assert.equal(res.statusCode, 200);
   assert.ok(res.json().access_token);
+  assert.equal(subOf(res.json().access_token), `${EXT}:alice@example.com`);
+});
+
+test('subject_mapping=email requires email_verified', async () => {
+  const c = await setup();
+  await c.store.saveTrustedIssuer({
+    id: 'ti-1', issuer: EXT, jwks: (await c.store.getTrustedIssuer(EXT))!.jwks,
+    allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  for (const extra of [{}, { email_verified: false }, { email_verified: 'true' }]) {
+    const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', ...extra }));
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_grant');
+  }
+  const ok = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', email_verified: true }));
+  assert.equal(ok.statusCode, 200, ok.body);
+});
+
+test('jwt-bearer subject never equals a local or client subject', async () => {
+  const c = await setup();
+  const res = await c.jwtb(await c.sign());
+  assert.equal(res.statusCode, 200, res.body);
+  const payload = decodeJwt(res.json().access_token);
+  assert.notEqual(payload.sub, 'alice');
+  assert.notEqual(payload.sub, 'conf');
+  assert.equal(payload.client_id, 'conf');
+});
+
+test('two trusted issuers with the same claim value yield different subjects', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  await c.store.saveTrustedIssuer({
+    id: 'ti-2', issuer: 'https://idp2.example', jwks: { keys: [{ ...(await exportJWK(ext2.publicKey)), kid: 'ext2' }] },
+    allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  const a1 = await c.jwtb(await c.sign());
+  const a2 = await c.jwtb(await new SignJWT({ iss: 'https://idp2.example', sub: 'alice', aud: ISSUER, jti: randomUUID(), iat: T0, exp: T0 + 60 })
+    .setProtectedHeader({ alg: 'ES256' }).sign(ext2.privateKey));
+  assert.equal(a1.statusCode, 200, a1.body);
+  assert.equal(a2.statusCode, 200, a2.body);
+  assert.notEqual(subOf(a1.json().access_token), subOf(a2.json().access_token));
 });
 
 test('allowedClientIds restricts which client may use the issuer', async () => {
