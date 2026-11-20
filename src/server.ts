@@ -30,6 +30,8 @@ export interface Deps {
    * leave unset and the admin routes are not registered.
    */
   adminToken?: string | undefined;
+  /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
+  maxDelegationDepth?: number | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
 }

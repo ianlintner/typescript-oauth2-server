@@ -18,6 +18,8 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** RFC 8693 act-chain depth limit (levels). */
+  maxDelegationDepth: number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -116,6 +118,15 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  let maxDelegationDepth = 4;
+  if (env.OAUTH2_MAX_DELEGATION_DEPTH !== undefined && env.OAUTH2_MAX_DELEGATION_DEPTH.trim() !== '') {
+    const raw = env.OAUTH2_MAX_DELEGATION_DEPTH.trim();
+    maxDelegationDepth = /^\d+$/.test(raw) ? Number(raw) : 0;
+    if (maxDelegationDepth < 1 || maxDelegationDepth > 32) {
+      throw new ConfigError('OAUTH2_MAX_DELEGATION_DEPTH must be an integer between 1 and 32');
+    }
+  }
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -138,5 +149,6 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    maxDelegationDepth,
   };
 }

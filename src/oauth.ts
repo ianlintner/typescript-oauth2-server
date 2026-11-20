@@ -7,6 +7,7 @@ import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
+import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
@@ -22,6 +23,8 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
+  maxDelegationDepth?: number | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -833,6 +836,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return reply.header('pragma', 'no-cache').send(body);
     }
 
+    // -- token-exchange (RFC 8693) --
+    if (grantType === TOKEN_EXCHANGE_GRANT_TYPE) {
+      const client = await authenticateClient(deps, req, form);
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use token-exchange');
+      if (!client.grantTypes.includes(TOKEN_EXCHANGE_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
+      const jkt = await tokenEndpointProof(req);
+      const body = await tokenExchangeGrant(deps, client, form, jkt, ACCESS_TOKEN_TTL_SECONDS);
+      return reply.header('pragma', 'no-cache').send(body);
+    }
+
     throw new OAuthError('unsupported_grant_type');
   });
 
@@ -953,7 +966,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     registration_endpoint: `${deps.issuer}/connect/register`,
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', TOKEN_EXCHANGE_GRANT_TYPE],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
