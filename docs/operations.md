@@ -6,6 +6,8 @@ For local parity tests, start disposable PostgreSQL and MongoDB replica-set inst
 
 `OAUTH2_METRICS_ENABLED=1` exposes `GET /metrics` only when `OAUTH2_HOST` is loopback. It emits Prometheus text counters and latency buckets labeled solely by fixed operation and response class; no client IDs, arbitrary paths, tokens or usernames. Put an authenticated proxy in front of metrics if exporting remotely. Applications embedding `buildServer` can supply an optional `trace(name)` callback that returns a span-ending function; names are fixed `oauth.http.<operation>` values with no dynamic attributes. Neither an exporter nor a tracing backend is bundled. Counters reset on process restart.
 
+`OAUTH2_ADMIN_TOKEN` enables the trusted-issuer admin routes and is a single shared secret. It is checked for length (32+ characters) and placeholder or well-known values in every environment, not only production. Outside production, a non-loopback `OAUTH2_HOST` together with an admin token is refused at startup; set `OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK=1` only when the process sits behind a trusted proxy. Operators using a shorter development token must rotate it.
+
 ## Refresh-token digest cutover (storage format `rt1`)
 
 **Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier, `family` and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client, and every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.
