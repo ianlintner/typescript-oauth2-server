@@ -18,6 +18,15 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** Invalid-client rate limit (RFC 9700 §4.2): failures allowed per client per fixed window. */
+  clientAuthLimit: { maxFailures: number; windowSeconds: number };
+}
+
+function parseBoundedInt(env: Env, name: string, fallback: number, max: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  if (!/^\d+$/.test(raw.trim()) || Number(raw) < 1 || Number(raw) > max) throw new ConfigError(`${name} must be an integer between 1 and ${max}`);
+  return Number(raw);
 }
 
 type Env = Record<string, string | undefined>;
@@ -138,5 +147,9 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    clientAuthLimit: {
+      maxFailures: parseBoundedInt(env, 'OAUTH2_CLIENT_AUTH_MAX_FAILURES', 10, 100_000),
+      windowSeconds: parseBoundedInt(env, 'OAUTH2_CLIENT_AUTH_WINDOW_SECONDS', 300, 86_400),
+    },
   };
 }

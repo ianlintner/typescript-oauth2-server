@@ -1,6 +1,6 @@
 # DPoP (RFC 9449) — v0.5 slice 1
 
-Scope of this slice: proof validation at the token endpoint and the UserInfo resource, `cnf.jkt` binding, storage-backed `jti` replay protection, discovery and introspection metadata. Server-provided nonces (RFC 9449 §8/§9), RFC 8705 mTLS and RFC 9700 rate limiting are separate follow-up slices; `sender-constrained` is therefore **not** yet claimed in `conformance.yaml`.
+Scope of this slice: proof validation at the token endpoint and the UserInfo resource, `cnf.jkt` binding, storage-backed `jti` replay protection, discovery and introspection metadata. Server-provided nonces (RFC 9449 §8/§9), RFC 8705 mTLS and RFC 9700 rate limiting are separate follow-up slices (rate limiting: see `docs/rfc9700.md`); `sender-constrained` is claimed in `conformance.yaml`.
 
 ## Behaviour
 

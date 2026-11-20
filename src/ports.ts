@@ -217,6 +217,19 @@ export interface Store {
    */
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean>;
 
+  /**
+   * Fixed-window failure counter (RFC 9700 §4.2 brute-force defence). Returns
+   * the failures recorded under `key` whose window has not elapsed, 0 if none.
+   * Read-only; must reflect writes from other processes sharing the store.
+   */
+  rateLimitCount(key: string, now: number): Promise<number>;
+  /**
+   * Atomically add one failure under `key` and return the new count. A missing
+   * or elapsed window starts a fresh one ending at `now + windowSeconds`; a live
+   * window keeps its original end (so a steady attacker cannot extend it).
+   */
+  rateLimitHit(key: string, windowSeconds: number, now: number): Promise<number>;
+
   /** Run `fn` atomically; commits on resolve, rolls back and rethrows on reject. Not reentrant. */
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T>;
 }

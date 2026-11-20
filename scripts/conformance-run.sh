@@ -41,6 +41,9 @@ key_pem="$(cat "$work/key.p8")"
 free_port="$(node scripts/free-port.mjs)"
 
 : > "$work/port"
+# The shared SUT serves every scenario. The contract's draft abuse scenario fires 100 failed
+# auths at a seeded client (and is deferred, not coverage); a production-sized limit would lock
+# that client out for the stable scenarios that follow, so the run raises the threshold.
 OAUTH2_ENV=test \
 OAUTH2_ISSUER=http://localhost:8080 \
 OAUTH2_SESSION_SECRET=0123456789abcdef0123456789abcdef \
@@ -49,6 +52,7 @@ OAUTH2_SIGNING_KEY_ID=k1 \
 OAUTH2_HOST=127.0.0.1 \
 OAUTH2_PORT="$free_port" \
 OAUTH2_DATABASE_PATH=:memory: \
+OAUTH2_CLIENT_AUTH_MAX_FAILURES=1000 \
 OAUTH2_CONFORMANCE_MODE=1 \
 OAUTH2_CONFORMANCE_SEED="$seed" \
 pnpm start >"$work/server.log" 2>&1 &
