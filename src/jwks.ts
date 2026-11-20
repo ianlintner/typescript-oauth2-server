@@ -14,23 +14,37 @@ const JWKS_MAX_BYTES = 128 * 1024; // 128 KiB cap so a hostile endpoint cannot O
 /** How long a fetched JWKS document is reused before the endpoint is re-hit. */
 const JWKS_CACHE_TTL_MS = 300_000; // 5 minutes
 
+/**
+ * Minimum age of a cached document before a forced refresh (`forceFresh`) is
+ * honoured. Repeated forced refreshes for a document fetched moments ago are
+ * served from cache instead, so an unauthenticated client cannot turn the
+ * token endpoint into a refresh-hammering amplifier against a slow JWKS host.
+ */
+const JWKS_FORCE_FRESH_COOLDOWN_MS = 5_000; // 5 seconds
+
 interface CachedJwks {
   jwks: Jwks;
   expiresAt: number;
+  /** Wall-clock instant the document was last successfully fetched. */
+  fetchedAt: number;
   /** A fetch currently in flight for this URI; concurrent requests share it. */
   inFlight: Promise<Jwks> | null;
 }
 
 const jwksCache = new Map<string, CachedJwks>();
 
-/** Minimum spacing between forced (rotation-driven) refreshes of the same URI. */
-const JWKS_FORCED_REFRESH_WINDOW_MS = 10_000;
-const lastForcedRefresh = new Map<string, number>();
+/** Injectable clock so tests can advance time without sleeping (see `__setJwksClock`). */
+let jwksNow: () => number = () => Date.now();
 
-/** Drop all cached documents (test seam). */
+/** Drop all cached documents and reset the injected clock (test seam). */
 export function clearJwksCache(): void {
   jwksCache.clear();
-  lastForcedRefresh.clear();
+  jwksNow = () => Date.now();
+}
+
+/** Override the cache clock (test seam); reset via `clearJwksCache`. @internal */
+export function __setJwksClock(fn: () => number): void {
+  jwksNow = fn;
 }
 
 /**
@@ -130,35 +144,39 @@ async function fetchJwksDocument(url: string): Promise<Jwks> {
  * once the TTL elapses or a rotation requires fresh keys.
  */
 export async function fetchJwks(url: string, forceFresh = false): Promise<Jwks> {
-  const now = Date.now();
+  const nowMs = jwksNow();
   const cached = jwksCache.get(url);
   if (!forceFresh) {
-    if (cached && cached.expiresAt > now) return cached.jwks;
+    if (cached && cached.expiresAt > nowMs) return cached.jwks;
     if (cached?.inFlight) return cached.inFlight;
-  } else if (cached?.inFlight) {
-    return cached.inFlight; // coalesce onto an in-flight refresh
   } else {
-    // Bound forced refreshes: within the window, reuse the cached document
-    // (or fail) instead of making another outbound request.
-    const last = lastForcedRefresh.get(url);
-    if (last !== undefined && now - last < JWKS_FORCED_REFRESH_WINDOW_MS) {
-      if (cached) return cached.jwks;
-      throw new Error('JWKS refresh rate-limited');
-    }
-    lastForcedRefresh.set(url, now);
+    // Cooldown: never refetch a document fetched within the cooldown window,
+    // even when a forced refresh is requested. This both throttles refresh
+    // storms and lets a rotation take effect once the window has passed.
+    if (cached && cached.fetchedAt !== 0 && nowMs - cached.fetchedAt < JWKS_FORCE_FRESH_COOLDOWN_MS) return cached.jwks;
+    if (cached?.inFlight) return cached.inFlight; // coalesce onto an in-flight refresh
   }
 
   const inFlight = fetchJwksDocument(url).then((jwks) => {
-    jwksCache.set(url, { jwks, expiresAt: Date.now() + JWKS_CACHE_TTL_MS, inFlight: null });
+    const fetchedAt = jwksNow();
+    jwksCache.set(url, { jwks, expiresAt: fetchedAt + JWKS_CACHE_TTL_MS, fetchedAt, inFlight: null });
     return jwks;
   });
-  jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, inFlight });
+  jwksCache.set(url, { jwks: cached?.jwks ?? { keys: [] }, expiresAt: cached?.expiresAt ?? 0, fetchedAt: cached?.fetchedAt ?? 0, inFlight });
   try {
     return await inFlight;
   } catch (err) {
-    // A failed refresh must not wedge the guard entry for concurrent callers;
-    // drop it so the next request starts a clean fetch.
-    if (jwksCache.get(url)?.inFlight === inFlight) jwksCache.delete(url);
+    // A failed refresh must not wedge the guard entry for concurrent callers:
+    // clear only the in-flight promise, preserving the previously cached (now
+    // stale) document so a transient outage past TTL still verifies on
+    // non-forced lookups. On forced refreshes (or when no stale keys exist) we
+    // rethrow so callers fail closed instead of looping on stale keys.
+    const entry = jwksCache.get(url);
+    if (entry && entry.inFlight === inFlight) {
+      jwksCache.set(url, { jwks: entry.jwks, expiresAt: entry.expiresAt, fetchedAt: entry.fetchedAt, inFlight: null });
+    }
+    const stale = entry?.jwks ?? cached?.jwks;
+    if (!forceFresh && stale && (stale.keys?.length ?? 0) > 0) return stale;
     throw err;
   }
 }

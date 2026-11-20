@@ -63,7 +63,7 @@ test('a forced refresh is limited to one outbound fetch per URI per window', asy
     for (let i = 0; i < 5; i++) await fetchJwks('https://idp.example/jwks.json', true);
   });
   assert.equal(r.error, undefined);
-  assert.equal(r.calls, 2); // initial fetch + the first forced refresh
+  assert.equal(r.calls, 1); // initial fetch only: forced refreshes within the cooldown are served from cache
 });
 
 test('isPublicAddress classifies ranges', () => {
