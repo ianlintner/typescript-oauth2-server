@@ -1024,7 +1024,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const jti = payload.jti as string | undefined;
     const stored = jti ? await deps.store.getAccessToken(jti, deps.clock.now()) : null;
     // A client_credentials token represents an application, not an end-user (sub === client_id).
-    if (!stored || payload.sub === payload.client_id) {
+    if (!stored || payload.sub === payload.client_id || !(await clientEnabled(deps, stored.clientId))) {
       return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
     }
     const claims = claimsForScope(stored.scope, deps.userClaims?.(stored.subject) ?? null);
@@ -1036,24 +1036,35 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const params = new URL(req.url, 'http://localhost').searchParams;
     rejectDuplicates(params);
     const hint = single(params, 'id_token_hint');
-    if (hint !== undefined) {
-      // The hint must be our own ID token (signature, issuer) addressed to a registered client.
-      // Expiry is ignored: RPs commonly present an expired hint.
-      let aud: unknown;
-      try {
-        const payload = await verifyOwnJwt(deps, hint, true);
-        aud = payload.aud;
-      } catch {
-        throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    // A bare GET must never end a session: the request has to carry a hint identifying the session's RP.
+    if (hint === undefined) throw new OAuthError('invalid_request', 'id_token_hint is required');
+    // The hint must be an ID token this server issued (signature, issuer) addressed to enabled clients.
+    // Expiry is ignored: RPs commonly present an expired hint.
+    let payload: Record<string, unknown>;
+    try {
+      payload = await verifyOwnJwt(deps, hint, true);
+    } catch {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    // Access tokens always carry a client_id claim; ID tokens do not.
+    if (payload.client_id !== undefined || typeof payload.sub !== 'string') {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    for (const a of audiences) {
+      if (typeof a !== 'string' || !(await clientEnabled(deps, a))) {
+        throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
       }
-      const audiences = Array.isArray(aud) ? aud : [aud];
-      let registered = false;
-      for (const a of audiences) if (typeof a === 'string' && (await deps.store.getClient(a))) registered = true;
-      if (!registered) throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
     }
     deps.endSession?.(req, reply);
     return reply.status(200).header('content-type', 'text/plain; charset=utf-8').send('logged out');
   });
+}
+
+/** True while the client exists and is enabled. Read per request; never cached. */
+async function clientEnabled(deps: OAuthDeps, clientId: string): Promise<boolean> {
+  const client = await deps.store.getClient(clientId);
+  return client != null && client.enabled === true;
 }
 
 /**
