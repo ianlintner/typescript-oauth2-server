@@ -41,6 +41,7 @@ async function setup(opts: { user?: string | null; refreshTokenTtl?: number } = 
   await store.saveClient({ ...base, clientId: 'pub', clientSecretHash: null });
   await store.saveClient({ ...base, clientId: 'conf', clientSecretHash: await hashClientSecret(SECRET), resources: ['https://api.example'] });
   // Internal RS (resource server) for introspection
+  await store.saveClient({ ...base, clientId: 'norc', clientSecretHash: await hashClientSecret('norc-secret') });
   await store.saveClient({ ...base, clientId: 'rs-1', clientSecretHash: await hashClientSecret('rs-secret'), grantTypes: [] });
   let now = 1_000_000;
   const clock: Clock = { now: () => now };
@@ -679,8 +680,9 @@ test('resource parameter sets the access-token audience', async () => {
 
 test('resource is refused for a client with no registered resources, and before the code is consumed', async () => {
   const s = await setup();
-  const res = await token(s.server, { grant_type: 'client_credentials', client_id: 'rs-1', client_secret: 'rs-secret', resource: 'https://api.example' });
-  assert.notEqual(res.statusCode, 200);
+  const res = await token(s.server, { grant_type: 'client_credentials', client_id: 'norc', client_secret: 'norc-secret', scope: 'read', resource: 'https://api.example' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_target');
 
   const authz = await s.server.inject({
     method: 'GET',
@@ -726,6 +728,35 @@ test('refresh of a token issued without a resource keeps aud = client id and rej
   assert.equal(widened.json().error, 'invalid_target');
   const plain = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token });
   assert.equal(decodeJwt(plain.json().access_token).aud, 'conf');
+  await done(s);
+});
+
+test('refresh revalidates the resource against the client allow-list', async () => {
+  for (const repeat of [false, true]) {
+    const s = await setup();
+    const first = (await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, { client_secret: SECRET, resource: 'https://api.example' })).json();
+    const c = (await s.store.getClient('conf'))!;
+    await s.store.saveClient({ ...c, resources: [] });
+    const res = await token(s.server, {
+      grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token,
+      ...(repeat ? { resource: 'https://api.example' } : {}),
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_target');
+    await done(s);
+  }
+});
+
+test('userinfo rejects an access token addressed to another API', async () => {
+  const s = await setup();
+  const body = (await exchangeCode(s.server, { client_id: 'conf', scope: 'openid' }, { client_secret: SECRET, resource: 'https://api.example' })).json();
+  assert.equal(decodeJwt(body.access_token).aud, 'https://api.example');
+  const ui = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${body.access_token}` } });
+  assert.equal(ui.statusCode, 401);
+  assert.equal(ui.json().error, 'invalid_token');
+  const plain = (await exchangeCode(s.server, { client_id: 'conf', scope: 'openid' }, { client_secret: SECRET })).json();
+  const ok = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${plain.access_token}` } });
+  assert.equal(ok.statusCode, 200);
   await done(s);
 });
 

@@ -751,6 +751,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (requestedRes !== undefined && requestedRes !== resource) {
         throw new OAuthError('invalid_target', 'resource does not match the original grant');
       }
+      // The client's current allow-list still applies: a resource removed from it stops being issuable.
+      if (resource !== undefined && !client.resources?.includes(resource)) {
+        throw new OAuthError('invalid_target', 'resource is not permitted for this client');
+      }
 
       const consumed = await deps.store.consumeRefreshToken(presentedId, deps.clock.now());
       if (!consumed) throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
@@ -1004,6 +1008,13 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       }
     }
 
+    // The token must be addressed to the client it was issued to (no `resource`): a token whose audience
+    // is another API is not usable here.
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (typeof payload.client_id !== 'string' || audiences.length !== 1 || audiences[0] !== payload.client_id) {
+      return reply.status(401).header('www-authenticate', `${scheme} error="invalid_token"`).send({ error: 'invalid_token' });
+    }
+
     // Verify token is still alive in store (not revoked)
     const jti = payload.jti as string | undefined;
     const stored = jti ? await deps.store.getAccessToken(jti, deps.clock.now()) : null;
@@ -1026,6 +1037,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       let aud: unknown;
       try {
         const payload = await verifyOwnJwt(deps, hint, true);
+        // Access tokens issued before typed access tokens carry typ JWT; their claim shape (client_id,
+        // scope, cnf) never appears in an ID token, so it identifies them.
+        if ('client_id' in payload || 'scope' in payload || 'cnf' in payload) throw new Error('access token');
         aud = payload.aud;
       } catch {
         throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
