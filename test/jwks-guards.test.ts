@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { candidateKeys, clearJwksCache, fetchJwks, setJwksNetGuard, validateJwksUri } from '../src/jwks.js';
 import { isPublicAddress } from '../src/net-guard.js';
 import type { Jwks } from '../src/ports.js';
 
 // Default for this file: names resolve to a public address (no real DNS).
 setJwksNetGuard({ resolver: async () => [{ address: '203.0.113.10', family: 4 }] });
+
+// Failed attempts are rate-limited per URI, so tests sharing a URL start from a clean cache.
+beforeEach(() => clearJwksCache());
 
 /** Run `fn` with a fetch spy; returns the number of fetch calls. */
 async function withFetchSpy(body: string, fn: () => Promise<unknown>): Promise<{ calls: number; error?: unknown }> {
@@ -63,7 +66,7 @@ test('a forced refresh is limited to one outbound fetch per URI per window', asy
     for (let i = 0; i < 5; i++) await fetchJwks('https://idp.example/jwks.json', true);
   });
   assert.equal(r.error, undefined);
-  assert.equal(r.calls, 2); // initial fetch + the first forced refresh
+  assert.equal(r.calls, 1); // initial fetch only: forced refreshes within the cooldown are served from cache
 });
 
 test('isPublicAddress classifies ranges', () => {
