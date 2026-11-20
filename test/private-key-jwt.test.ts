@@ -148,7 +148,7 @@ test('dynamic registration: private_key_jwt requires inline public jwks and issu
   const sigKey = await generateKeyPair('ES256', { extractable: true });
   const store = new SqliteStore(':memory:'); await store.init();
   const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 },
-    random: cryptoRandom, issuer: ISSUER, dynamicRegistration: true });
+    random: cryptoRandom, issuer: ISSUER, dynamicRegistration: true, registrationPolicy: { allowedGrantTypes: ['authorization_code', 'refresh_token', 'client_credentials'] } });
   const reg = (body: unknown) => server.inject({ method: 'POST', url: '/connect/register', headers: { 'content-type': 'application/json' }, payload: JSON.stringify(body) });
   const k = await exportJWK((await generateKeyPair('ES256', { extractable: true })).publicKey);
   const ok = await reg({ redirect_uris: ['https://a.example/cb'], token_endpoint_auth_method: 'private_key_jwt', grant_types: ['client_credentials'], jwks: { keys: [k] } });
@@ -165,7 +165,7 @@ async function regSetup() {
   const sigKey = await generateKeyPair('ES256', { extractable: true });
   const store = new SqliteStore(':memory:'); await store.init();
   const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 },
-    random: cryptoRandom, issuer: ISSUER, dynamicRegistration: true });
+    random: cryptoRandom, issuer: ISSUER, dynamicRegistration: true, registrationPolicy: { allowedGrantTypes: ['authorization_code', 'refresh_token', 'client_credentials'] } });
   const reg = (body: unknown) => server.inject({ method: 'POST', url: '/connect/register', headers: { 'content-type': 'application/json' }, payload: JSON.stringify(body) });
   const put = (id: string, token: string, body: unknown) => server.inject({ method: 'PUT', url: `/connect/register/${id}`,
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, payload: JSON.stringify(body) });

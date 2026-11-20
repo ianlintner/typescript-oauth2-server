@@ -2,14 +2,18 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { test } from 'node:test';
-import { SignJWT, exportJWK, exportPKCS8, generateKeyPair, type CryptoKey, type JWK } from 'jose';
+import { SignJWT, decodeJwt, exportJWK, exportPKCS8, generateKeyPair, type CryptoKey, type JWK } from 'jose';
 import { hashClientSecret } from '../src/client-auth.js';
 import type { Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
-import { clearJwksCache } from '../src/jwks.js';
+import { clearJwksCache, setJwksNetGuard } from '../src/jwks.js';
+
+// These tests serve JWKS documents from a loopback listener, so the fetch-time
+// address check is relaxed for this file only (test seam; not reachable from config).
+setJwksNetGuard({ allowPrivate: true });
 
 const ISSUER = 'http://localhost:8080';
 const GT = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
@@ -46,7 +50,9 @@ async function setup() {
   return { store, server, state, ext, sign, post, jwtb };
 }
 
-test('valid assertion exchanges for a token with sub = assertion sub', async () => {
+const subOf = (jwt: string): unknown => decodeJwt(jwt).sub;
+
+test('valid assertion exchanges for a token with a namespaced subject', async () => {
   const c = await setup();
   const res = await c.jwtb(await c.sign());
   assert.equal(res.statusCode, 200, res.body);
@@ -63,9 +69,52 @@ test('subject_mapping=email uses the email claim as subject', async () => {
     allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
     createdAt: T0, updatedAt: T0,
   });
-  const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com' }));
+  const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', email_verified: true }));
   assert.equal(res.statusCode, 200);
   assert.ok(res.json().access_token);
+  assert.equal(subOf(res.json().access_token), `${EXT}:alice@example.com`);
+});
+
+test('subject_mapping=email requires email_verified', async () => {
+  const c = await setup();
+  await c.store.saveTrustedIssuer({
+    id: 'ti-1', issuer: EXT, jwks: (await c.store.getTrustedIssuer(EXT))!.jwks,
+    allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  for (const extra of [{}, { email_verified: false }, { email_verified: 'true' }]) {
+    const res = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', ...extra }));
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_grant');
+  }
+  const ok = await c.jwtb(await c.sign({ sub: 'x', email: 'alice@example.com', email_verified: true }));
+  assert.equal(ok.statusCode, 200, ok.body);
+});
+
+test('jwt-bearer subject never equals a local or client subject', async () => {
+  const c = await setup();
+  const res = await c.jwtb(await c.sign());
+  assert.equal(res.statusCode, 200, res.body);
+  const payload = decodeJwt(res.json().access_token);
+  assert.notEqual(payload.sub, 'alice');
+  assert.notEqual(payload.sub, 'conf');
+  assert.equal(payload.client_id, 'conf');
+});
+
+test('two trusted issuers with the same claim value yield different subjects', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  await c.store.saveTrustedIssuer({
+    id: 'ti-2', issuer: 'https://idp2.example', jwks: { keys: [{ ...(await exportJWK(ext2.publicKey)), kid: 'ext2' }] },
+    allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  const a1 = await c.jwtb(await c.sign());
+  const a2 = await c.jwtb(await new SignJWT({ iss: 'https://idp2.example', sub: 'alice', aud: ISSUER, jti: randomUUID(), iat: T0, exp: T0 + 60 })
+    .setProtectedHeader({ alg: 'ES256' }).sign(ext2.privateKey));
+  assert.equal(a1.statusCode, 200, a1.body);
+  assert.equal(a2.statusCode, 200, a2.body);
+  assert.notEqual(subOf(a1.json().access_token), subOf(a2.json().access_token));
 });
 
 test('allowedClientIds restricts which client may use the issuer', async () => {
@@ -212,6 +261,53 @@ test('admin: jwks_uri must be https-only with a host and no fragment', async () 
     assert.equal(res.json().error, 'invalid_request', uri);
   }
   assert.equal((await mk('https://ok.example', 'https://idp.example/jwks.json')).statusCode, 201);
+});
+
+test('jwks_uri with a private address is rejected at registration', async () => {
+  const sigKey = await generateKeyPair('ES256', { extractable: true });
+  const store = new SqliteStore(':memory:'); await store.init();
+  const server = buildServer({ store, signer: await createJoseSigner(await exportPKCS8(sigKey.privateKey), 'k1'), clock: { now: () => T0 }, random: cryptoRandom, issuer: ISSUER, adminToken: ADMIN_TOKEN });
+  const res = await server.inject({ method: 'POST', url: '/admin/trusted-issuers', headers: { 'content-type': 'application/json', authorization: `Bearer ${ADMIN_TOKEN}` }, payload: JSON.stringify({ issuer: 'https://x.example', jwks_uri: 'https://169.254.169.254/latest/meta-data/' }) });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+});
+
+test('forced JWKS refresh is rate-bounded per URI', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'present' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  try {
+    clearJwksCache();
+    await c.store.saveTrustedIssuer({
+      id: 'ti-rate', issuer: 'https://rate.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    for (let i = 0; i < 5; i++) {
+      const body = { iss: 'https://rate.example', sub: 'bob', aud: ISSUER, jti: randomUUID(), iat: T0, exp: T0 + 60 };
+      const assertion = await new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'absent' }).sign(ext2.privateKey);
+      const res = await c.jwtb(assertion);
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.json().error, 'invalid_grant');
+    }
+    // One initial fetch plus at most one forced refresh within the 10 s window.
+    assert.ok(fetches <= 2, `fetches=${fetches}`);
+  } finally {
+    server.close();
+    clearJwksCache();
+  }
 });
 
 test('admin: one of jwks or jwksUri is required; invalid subject_mapping is rejected', async () => {

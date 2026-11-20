@@ -1,0 +1,14 @@
+# gitleaks false positives — no real credentials in this repository.
+# Each entry is a `generic-api-key` match on an explicitly-fake, hardcoded
+# conformance-mode test secret (the literal string
+# `0123456789abcdef0123456789abcdef`, a discardable all-hex placeholder that is
+# only valid when OAUTH2_ENV=conformance). Format is `file:rule-id:line`
+# (global) or `commit:file:rule-id:line` (per historical commit).
+# Added 2026-11-15 as part of Phase 1 security-tooling parity.
+
+# scripts/conformance-run.sh — hardcoded test-only session secret for the
+# conformance SUT (fake; mirrors python-oauth2-server's 0123... fixture).
+scripts/conformance-run.sh:generic-api-key:46
+
+# Same fake secret, historical commit (line moved from 45 to 46 upstream).
+7015193485a2e060ff37053d1ac8d3c3390aa6d1:scripts/conformance-run.sh:generic-api-key:45

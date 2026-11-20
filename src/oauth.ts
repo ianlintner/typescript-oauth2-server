@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
@@ -6,7 +7,7 @@ import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
-import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
+import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
 export const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -87,6 +88,26 @@ function redirectTo(reply: FastifyReply, redirectUri: string, params: Record<str
   const url = new URL(redirectUri);
   for (const [key, value] of Object.entries(params)) if (value !== undefined) url.searchParams.set(key, value);
   return reply.status(302).header('location', url.toString()).send();
+}
+
+/**
+ * Subject minted for a verified external assertion. Derived only from the
+ * trusted-issuer record and the verified claim, and namespaced as
+ * `<issuer>:<claim value>` so it cannot coincide with locally authenticated
+ * subjects, client ids, or subjects from another trusted issuer. The `email`
+ * mapping additionally requires `email_verified === true`. Returns undefined
+ * when no usable subject can be derived.
+ */
+export function assertionSubject(trusted: Pick<TrustedIssuerRecord, 'issuer' | 'subjectMapping'>, verifiedPayload: Record<string, unknown>): string | undefined {
+  let value: unknown;
+  if (trusted.subjectMapping === 'email') {
+    if (verifiedPayload.email_verified !== true) return undefined;
+    value = verifiedPayload.email;
+  } else {
+    value = verifiedPayload.sub;
+  }
+  if (typeof value !== 'string' || value === '') return undefined;
+  return `${trusted.issuer}:${value}`;
 }
 
 export function safeEqual(a: string, b: string): boolean {
@@ -278,12 +299,13 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   }
 
   if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-    const rtJti = deps.random.token(24);
+    const rtValue = deps.random.token(24);
+    const rtId = refreshTokenId(rtValue);
     await deps.store.saveRefreshToken({
-      jti: rtJti, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
+      jti: rtId, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
       family: grant, parentJti: null, revokedByReplayAt: null, revokedAt: null,
     });
-    body.refresh_token = rtJti;
+    body.refresh_token = rtValue;
   }
 
   return body;
@@ -316,8 +338,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
    *
    * The reference resolves the assertion subject to a *local* user id (with JIT
    * provisioning against a user table). This port has no user store: the token
-   * subject is the assertion's mapped claim value (`sub` or `email`), treated as
-   * the opaque local subject the rest of this server already uses throughout.
+   * subject is derived from the assertion's mapped claim value (`sub` or `email`)
+   * namespaced by the trusted issuer (see `assertionSubject`).
    */
   const jwtBearerGrant = async (client: ClientRecord, form: URLSearchParams, req: FastifyRequest): Promise<Record<string, unknown>> => {
     const invalid = new OAuthError('invalid_grant', 'assertion is invalid');
@@ -409,10 +431,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // invalid_grant despite no token having been issued.
     const jkt = await tokenEndpointProof(req);
 
-    // Subject mapping: sub (default) or email.
-    const subject = trusted.subjectMapping === 'email'
-      ? (typeof verifiedPayload.email === 'string' && verifiedPayload.email !== '' ? verifiedPayload.email : undefined)
-      : verifiedPayload.sub as string;
+    // Subject mapping: sub (default) or email, namespaced by the trusted issuer.
+    const subject = assertionSubject(trusted, verifiedPayload);
     if (subject === undefined) throw invalid;
 
     // Validate the requested scope (and the mapped subject above) *before*
@@ -653,14 +673,15 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       // Refresh token
       if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-        const rtJti = deps.random.token(24);
+        const rtValue = deps.random.token(24);
+        const rtId = refreshTokenId(rtValue);
         await deps.store.saveRefreshToken({
-          jti: rtJti, clientId: client.clientId, subject: record.subject,
+          jti: rtId, clientId: client.clientId, subject: record.subject,
           scope: scopes, expiresAt: iat + refreshTtl,
           family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
           parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
         });
-        body.refresh_token = rtJti;
+        body.refresh_token = rtValue;
       }
 
       return reply.header('pragma', 'no-cache').send(body);
@@ -716,7 +737,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (!rtValue) throw new OAuthError('invalid_request', 'refresh_token is required');
 
       // Check client binding BEFORE consuming (don't burn someone else's token).
-      const lookedUp = await deps.store.getRefreshToken(rtValue, deps.clock.now());
+      const presentedId = refreshTokenId(rtValue);
+      const lookedUp = await deps.store.getRefreshToken(presentedId, deps.clock.now());
       if (!lookedUp || lookedUp.clientId !== client.clientId) {
         throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
       }
@@ -727,7 +749,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const jkt = proofJkt;
 
       const consumed = await deps.store.transaction(async (tx) => {
-        const c = await tx.consumeRefreshToken(rtValue, deps.clock.now());
+        const c = await tx.consumeRefreshToken(presentedId, deps.clock.now());
         // The token passed the lookup but could not be consumed: another request already used it.
         if (!c) await tx.revokeGrant(lookedUp.family, deps.clock.now(), client.clientId);
         return c;
@@ -773,9 +795,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         grant: consumed.family,
       });
 
-      const rtJti = deps.random.token(24);
+      const newRtValue = deps.random.token(24);
+      const newRtId = refreshTokenId(newRtValue);
       await deps.store.saveRefreshToken({
-        jti: rtJti, clientId: client.clientId, subject: consumed.subject,
+        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
         scope: allowedScope, expiresAt: iat + refreshTtl,
         family: consumed.family,
         parentJti: consumed.jti,
@@ -786,7 +809,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         access_token: accessToken,
         token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        refresh_token: rtJti,
+        refresh_token: newRtValue,
         ...(allowedScope ? { scope: allowedScope } : {}),
       };
 
@@ -858,10 +881,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return true;
     };
     const revokeRefresh = async (): Promise<boolean> => {
-      const rt = await deps.store.getRefreshToken(token, now);
+      const id = refreshTokenId(token);
+      const rt = await deps.store.getRefreshToken(id, now);
       if (!rt || rt.clientId !== client.clientId) return false;
       await deps.store.transaction(async (tx) => {
-        await tx.revokeRefreshToken(token, now);
+        await tx.revokeRefreshToken(id, now);
         await tx.revokeGrant(rt.family, now, client.clientId);
       });
       return true;

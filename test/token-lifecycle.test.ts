@@ -7,6 +7,7 @@ import { hashClientSecret } from '../src/client-auth.js';
 import type { ClientRecord, Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
+import { refreshTokenId } from '../src/token-digest.js';
 import { SqliteStore } from '../src/sqlite-store.js';
 import { buildServer } from '../src/server.js';
 
@@ -273,7 +274,7 @@ test('linear rotation never flags a replay', async () => {
   const rts = await chain(s, 3); // rt1..rt4, every rotation accepted
   assert.equal(rts.length, 4);
   // Nothing was revoked by rotating: the newest token is still redeemable via lookup.
-  assert.ok(await s.store.getRefreshToken(rts[3]!, 1_000_000));
+  assert.ok(await s.store.getRefreshToken(refreshTokenId(rts[3]!), 1_000_000));
   assert.equal((await rotate(s, rts[0]!)).statusCode, 400);
   const afterFirst = await rotate(s, rts[3]!);
   assert.equal(afterFirst.statusCode, 400);
