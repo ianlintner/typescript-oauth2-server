@@ -83,7 +83,7 @@ test('production rejects http issuer, in-memory database and placeholder secrets
 test('admin token is optional, trimmed, and placeholder-gated in production', () => {
   assert.equal(loadConfig(dev).adminToken, undefined);
   assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: '  ' }).adminToken, undefined);
-  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: ' good-admin-token ' }).adminToken, 'good-admin-token');
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: ` ${'g'.repeat(32)} ` }).adminToken, 'g'.repeat(32));
   rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'change-me'.padEnd(40, '!') }, /OAUTH2_ADMIN_TOKEN/);
 });
 
@@ -92,9 +92,33 @@ test('production admin token must be at least MIN_SECRET_LENGTH characters', () 
   // sole authorization check for the trusted-issuer registry.
   rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'a' }, /OAUTH2_ADMIN_TOKEN/);
   rejects({ ...prod, OAUTH2_ADMIN_TOKEN: 'short-admin-token' }, /OAUTH2_ADMIN_TOKEN/);
-  // A strong token in development is unaffected, and a long token loads in production.
-  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: 'short' }).adminToken, 'short');
   assert.equal(loadConfig({ ...prod, OAUTH2_ADMIN_TOKEN: 's'.repeat(32) }).adminToken, 's'.repeat(32));
+});
+
+test('development rejects a short admin token', () => {
+  rejects({ ...dev, OAUTH2_ADMIN_TOKEN: 'short' }, /OAUTH2_ADMIN_TOKEN/);
+  rejects({ ...dev, OAUTH2_ENV: 'test', OAUTH2_ADMIN_TOKEN: 'admin' }, /OAUTH2_ADMIN_TOKEN/);
+});
+
+test('development rejects a placeholder admin token', () => {
+  rejects({ ...dev, OAUTH2_ADMIN_TOKEN: 'change-me'.padEnd(40, '!') }, /OAUTH2_ADMIN_TOKEN/);
+  rejects({ ...dev, OAUTH2_ADMIN_TOKEN: 'admin'.padEnd(32, 'x') }, /OAUTH2_ADMIN_TOKEN/);
+  rejects({ ...dev, OAUTH2_ADMIN_TOKEN: 'Test'.padEnd(32, 'x') }, /OAUTH2_ADMIN_TOKEN/);
+});
+
+test('development accepts a strong admin token', () => {
+  assert.equal(loadConfig({ ...dev, OAUTH2_ADMIN_TOKEN: 's'.repeat(32) }).adminToken, 's'.repeat(32));
+});
+
+test('admin token with a non-loopback host is refused unless explicitly allowed', () => {
+  const env = { ...dev, OAUTH2_HOST: '0.0.0.0', OAUTH2_ADMIN_TOKEN: 's'.repeat(32) };
+  rejects(env, /non-loopback|OAUTH2_HOST/);
+  assert.equal(loadConfig({ ...env, OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK: '1' }).host, '0.0.0.0');
+  assert.equal(loadConfig({ ...env, OAUTH2_HOST: 'localhost' }).host, 'localhost');
+});
+
+test('no admin token, non-loopback host is still allowed', () => {
+  assert.equal(loadConfig({ ...dev, OAUTH2_HOST: '0.0.0.0' }).host, '0.0.0.0');
 });
 
 test('development allows http only for loopback issuers', () => {

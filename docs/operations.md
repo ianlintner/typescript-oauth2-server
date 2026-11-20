@@ -12,6 +12,8 @@ Failed client authentication on the token, revocation and introspection endpoint
 
 Expired authorization codes, tokens, device codes, pushed requests, DPoP proofs and counter windows are removed by a sweep at start-up and every `OAUTH2_SWEEP_INTERVAL_SECONDS` (default 300; `0` disables). `Store.sweepExpired(now)` is idempotent and can be called from a scheduler instead. Lookups by client, user code and refresh-token family use indexes on all three backends.
 
+`OAUTH2_ADMIN_TOKEN` enables the trusted-issuer admin routes and is a single shared secret. It is checked for length (32+ characters) and placeholder or well-known values in every environment, not only production. Outside production, a non-loopback `OAUTH2_HOST` together with an admin token is refused at startup; set `OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK=1` only when the process sits behind a trusted proxy. Operators using a shorter development token must rotate it.
+
 ## Refresh-token digest cutover (storage format `rt1`)
 
 **Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier, `family` and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client, and every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.

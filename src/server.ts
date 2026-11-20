@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
-import { registerExtensionRoutes } from './device-grant.js';
+import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant.js';
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
@@ -21,6 +21,8 @@ export interface Deps {
   refreshTokenTtl?: number | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
   dynamicRegistration?: boolean | undefined;
+  /** Allow-lists (grant types, scopes, redirect schemes) and optional initial access token for registration. */
+  registrationPolicy?: RegistrationPolicy | undefined;
   /** Metrics endpoint is opt-in and should only be bound to a trusted interface. */
   metrics?: Metrics | undefined;
   /**
@@ -100,6 +102,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
     throttle: deps.throttle,
+    registrationPolicy: deps.registrationPolicy,
   });
 
   registerAdminTrustedIssuerRoutes(app, {

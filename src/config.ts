@@ -28,6 +28,8 @@ type Env = Record<string, string | undefined>;
 
 const MIN_SECRET_LENGTH = 32;
 const PLACEHOLDER = /change[-_ ]?me|example|secret|password|default|insecure/i;
+// Well-known weak admin values the placeholder pattern does not already cover.
+const WEAK_ADMIN_TOKEN = /^(admin|token|test|dev)/i;
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 function required(env: Env, name: string): string {
@@ -104,12 +106,17 @@ export function loadConfig(env: Env): Config {
   if (metricsEnabled && !LOOPBACK.has(host)) throw new ConfigError('OAUTH2_METRICS_ENABLED requires a loopback host');
 
   const adminToken = env.OAUTH2_ADMIN_TOKEN?.trim() || undefined;
-  if (production && adminToken !== undefined) {
-    if (PLACEHOLDER.test(adminToken)) {
-      throw new ConfigError('OAUTH2_ADMIN_TOKEN looks like a placeholder; refusing to start in production');
+  if (adminToken !== undefined) {
+    if (PLACEHOLDER.test(adminToken) || WEAK_ADMIN_TOKEN.test(adminToken)) {
+      throw new ConfigError('OAUTH2_ADMIN_TOKEN looks like a placeholder or well-known value');
     }
     if (adminToken.length < MIN_SECRET_LENGTH) {
       throw new ConfigError(`OAUTH2_ADMIN_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
+    }
+    if (!production && !LOOPBACK.has(host) && env.OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK !== '1') {
+      throw new ConfigError(
+        'OAUTH2_ADMIN_TOKEN with a non-loopback OAUTH2_HOST requires OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK=1 (only behind a trusted proxy)',
+      );
     }
   }
 

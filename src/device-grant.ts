@@ -25,6 +25,45 @@ const USER_CODE_LENGTH = 8;
 
 export type { OAuthDeps };
 
+/**
+ * Operator policy for self-service client registration (RFC 7591). Every value a registrant
+ * supplies must be on the relevant allow-list; anything else is refused.
+ */
+export interface RegistrationPolicy {
+  /** Grant types a registrant may request. Default: authorization_code, refresh_token. */
+  allowedGrantTypes?: readonly string[] | undefined;
+  /** Scope values a registrant may request. Default: openid, profile, email. */
+  allowedScopes?: readonly string[] | undefined;
+  /**
+   * Redirect URI schemes accepted for registration, without the trailing colon. Default: https.
+   * Plain http is accepted only for the 127.0.0.1 and [::1] loopback literals.
+   */
+  allowedRedirectSchemes?: readonly string[] | undefined;
+  /** When set, POST /connect/register requires this value as a Bearer initial access token. */
+  initialAccessToken?: string | undefined;
+}
+
+export const DEFAULT_REGISTRATION_GRANT_TYPES: readonly string[] = ['authorization_code', 'refresh_token'];
+export const DEFAULT_REGISTRATION_SCOPES: readonly string[] = ['openid', 'profile', 'email'];
+export const DEFAULT_REGISTRATION_REDIRECT_SCHEMES: readonly string[] = ['https'];
+/** Schemes that are never acceptable redirect targets, even if an operator lists them. */
+const UNSAFE_REDIRECT_SCHEMES = new Set(['javascript', 'data', 'vbscript', 'file', 'blob', 'about']);
+
+interface ResolvedRegistrationPolicy {
+  grantTypes: readonly string[];
+  scopes: readonly string[];
+  redirectSchemes: readonly string[];
+}
+
+function resolvePolicy(policy: RegistrationPolicy | undefined): ResolvedRegistrationPolicy {
+  return {
+    grantTypes: policy?.allowedGrantTypes ?? DEFAULT_REGISTRATION_GRANT_TYPES,
+    scopes: policy?.allowedScopes ?? DEFAULT_REGISTRATION_SCOPES,
+    redirectSchemes: (policy?.allowedRedirectSchemes ?? DEFAULT_REGISTRATION_REDIRECT_SCHEMES)
+      .map((x) => x.toLowerCase().replace(/:$/, '')),
+  };
+}
+
 export interface ExtDeps {
   store: OAuthDeps['store'];
   signer: OAuthDeps['signer'];
@@ -38,6 +77,8 @@ export interface ExtDeps {
   dynamicRegistration?: boolean | undefined;
   /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
   throttle?: Partial<ThrottleConfig> | false | undefined;
+  /** Allow-lists and optional initial access token for dynamic registration. */
+  registrationPolicy?: RegistrationPolicy | undefined;
 }
 
 /**
@@ -78,6 +119,9 @@ const USER_CODE_MAX_FAILURES = 5;
 const USER_CODE_WINDOW_SECONDS = 60;
 
 export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): void {
+  const policy = resolvePolicy(deps.registrationPolicy);
+  const iatDigest = deps.registrationPolicy?.initialAccessToken
+    ? sha256(deps.registrationPolicy.initialAccessToken) : undefined;
   const guessState = new Map<string, { count: number; windowStart: number }>();
   // -- RFC 8628 device authorization endpoint --
   // POST /oauth/device_authorization  (also /oauth/device for the reference admin path)
@@ -209,6 +253,12 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     if (!deps.dynamicRegistration) {
       throw new OAuthError('access_denied', 'dynamic client registration is disabled');
     }
+    if (iatDigest !== undefined) {
+      const presented = bearerToken(req);
+      if (!presented || !safeEqual(sha256(presented), iatDigest)) {
+        throw new OAuthError('invalid_client', 'invalid initial access token');
+      }
+    }
     const body = req.body;
     // Accept application/json; fastify's JSON parser yields an object.
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -216,12 +266,12 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     }
     const meta = body as Record<string, unknown>;
 
-    const redirectUris = normalizeRedirectUris(meta.redirect_uris);
+    const redirectUris = normalizeRedirectUris(meta.redirect_uris, policy);
     if (redirectUris.length === 0) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must not be empty');
     const authMethod = normalizeAuthMethod(meta.token_endpoint_auth_method);
-    const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
+    const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod, policy);
     const responseTypes = normalizeResponseTypes(meta.response_types);
-    const scope = normalizeScope(meta.scope);
+    const scope = normalizeScope(meta.scope, policy);
 
     const now = deps.clock.now();
     const clientId = deps.random.token(16);
@@ -283,7 +333,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       throw new OAuthError('invalid_client_metadata', 'request body must be a JSON object');
     }
     const meta = body as Record<string, unknown>;
-    const redirectUris = normalizeRedirectUris(meta.redirect_uris);
+    const redirectUris = normalizeRedirectUris(meta.redirect_uris, policy);
     if (redirectUris.length === 0) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must not be empty');
     const authMethod = meta.token_endpoint_auth_method === undefined
       ? String(record.registration?.metadata.token_endpoint_auth_method ?? 'client_secret_basic')
@@ -298,8 +348,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     if ((authMethod === 'none') !== wasPublic) {
       throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch between public and confidential');
     }
-    const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod);
-    const scope = normalizeScope(meta.scope);
+    const grantTypes = normalizeGrantTypes(meta.grant_types, authMethod, policy);
+    const scope = normalizeScope(meta.scope, policy);
     // Key rotation: a supplied jwks replaces the stored set; omitted keeps the current keys.
     const newJwks = authMethod === 'private_key_jwt' && meta.jwks !== undefined ? await normalizeJwks(meta.jwks) : null;
 
@@ -345,7 +395,7 @@ async function authenticateRegToken(deps: ExtDeps, req: FastifyRequest, clientId
   return record;
 }
 
-function normalizeRedirectUris(value: unknown): string[] {
+function normalizeRedirectUris(value: unknown, policy: ResolvedRegistrationPolicy): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must be an array');
   const uris: string[] = [];
@@ -359,10 +409,18 @@ function normalizeRedirectUris(value: unknown): string[] {
     }
     // Fragment is never permitted in a redirect URI.
     if (parsed.hash !== '') throw new OAuthError('invalid_redirect_uri', 'redirect_uri must not contain a fragment');
-    // Plain http only for loopback (RFC 8252 §7.3); other schemes must be https or a custom app scheme.
-    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
-    if (parsed.protocol === 'http:' && !loopback) throw new OAuthError('invalid_redirect_uri', 'http redirect_uri only allowed for loopback');
-    if (parsed.protocol === 'javascript:' || parsed.protocol === 'data:') throw new OAuthError('invalid_redirect_uri', 'unsafe redirect_uri scheme');
+    if (parsed.username !== '' || parsed.password !== '') {
+      throw new OAuthError('invalid_redirect_uri', 'redirect_uri must not contain credentials');
+    }
+    const scheme = parsed.protocol.replace(/:$/, '');
+    if (scheme === 'http') {
+      // RFC 8252 §7.3: plain http only for IP-literal loopback redirects.
+      if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== '[::1]') {
+        throw new OAuthError('invalid_redirect_uri', 'http redirect_uri only allowed for 127.0.0.1 or [::1]');
+      }
+    } else if (UNSAFE_REDIRECT_SCHEMES.has(scheme) || !policy.redirectSchemes.includes(scheme)) {
+      throw new OAuthError('invalid_redirect_uri', 'redirect_uri scheme is not permitted');
+    }
     uris.push(u);
   }
   return uris;
@@ -405,18 +463,17 @@ async function normalizeJwks(value: unknown): Promise<{ keys: Array<Record<strin
   return { keys: keys as Array<Record<string, unknown>> };
 }
 
-function normalizeGrantTypes(value: unknown, authMethod: string): string[] {
-  const allowed = ['authorization_code', 'refresh_token', 'client_credentials', DEVICE_GRANT_TYPE, DEVICE_GRANT_TYPE_ALIAS, JWT_BEARER_GRANT_TYPE];
+function normalizeGrantTypes(value: unknown, authMethod: string, policy: ResolvedRegistrationPolicy): string[] {
+  const known = ['authorization_code', 'refresh_token', 'client_credentials', DEVICE_GRANT_TYPE, DEVICE_GRANT_TYPE_ALIAS, JWT_BEARER_GRANT_TYPE];
   if (value === undefined) {
     const out = ['authorization_code'];
-    if (authMethod === 'none') return out;
-    out.push('refresh_token');
-    return out;
+    if (authMethod !== 'none') out.push('refresh_token');
+    return out.filter((g) => policy.grantTypes.includes(g));
   }
   if (!Array.isArray(value)) throw new OAuthError('invalid_client_metadata', 'grant_types must be an array');
   const out: string[] = [];
   for (const g of value) {
-    if (typeof g !== 'string' || !allowed.includes(g)) {
+    if (typeof g !== 'string' || !known.includes(g) || !policy.grantTypes.includes(g)) {
       throw new OAuthError('invalid_client_metadata', `unsupported grant_type: ${String(g)}`);
     }
     out.push(g);
@@ -435,13 +492,13 @@ function normalizeResponseTypes(value: unknown): string[] {
   return out;
 }
 
-function normalizeScope(value: unknown): string {
-  if (value === undefined) return 'openid';
+function normalizeScope(value: unknown, policy: ResolvedRegistrationPolicy): string {
+  if (value === undefined) return policy.scopes.includes('openid') ? 'openid' : '';
   if (typeof value !== 'string') throw new OAuthError('invalid_client_metadata', 'scope must be a string');
   const scope = value.trim();
-  // Self-service registration may never mint privileged scopes (reference: admin/write rejected).
-  if (scope.split(' ').some((s) => ['admin', 'write'].includes(s.toLowerCase()))) {
-    throw new OAuthError('invalid_client_metadata', 'privileged scopes cannot be self-registered');
+  // Unknown is refused: every requested scope must be on the operator's allow-list.
+  for (const s of scope.split(' ').filter((x) => x !== '')) {
+    if (!policy.scopes.includes(s)) throw new OAuthError('invalid_client_metadata', `scope is not permitted: ${s}`);
   }
   return scope;
 }

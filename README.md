@@ -20,11 +20,22 @@ The four live PKCE, redirect, and code-replay fixtures are deferred until real a
 
 Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/client-auth.test.ts`). The cross-language fixtures above remain deferred because the harness cannot yet bind a code from a redirect `Location`; matrix statuses are unchanged.
 
-- `src/config.ts`: environment validation that fails closed. `OAUTH2_ENV`, `OAUTH2_ISSUER`, `OAUTH2_SESSION_SECRET` (32+ chars), `OAUTH2_SIGNING_KEY_PEM` (PKCS#8 ES256) and `OAUTH2_SIGNING_KEY_ID` are required. Production additionally requires an https issuer, a persistent `OAUTH2_DATABASE_PATH`, and a non-placeholder secret. Error messages never echo secret values.
+- `src/config.ts`: environment validation that fails closed. `OAUTH2_ENV`, `OAUTH2_ISSUER`, `OAUTH2_SESSION_SECRET` (32+ chars), `OAUTH2_SIGNING_KEY_PEM` (PKCS#8 ES256) and `OAUTH2_SIGNING_KEY_ID` are required. Production additionally requires an https issuer, a persistent `OAUTH2_DATABASE_PATH`, and a non-placeholder secret. Error messages never echo secret values. `OAUTH2_ADMIN_TOKEN` is optional; when unset the `/admin/trusted-issuers` routes are not registered. When set, in every environment it must be at least 32 characters and must not look like a placeholder or well-known value (for example one starting with `admin`, `token`, `test` or `dev`). It is a single shared secret protecting trusted-issuer registration. Outside production, setting it with a non-loopback `OAUTH2_HOST` is refused unless `OAUTH2_ALLOW_ADMIN_ON_NON_LOOPBACK=1` (only behind a trusted proxy).
 - `src/errors.ts`: typed OAuth errors mapped once to RFC 6749 status, headers and JSON; server errors are opaque.
 - `src/ports.ts`: clock, random, signer and store interfaces. `src/sqlite-store.ts` is the SQLite adapter (`node:sqlite`) with serialized transactions and atomic one-time authorization-code consumption; `src/signer.ts` is the `jose` ES256 signer.
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
+
+### Dynamic client registration policy
+
+Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a `registrationPolicy`. Every value a registrant supplies must appear on the matching allow-list, otherwise `POST` and `PUT /connect/register` return `invalid_client_metadata` or `invalid_redirect_uri`:
+
+- `allowedGrantTypes` (default `authorization_code`, `refresh_token`). `client_credentials`, the device grant and `urn:ietf:params:oauth:grant-type:jwt-bearer` are opt-in.
+- `allowedScopes` (default `openid`, `profile`, `email`).
+- `allowedRedirectSchemes` (default `https`). Plain `http` is accepted only for `127.0.0.1` and `[::1]`; custom app schemes are opt-in; credentials in the URI are always refused.
+- `initialAccessToken`: when set, `POST /connect/register` requires it as a Bearer token. Reading, updating and deleting a client continue to use that client's registration access token.
+
+Embedders that enabled registration without a policy now get these defaults; list any previously accepted grant types, scopes or schemes explicitly to keep them.
 
 ## Remote key retrieval
 

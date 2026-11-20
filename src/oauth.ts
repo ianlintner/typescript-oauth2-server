@@ -7,7 +7,7 @@ import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
-import type { ClientRecord, Clock, Random, Signer, Store } from './ports.js';
+import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 import { failureKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
 
 export const CODE_TTL_SECONDS = 60;
@@ -91,6 +91,26 @@ function redirectTo(reply: FastifyReply, redirectUri: string, params: Record<str
   const url = new URL(redirectUri);
   for (const [key, value] of Object.entries(params)) if (value !== undefined) url.searchParams.set(key, value);
   return reply.status(302).header('location', url.toString()).send();
+}
+
+/**
+ * Subject minted for a verified external assertion. Derived only from the
+ * trusted-issuer record and the verified claim, and namespaced as
+ * `<issuer>:<claim value>` so it cannot coincide with locally authenticated
+ * subjects, client ids, or subjects from another trusted issuer. The `email`
+ * mapping additionally requires `email_verified === true`. Returns undefined
+ * when no usable subject can be derived.
+ */
+export function assertionSubject(trusted: Pick<TrustedIssuerRecord, 'issuer' | 'subjectMapping'>, verifiedPayload: Record<string, unknown>): string | undefined {
+  let value: unknown;
+  if (trusted.subjectMapping === 'email') {
+    if (verifiedPayload.email_verified !== true) return undefined;
+    value = verifiedPayload.email;
+  } else {
+    value = verifiedPayload.sub;
+  }
+  if (typeof value !== 'string' || value === '') return undefined;
+  return `${trusted.issuer}:${value}`;
 }
 
 export function safeEqual(a: string, b: string): boolean {
@@ -364,8 +384,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
    *
    * The reference resolves the assertion subject to a *local* user id (with JIT
    * provisioning against a user table). This port has no user store: the token
-   * subject is the assertion's mapped claim value (`sub` or `email`), treated as
-   * the opaque local subject the rest of this server already uses throughout.
+   * subject is derived from the assertion's mapped claim value (`sub` or `email`)
+   * namespaced by the trusted issuer (see `assertionSubject`).
    */
   const jwtBearerGrant = async (client: ClientRecord, form: URLSearchParams, req: FastifyRequest): Promise<Record<string, unknown>> => {
     const invalid = new OAuthError('invalid_grant', 'assertion is invalid');
@@ -457,10 +477,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // invalid_grant despite no token having been issued.
     const jkt = await tokenEndpointProof(req);
 
-    // Subject mapping: sub (default) or email.
-    const subject = trusted.subjectMapping === 'email'
-      ? (typeof verifiedPayload.email === 'string' && verifiedPayload.email !== '' ? verifiedPayload.email : undefined)
-      : verifiedPayload.sub as string;
+    // Subject mapping: sub (default) or email, namespaced by the trusted issuer.
+    const subject = assertionSubject(trusted, verifiedPayload);
     if (subject === undefined) throw invalid;
 
     // Validate the requested scope (and the mapped subject above) *before*
