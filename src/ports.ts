@@ -30,8 +30,19 @@ export interface ClientRecord {
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
   jwksUri?: string | null | undefined;
+  /** RFC 8705 settings for `tls_client_auth` and certificate-bound tokens. */
+  mtls?: ClientMtls | null | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
+}
+
+export interface ClientMtls {
+  /** `tls_client_auth`: expected certificate subject DN (RFC 4514 string). Exactly one of subjectDn/sanDns. */
+  subjectDn?: string | undefined;
+  /** `tls_client_auth`: expected dNSName subjectAltName. */
+  sanDns?: string | undefined;
+  /** `tls_client_certificate_bound_access_tokens` (RFC 8705 §3.4): bind every token to the presented certificate. */
+  boundTokens?: boolean | undefined;
 }
 
 /** RFC 7591/7592 state. The registration access token is stored only as a SHA-256 hash. */

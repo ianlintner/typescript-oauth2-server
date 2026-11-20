@@ -6,6 +6,7 @@ import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
+import { MTLS_AUTH_METHODS, certThumbprint, certificateAuthenticates, isMtlsAuthMethod, presentedCertificate, type MtlsConfig } from './mtls.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 
@@ -22,6 +23,8 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** RFC 8705 trusted-proxy mTLS ingress; absent disables mTLS client auth and bound tokens. */
+  mtls?: MtlsConfig | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -131,8 +134,35 @@ export const JWT_BEARER_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-beare
 /** jti replay namespace for JWT-bearer assertions, prefixed per the parity card (`jwtb:`) and scoped by issuer. */
 const JWT_BEARER_JTI_PREFIX = 'jwtb:';
 
-/** A client with neither a secret nor a registered key cannot authenticate: it is public. */
-export const isPublicClient = (c: ClientRecord): boolean => c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt';
+/** A client with neither a secret nor a registered key/certificate cannot authenticate: it is public. */
+export const isPublicClient = (c: ClientRecord): boolean =>
+  c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt' && !isMtlsAuthMethod(c.tokenEndpointAuthMethod);
+
+/**
+ * RFC 8705 §3 certificate binding. Returns the `x5t#S256` thumbprint to bind issued
+ * tokens to, or null when this client does not use bound tokens. Fails closed: a client
+ * that authenticates by mTLS or registered boundTokens must present a certificate the
+ * trusted proxy vouches for, otherwise no token is issued.
+ */
+function certBinding(deps: OAuthDeps, req: FastifyRequest, client: ClientRecord): string | null {
+  if (!isMtlsAuthMethod(client.tokenEndpointAuthMethod) && client.mtls?.boundTokens !== true) return null;
+  const cert = presentedCertificate(deps.mtls, req.headers);
+  if (!cert) throw new OAuthError('invalid_client', 'client certificate required');
+  return certThumbprint(cert);
+}
+
+/** RFC 7800 confirmation claim combining the DPoP key (`jkt`) and certificate (`x5t#S256`) bindings. */
+function cnfClaim(jkt: string | null, x5t: string | null): Record<string, string> | null {
+  if (!jkt && !x5t) return null;
+  return { ...(jkt ? { jkt } : {}), ...(x5t ? { 'x5t#S256': x5t } : {}) };
+}
+
+function boundX5t(payload: Record<string, unknown>): string | null {
+  const cnf = payload.cnf;
+  if (typeof cnf !== 'object' || cnf === null) return null;
+  const v = (cnf as Record<string, unknown>)['x5t#S256'];
+  return typeof v === 'string' && v !== '' ? v : null;
+}
 
 function candidateKeys(client: ClientRecord, alg: string, kid: string | undefined): JWK[] {
   const kty = alg === 'ES256' ? 'EC' : 'RSA';
@@ -206,6 +236,13 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
     throw invalid;
   }
   if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
+  if (isMtlsAuthMethod(client.tokenEndpointAuthMethod)) {
+    // RFC 8705 §2: the certificate is the credential; no secret may accompany it.
+    if (secret !== undefined || req.headers.authorization !== undefined) throw invalid;
+    const cert = presentedCertificate(deps.mtls, req.headers);
+    if (!deps.mtls || !cert || !certificateAuthenticates(deps.mtls, client, cert, deps.clock.now())) throw invalid;
+    return client;
+  }
   if (client.clientSecretHash === null) {
     if (secret) throw invalid; // public clients never authenticate with a secret
     return client;
@@ -242,7 +279,7 @@ function boundJkt(payload: Record<string, unknown>): string | null {
  * Cache-Control: no-store (RFC 8628 §3.5). A poll faster than the device's
  * interval gets slow_down (+5s).
  */
-async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: string): Promise<Record<string, unknown>> {
+async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: string, x5t: string | null): Promise<Record<string, unknown>> {
   const now = deps.clock.now();
   const record = await deps.store.getDeviceCode(hash);
   if (!record || record.clientId !== client.clientId) throw new OAuthError('invalid_grant', 'device_code is invalid');
@@ -277,6 +314,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
     iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
   };
   if (scopes !== '') claims.scope = scopes;
+  { const cnf = cnfClaim(null, x5t); if (cnf) claims.cnf = cnf; }
   const accessToken = await deps.signer.sign(claims);
 
   await deps.store.saveAccessToken({
@@ -340,7 +378,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
    * subject is derived from the assertion's mapped claim value (`sub` or `email`)
    * namespaced by the trusted issuer (see `assertionSubject`).
    */
-  const jwtBearerGrant = async (client: ClientRecord, form: URLSearchParams, req: FastifyRequest): Promise<Record<string, unknown>> => {
+  const jwtBearerGrant = async (client: ClientRecord, form: URLSearchParams, req: FastifyRequest, x5t: string | null): Promise<Record<string, unknown>> => {
     const invalid = new OAuthError('invalid_grant', 'assertion is invalid');
     const assertion = single(form, 'assertion');
     if (!assertion) throw new OAuthError('invalid_request', 'assertion is required');
@@ -456,7 +494,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: atJti,
     };
     if (scope) claims.scope = scope;
-    if (jkt) claims.cnf = { jkt };
+    { const cnf = cnfClaim(jkt, x5t); if (cnf) claims.cnf = cnf; }
     const accessToken = await deps.signer.sign(claims);
 
     await deps.store.saveAccessToken({
@@ -595,6 +633,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // -- authorization_code --
     if (grantType === 'authorization_code') {
       const client = await authenticateClient(deps, req, form);
+      const x5t = certBinding(deps, req, client);
       if (!client.grantTypes.includes('authorization_code')) throw new OAuthError('unauthorized_client');
       // Validate the proof before consuming the code so a bad proof cannot burn it.
       const jkt = await tokenEndpointProof(req);
@@ -639,7 +678,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (scopes !== '') claims.scope = scopes;
-      if (jkt) claims.cnf = { jkt };
+      { const cnf = cnfClaim(jkt, x5t); if (cnf) claims.cnf = cnf; }
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -688,6 +727,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // -- client_credentials --
     if (grantType === 'client_credentials') {
       const client = await authenticateClient(deps, req, form);
+      const x5t = certBinding(deps, req, client);
       // public clients may not use client_credentials
       if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use client_credentials');
       if (!client.grantTypes.includes('client_credentials')) throw new OAuthError('unauthorized_client');
@@ -709,7 +749,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (scope) claims.scope = scope;
-      if (jkt) claims.cnf = { jkt };
+      { const cnf = cnfClaim(jkt, x5t); if (cnf) claims.cnf = cnf; }
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -728,6 +768,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // -- refresh_token --
     if (grantType === 'refresh_token') {
       const client = await authenticateClient(deps, req, form);
+      const x5t = certBinding(deps, req, client);
       if (!client.grantTypes.includes('refresh_token')) throw new OAuthError('unauthorized_client');
       const proofJkt = await tokenEndpointProof(req);
 
@@ -777,7 +818,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         jti: atJti,
       };
       if (allowedScope) claims.scope = allowedScope;
-      if (jkt) claims.cnf = { jkt };
+      { const cnf = cnfClaim(jkt, x5t); if (cnf) claims.cnf = cnf; }
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -817,6 +858,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // -- device_code (RFC 8628 §3.4) --
     if (grantType === 'urn:ietf:params:oauth:grant-type:device_code' || grantType === 'device_code') {
       const client = await authenticateClient(deps, req, form);
+      const x5t = certBinding(deps, req, client);
       if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use device_code');
       if (!client.grantTypes.includes('urn:ietf:params:oauth:grant-type:device_code') &&
           !client.grantTypes.includes('device_code')) {
@@ -825,15 +867,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const deviceCode = single(form, 'device_code');
       if (!deviceCode) throw new OAuthError('invalid_request', 'device_code is required');
       const hash = sha256Hex(deviceCode);
-      return deviceCodeGrant(deps, client, hash);
+      return deviceCodeGrant(deps, client, hash, x5t);
     }
 
     // -- jwt-bearer (RFC 7523 §2.1) --
     if (grantType === JWT_BEARER_GRANT_TYPE) {
       const client = await authenticateClient(deps, req, form);
+      const x5t = certBinding(deps, req, client);
       if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use jwt-bearer');
       if (!client.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
-      const body = await jwtBearerGrant(client, form, req);
+      const body = await jwtBearerGrant(client, form, req, x5t);
       return reply.header('pragma', 'no-cache').send(body);
     }
 
@@ -923,7 +966,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
             scope: stored.scope || undefined,
             client_id: stored.clientId,
             token_type: boundJkt(decoded) ? 'DPoP' : 'Bearer',
-            ...(boundJkt(decoded) ? { cnf: { jkt: boundJkt(decoded) } } : {}),
+            ...(cnfClaim(boundJkt(decoded), boundX5t(decoded)) ? { cnf: cnfClaim(boundJkt(decoded), boundX5t(decoded)) } : {}),
             exp: stored.expiresAt,
             iat: typeof decoded.iat === 'number' ? decoded.iat : undefined,
             jti: stored.jti,
@@ -958,7 +1001,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
-    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', ...(deps.mtls ? MTLS_AUTH_METHODS : []), 'none'],
+    ...(deps.mtls ? { tls_client_certificate_bound_access_tokens: true } : {}),
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
@@ -1004,6 +1048,15 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
         if (!(err instanceof OAuthError) || err.code !== 'invalid_dpop_proof') throw err;
         return reply.status(401).header('www-authenticate', `DPoP error="invalid_dpop_proof", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
           .send({ error: 'invalid_dpop_proof', ...(err.description ? { error_description: err.description } : {}) });
+      }
+    }
+
+    // RFC 8705 §3: a certificate-bound token is only usable over a connection presenting that certificate.
+    const boundCert = boundX5t(payload);
+    if (boundCert !== null) {
+      const cert = presentedCertificate(deps.mtls, req.headers);
+      if (!cert || !safeEqual(certThumbprint(cert), boundCert)) {
+        return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
       }
     }
 

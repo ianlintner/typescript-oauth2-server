@@ -3,6 +3,7 @@ import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
 import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant.js';
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
+import type { MtlsConfig } from './mtls.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
 
@@ -30,6 +31,8 @@ export interface Deps {
    * leave unset and the admin routes are not registered.
    */
   adminToken?: string | undefined;
+  /** RFC 8705 trusted-proxy mTLS; absent means mTLS auth and bound tokens are disabled. */
+  mtls?: MtlsConfig | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
 }
