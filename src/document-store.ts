@@ -134,6 +134,16 @@ export abstract class DocumentStore implements Store {
     await db.put('proof', key, { expiresAt });
     return true;
   }); }
+  rateLimitCount(key: string, now: number): Promise<number> { return this.run(async db => {
+    const r = await db.get<{ count: number; expiresAt: number }>('ratelimit', key);
+    return r && r.expiresAt > now ? r.count : 0;
+  }); }
+  rateLimitHit(key: string, windowSeconds: number, now: number): Promise<number> { return this.run(async db => {
+    const r = await db.get<{ count: number; expiresAt: number }>('ratelimit', key);
+    const next = r && r.expiresAt > now ? { count: r.count + 1, expiresAt: r.expiresAt } : { count: 1, expiresAt: now + windowSeconds };
+    await db.put('ratelimit', key, next);
+    return next.count;
+  }); }
 }
 
 /** Scoped handle cannot outlive its callback or start a nested transaction. */
