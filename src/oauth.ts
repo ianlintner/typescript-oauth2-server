@@ -521,7 +521,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const state = single(params, 'state');
     const fail = (error: string) => redirectTo(reply, redirectUri, { error, state, iss: deps.issuer });
 
-    if (single(params, 'response_type') !== 'code') return fail('invalid_request');
+    // RFC 6749 §4.1.2.1: a missing response_type is invalid_request; a present but unsupported
+    // value (e.g. the implicit `token`) is unsupported_response_type.
+    const responseType = single(params, 'response_type');
+    if (responseType === undefined || responseType === '') return fail('invalid_request');
+    if (responseType !== 'code') return fail('unsupported_response_type');
     if (!client.grantTypes.includes('authorization_code')) return fail('unauthorized_client');
     const challenge = single(params, 'code_challenge');
     if (!challenge || single(params, 'code_challenge_method') !== 'S256' || !CHALLENGE_RE.test(challenge)) {
