@@ -470,6 +470,33 @@ test('front-channel parameters do not extend a pushed request', async () => {
   await s.server.close();
 });
 
+test('repeated ignored front-channel parameters do not affect a pushed request', async () => {
+  const s = await setup();
+  const push = await pushPar(s, {
+    response_type: 'code', redirect_uri: CB, state: 'st-pushed',
+    code_challenge: CHALLENGE, code_challenge_method: 'S256',
+  });
+  assert.equal(push.statusCode, 201);
+  const uri = encodeURIComponent(push.json().request_uri);
+  const res = await s.server.inject({
+    method: 'GET', url: `/oauth/authorize?request_uri=${uri}&client_id=conf&state=a&state=b`,
+  });
+  assert.equal(res.statusCode, 302);
+  const loc = new URL(res.headers.location as string);
+  assert.ok(loc.searchParams.get('code'));
+  assert.deepEqual(loc.searchParams.getAll('state'), ['st-pushed']);
+  // Repeating an identifying parameter is still rejected.
+  const push2 = await pushPar(s, {
+    response_type: 'code', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'S256',
+  });
+  const dup = await s.server.inject({
+    method: 'GET',
+    url: `/oauth/authorize?request_uri=${encodeURIComponent(push2.json().request_uri)}&client_id=conf&client_id=conf`,
+  });
+  assert.equal(dup.statusCode, 400);
+  await s.server.close();
+});
+
 test('a denied pushed request does not consume the request_uri', async () => {
   const s = await setup();
   const push = await pushPar(s, {

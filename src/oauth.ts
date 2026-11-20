@@ -475,11 +475,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   app.get('/oauth/authorize', async (req, reply) => {
     let params = new URL(req.url, 'http://localhost').searchParams;
     // Until client and redirect_uri are trusted, errors are shown to the user agent and never redirected.
-    rejectDuplicates(params);
-
     // RFC 9126: a request_uri references a previously pushed request. Its stored
     // parameters supply client_id and redirect_uri; fields present on the GET are
-    // ignored (RFC 9126 §2/§3).
+    // ignored (RFC 9126 §2/§3). Only request_uri and client_id are read from the GET,
+    // so only those are checked for repetition when a request_uri is present.
+    if (params.has('request_uri')) {
+      single(params, 'request_uri');
+      single(params, 'client_id');
+    } else {
+      rejectDuplicates(params);
+    }
     const requestUri = single(params, 'request_uri');
     let parClientId: string | undefined;
     let parRedirectUri: string | undefined;
