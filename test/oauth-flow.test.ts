@@ -116,7 +116,11 @@ test('authorize reports PKCE and request errors to the trusted redirect_uri with
     [{ code_challenge_method: '' }, 'invalid_request'],
     [{ code_challenge_method: 'plain' }, 'invalid_request'],
     [{ code_challenge: 'short' }, 'invalid_request'],
-    [{ response_type: 'token' }, 'invalid_request'],
+    // RFC 6749 §4.1.2.1: an unsupported (here implicit) response_type value is unsupported_response_type.
+    [{ response_type: 'token' }, 'unsupported_response_type'],
+    [{ response_type: 'code token' }, 'unsupported_response_type'],
+    // A missing response_type stays invalid_request (RFC 6749 §4.1.2.1).
+    [{ response_type: '' }, 'invalid_request'],
     [{ scope: 'admin' }, 'invalid_scope'],
     [{ client_id: 'nogrant' }, 'unauthorized_client'],
   ];
