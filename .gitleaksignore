@@ -12,3 +12,5 @@ scripts/conformance-run.sh:generic-api-key:46
 
 # Same fake secret, historical commit (line moved from 45 to 46 upstream).
 7015193485a2e060ff37053d1ac8d3c3390aa6d1:scripts/conformance-run.sh:generic-api-key:45
+# False positive: fail-closed prose in docs/mtls.md (PR #45), reworded in the follow-up commit
+50b824980acac440615158bd157fe40b6054a008:docs/mtls.md:generic-api-key:18

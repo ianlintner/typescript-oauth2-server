@@ -15,7 +15,7 @@ mutual-TLS handshake and forwards the client certificate:
 | `OAUTH2_MTLS_CA_PEM` | Optional trust anchor: `tls_client_auth` certs must additionally be directly issued by this CA (single level). |
 
 **Fail closed.** The cert header is honoured only when the shared-secret header matches (constant time).
-A direct hit, wrong secret, missing/duplicate/garbled cert, expired cert, or mTLS left unconfigured all
+A direct hit, a mismatched proxy header value, a missing, duplicated or garbled cert, an expired cert, or mTLS left unconfigured all
 mean "no certificate": mTLS clients get an opaque `invalid_client`, bound-token clients get no token,
 and bound tokens are rejected at userinfo. The proxy must strip any client-supplied copies of both
 headers and must only forward the app over a private link.
