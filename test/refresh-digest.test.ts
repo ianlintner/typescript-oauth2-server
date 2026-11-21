@@ -217,3 +217,46 @@ test('document store: rotation lineage, replay, revoke and legacy purge on diges
   assert.equal(await store.countLegacyRefreshTokens(), 0);
   assert.equal((await store.docs.list('refresh')).length, 3); // a, b, c remain
 });
+
+test('replay revocation landing between consume and replacement save leaves no usable token', async () => {
+  const s = await setup();
+  try {
+    const rt1 = await issue(s.server);
+    const base = s.store;
+    let injected = false;
+    let replayStatus = 0;
+    // Deterministic interleaving: when the winning request saves its replacement, a replay of the
+    // already-consumed parent (revoking the family) completes first.
+    const racing = new Proxy(base, {
+      get(target, prop) {
+        if (prop === 'saveRefreshToken') {
+          return async (t: RefreshTokenRecord) => {
+            if (!injected && t.parentJti !== null) {
+              injected = true;
+              replayStatus = (await refresh(s.server, rt1)).statusCode;
+            }
+            return target.saveRefreshToken(t);
+          };
+        }
+        const v = Reflect.get(target, prop, target) as unknown;
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as Store;
+    const { privateKey } = await generateKeyPair('ES256', { extractable: true });
+    const signer = await createJoseSigner(await exportPKCS8(privateKey), 'k1');
+    const racer = buildServer({
+      store: racing, signer, clock: { now: () => NOW }, random: cryptoRandom, issuer: 'http://localhost:8080',
+      authenticate: async () => 'user-1', refreshTokenTtl: 86_400,
+    });
+    try {
+      const winner = await refresh(racer, rt1);
+      assert.equal(replayStatus, 400, 'replay is rejected');
+      assert.equal(winner.statusCode, 400, 'winner fails closed');
+      assert.equal(winner.json().refresh_token, undefined);
+      const db = s.raw();
+      const live = db.prepare('SELECT COUNT(*) AS n FROM refresh_tokens WHERE revoked_at IS NULL AND revoked_by_replay_at IS NULL').get() as unknown as { n: number };
+      db.close();
+      assert.equal(live.n, 0, 'no usable refresh token remains in the family');
+    } finally { await racer.close(); }
+  } finally { await s.cleanup(); }
+});

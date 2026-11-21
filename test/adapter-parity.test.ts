@@ -88,6 +88,30 @@ for (const [name, make] of factories) {
       assert.equal(await c.consumePar(id, id, 1000), null);
     } finally { await b.close(); await c.close(); }
   });
+  test(`${name}: replay of an ancestor after four rotations revokes the live token`, async () => {
+    const a = make();
+    await a.init();
+    const id = `client-${crypto.randomUUID()}`;
+    const mk = (p: string, family: string, n: number, parentJti: string | null) => ({
+      jti: `${p}${n}-${id}`, clientId: id, subject: 'user', scope: 'read', expiresAt: 100_000, family, parentJti,
+      revokedAt: null, revokedByReplayAt: null,
+    });
+    try {
+      await a.saveClient({ clientId: id, clientSecretHash: null, redirectUris: [], grantTypes: [], scopes: [], enabled: true });
+      // Linear rotation: each token is presented once and none of them is treated as a replay.
+      for (const [p, base] of [['r', 1000], ['s', 10_000]] as const) {
+        const family = `family-${p}-${id}`;
+        for (let n = 1; n <= 5; n++) await a.saveRefreshToken(mk(p, family, n, n === 1 ? null : `${p}${n - 1}-${id}`));
+        for (let n = 1; n <= 4; n++) {
+          assert.ok(await a.consumeRefreshToken(`${p}${n}-${id}`, base + n * 1001 - 1), `${p}${n} consumed`);
+        }
+      }
+      // Replaying the oldest token revokes the live member of the first family only.
+      assert.equal(await a.consumeRefreshToken(`r1-${id}`, 5000), null);
+      assert.equal(await a.getRefreshToken(`r5-${id}`, 5000), null);
+      assert.ok(await a.getRefreshToken(`s5-${id}`, 15_000));
+    } finally { await a.close(); }
+  });
   test(`${name}: transaction rollback, single-use and replay survive independent connections`, async () => {
     const a = make();
     const b = make();

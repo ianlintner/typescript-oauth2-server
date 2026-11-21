@@ -109,9 +109,7 @@ export abstract class DocumentStore implements Store {
     const family = await db.find<RefreshTokenRecord & { consumedAt: number | null }>('refresh', 'family', r.family);
     const revoke = async () => { for (const item of family) if (item.revokedAt === null && item.revokedByReplayAt === null) await db.put('refresh', item.jti, { ...item, revokedByReplayAt: now }); };
     if (r.consumedAt !== null) { await revoke(); return null; }
-    const sibling = family.some(x => x.jti !== id && x.jti !== r.parentJti && x.consumedAt !== null && x.revokedAt === null && x.revokedByReplayAt === null);
     await db.put('refresh', id, { ...r, consumedAt: now });
-    if (sibling) await revoke();
     return r;
   }); }
   revokeRefreshToken(id: string, now: number): Promise<boolean> { return this.run(async db => {
