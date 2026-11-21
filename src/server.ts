@@ -19,6 +19,8 @@ export interface Deps {
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
+  /** Per-source request bounds on /oauth/userinfo and /oauth/logout. On by default; `false` disables. */
+  rateLimit?: boolean | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
   dynamicRegistration?: boolean | undefined;
   /** Allow-lists (grant types, scopes, redirect schemes) and optional initial access token for registration. */
@@ -96,6 +98,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
     registrationPolicy: deps.registrationPolicy,
+    rateLimit: deps.rateLimit,
   });
 
   registerAdminTrustedIssuerRoutes(app, {
