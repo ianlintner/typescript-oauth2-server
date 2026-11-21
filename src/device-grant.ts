@@ -2,6 +2,7 @@ import { createHash, randomInt } from 'node:crypto';
 import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
+import { CHALLENGE_RE } from './oauth.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord } from './ports.js';
@@ -201,11 +202,25 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     // Never allow a request_uri to piggy-back into a pushed request.
     delete params.request_uri;
     // RFC 9126 §2.3: validate the request at push time as the authorization endpoint would.
-    if (params.response_type !== undefined && params.response_type !== 'code') {
+    // A pushed request must be complete on its own: the authorization endpoint ignores
+    // front-channel parameters when a request_uri is used (RFC 9126 §4).
+    if (params.response_type === undefined) {
+      throw new OAuthError('invalid_request', 'response_type is required');
+    }
+    if (params.response_type !== 'code') {
       throw new OAuthError('unsupported_response_type', 'only response_type=code is supported');
     }
-    if (params.redirect_uri !== undefined && !redirectUriMatches(client.redirectUris, params.redirect_uri)) {
+    if (params.redirect_uri === undefined || params.redirect_uri === '') {
+      throw new OAuthError('invalid_request', 'redirect_uri is required');
+    }
+    if (!redirectUriMatches(client.redirectUris, params.redirect_uri)) {
       throw new OAuthError('invalid_request', 'redirect_uri is not registered for this client');
+    }
+    if (
+      params.code_challenge_method !== 'S256' ||
+      params.code_challenge === undefined || !CHALLENGE_RE.test(params.code_challenge)
+    ) {
+      throw new OAuthError('invalid_request', 'code_challenge with code_challenge_method=S256 is required');
     }
 
     const now = deps.clock.now();
