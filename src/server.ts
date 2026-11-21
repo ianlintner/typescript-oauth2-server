@@ -1,11 +1,10 @@
-import Fastify, { type FastifyInstance, type FastifyPluginAsync, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
 import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant.js';
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
-import { registerRouteBounds, RouteBounds } from './rate-limit.js';
 
 export interface Deps {
   store: Store;
@@ -36,20 +35,6 @@ export interface Deps {
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
 }
-
-/** Dependencies the OAuth/OIDC plugin closes over: the server's dependency set as a whole. */
-export type OAuthRouteDeps = Deps;
-
-/**
- * The OAuth/OIDC routes plus the per-source request bounds on the work they do. Kept as one plugin,
- * registered on `app` by {@link buildServer}, so the onRequest bound and the routes it covers always
- * share an instance and registration scope: the handler checks the path, so nothing outside these
- * routes is affected.
- */
-export const oauthRoutes: FastifyPluginAsync<OAuthRouteDeps> = async (instance, deps) => {
-  if (deps.rateLimit !== false) registerRouteBounds(instance, new RouteBounds(), deps.clock);
-  registerOAuthRoutes(instance, deps);
-};
 
 export function buildServer(deps: Deps): FastifyInstance {
   const app = Fastify({ logger: false });
@@ -102,7 +87,7 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   if (deps.metrics) app.get('/metrics', async (_req, reply) => reply.type('text/plain; version=0.0.4').send(deps.metrics!.render()));
 
-  oauthRoutes(app, deps);
+  registerOAuthRoutes(app, deps);
 
   registerExtensionRoutes(app, {
     store: deps.store,
@@ -113,6 +98,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
     registrationPolicy: deps.registrationPolicy,
+    rateLimit: deps.rateLimit,
   });
 
   registerAdminTrustedIssuerRoutes(app, {
