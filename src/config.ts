@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -20,6 +22,8 @@ export interface Config {
   adminToken: string | undefined;
   /** RFC 8693 act-chain depth limit (levels). */
   maxDelegationDepth: number;
+  /** Comma-separated proxy IPs/CIDRs whose X-Forwarded-For is trusted; undefined = trust none. */
+  trustedProxies: string | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -127,6 +131,25 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  // Explicit proxy allow-list only (IP or CIDR); a blanket "trust everything" value is refused
+  // because it would let any caller spoof X-Forwarded-For past the token-endpoint rate limiter.
+  let trustedProxies: string | undefined;
+  const rawProxies = env.OAUTH2_TRUSTED_PROXIES?.trim();
+  if (rawProxies) {
+    const entries = rawProxies.split(',').map((e) => e.trim());
+    for (const e of entries) {
+      const [addr = '', prefix, extra] = e.split('/');
+      const family = isIP(addr);
+      const maxPrefix = family === 4 ? 32 : 128;
+      const prefixOk = prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) <= maxPrefix);
+      const wildcard = prefix !== undefined && Number(prefix) === 0;
+      if (family === 0 || extra !== undefined || !prefixOk || wildcard) {
+        throw new ConfigError('OAUTH2_TRUSTED_PROXIES must be a comma-separated list of proxy IPs or CIDRs (not /0)');
+      }
+    }
+    trustedProxies = entries.join(',');
+  }
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -150,5 +173,6 @@ export function loadConfig(env: Env): Config {
     signingKeyId,
     adminToken,
     maxDelegationDepth,
+    trustedProxies,
   };
 }

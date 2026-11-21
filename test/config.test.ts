@@ -150,3 +150,12 @@ test('OAUTH2_MAX_DELEGATION_DEPTH defaults to 4 and must be a positive integer',
   rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: 'abc' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
   rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '100' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
 });
+
+test('OAUTH2_TRUSTED_PROXIES is an explicit IP/CIDR list; unset trusts none and blanket values are refused', () => {
+  assert.equal(loadConfig(dev).trustedProxies, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_TRUSTED_PROXIES: '10.0.0.1, 192.168.0.0/16' }).trustedProxies, '10.0.0.1,192.168.0.0/16');
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: 'true' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: '0.0.0.0/0' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: '10.0.0.1/33' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: 'proxy.internal' }, /OAUTH2_TRUSTED_PROXIES/);
+});

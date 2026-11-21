@@ -54,6 +54,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     metrics: config.metricsEnabled ? new Metrics() : undefined,
     adminToken: config.adminToken,
     maxDelegationDepth: config.maxDelegationDepth,
+    trustProxy: config.trustedProxies,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
     consent,

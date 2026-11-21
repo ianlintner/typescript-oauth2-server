@@ -179,22 +179,35 @@ test('public clients, clients without the grant and bad secrets are refused', as
 
 test('expired, revoked, unrecorded and foreign-issuer subject tokens are rejected', async () => {
   const c = await setup();
-  const expiring = await c.cc('a');
-  const revoked = await c.cc('a');
-  await c.store.revokeAccessToken(decodeJwt(revoked).jti as string, c.state.v);
-  // validly signed by this server but never recorded (e.g. an ID token): must not resolve
-  const unrecorded = await c.signer.sign({ iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read', iat: T0, exp: T0 + 3600, jti: randomUUID() });
   const foreignKey = await generateKeyPair('ES256');
-  const foreign = await new SignJWT({ iss: 'https://evil.example', sub: 'a', client_id: 'a', scope: 'read', jti: randomUUID() })
-    .setProtectedHeader({ alg: 'ES256' }).setIssuedAt(T0).setExpirationTime(T0 + 3600).sign(foreignKey.privateKey);
-  const wrongKey = await new SignJWT({ iss: ISSUER, sub: 'a', client_id: 'a', scope: 'read', jti: randomUUID() })
-    .setProtectedHeader({ alg: 'ES256' }).setIssuedAt(T0).setExpirationTime(T0 + 3600).sign(foreignKey.privateKey);
-  c.state.v += 3601;
-  for (const [name, token] of Object.entries({ expiring, revoked, unrecorded, foreign, wrongKey })) {
+  const expectRejected = async (name: string, token: string) => {
     const res = await c.exchange('a', { subject_token: token });
     assert.equal(res.statusCode, 400, name);
     assert.equal(res.json().error, 'invalid_request', name);
-  }
+  };
+  // Control: a live token exchanges, so each case below varies only its own condition.
+  assert.equal((await c.exchange('a', { subject_token: await c.cc('a') })).statusCode, 200);
+
+  // revoked: unexpired, validly signed, recorded, then revoked
+  const revoked = await c.cc('a');
+  await c.store.revokeAccessToken(decodeJwt(revoked).jti as string, c.state.v);
+  await expectRejected('revoked', revoked);
+
+  // validly signed by this server but never recorded (e.g. an ID token): must not resolve
+  const unrecorded = await c.signer.sign({ iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read', iat: T0, exp: T0 + 3600, jti: randomUUID() });
+  await expectRejected('unrecorded', unrecorded);
+
+  const foreign = await new SignJWT({ iss: 'https://evil.example', sub: 'a', client_id: 'a', scope: 'read', jti: randomUUID() })
+    .setProtectedHeader({ alg: 'ES256' }).setIssuedAt(T0).setExpirationTime(T0 + 3600).sign(foreignKey.privateKey);
+  await expectRejected('foreign issuer', foreign);
+  const wrongKey = await new SignJWT({ iss: ISSUER, sub: 'a', client_id: 'a', scope: 'read', jti: randomUUID() })
+    .setProtectedHeader({ alg: 'ES256' }).setIssuedAt(T0).setExpirationTime(T0 + 3600).sign(foreignKey.privateKey);
+  await expectRejected('wrong key', wrongKey);
+
+  // expired: only the clock moves
+  const expiring = await c.cc('a');
+  c.state.v += 3601;
+  await expectRejected('expired', expiring);
 });
 
 // ---- scope ----
@@ -410,6 +423,37 @@ test('a proof presented at the endpoint binds an unbound subject exchange', asyn
   assert.equal(res.statusCode, 200, res.body);
   assert.equal(res.json().token_type, 'DPoP');
   assert.deepEqual(decodeJwt(res.json().access_token).cnf, { jkt });
+});
+
+test('a DPoP-bound actor token requires a matching proof (missing, mismatched, matching)', async () => {
+  const c = await setup();
+  const mk = async () => {
+    const { publicKey, privateKey } = await generateKeyPair('ES256', { extractable: true });
+    const jwk: JWK = await exportJWK(publicKey);
+    const jkt = await calculateJwkThumbprint(jwk);
+    const proof = () => new SignJWT({ jti: randomUUID(), htm: 'POST', htu: `${ISSUER}/oauth/token`, iat: T0 })
+      .setProtectedHeader({ typ: 'dpop+jwt', alg: 'ES256', jwk }).sign(privateKey);
+    return { jkt, proof };
+  };
+  const actorKey = await mk();
+  const otherKey = await mk();
+  const subj = await c.mint({ sub: 'alice', may_act: { sub: 'svc' } });
+  const actor = await c.mint({ sub: 'svc', cnf: { jkt: actorKey.jkt } });
+  const form = { subject_token: subj, actor_token: actor, actor_token_type: AT, scope: 'read' };
+
+  const missing = await c.exchange('a', form);
+  assert.equal(missing.statusCode, 400);
+  assert.equal(missing.json().error, 'invalid_request');
+  assert.match(missing.json().error_description, /actor_token/);
+
+  const mismatched = await c.exchange('a', form, { dpop: await otherKey.proof() });
+  assert.equal(mismatched.statusCode, 400);
+  assert.equal(mismatched.json().error, 'invalid_request');
+  assert.match(mismatched.json().error_description, /actor_token/);
+
+  const ok = await c.exchange('a', form, { dpop: await actorKey.proof() });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.notEqual(decodeJwt(ok.json().access_token).act, undefined);
 });
 
 // ---- discovery ----

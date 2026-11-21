@@ -35,12 +35,18 @@ export interface Deps {
   maxDelegationDepth?: number | undefined;
   /** Per-client-address request budget for /oauth/token (all grants, incl. token exchange). Defaults to 120 per 60s. */
   tokenRateLimit?: { max: number; windowSeconds: number } | undefined;
+  /**
+   * Proxies whose X-Forwarded-For is trusted (Fastify `trustProxy`: IP/CIDR list string, or boolean).
+   * Unset = forwarding headers are ignored and the peer address keys the rate limiter.
+   */
+  trustProxy?: boolean | string | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
 }
 
 export function buildServer(deps: Deps): FastifyInstance {
-  const app = Fastify({ logger: false });
+  // Forwarding headers are only honored when the operator names the trusted proxy hop(s).
+  const app = Fastify({ logger: false, ...(deps.trustProxy !== undefined ? { trustProxy: deps.trustProxy } : {}) });
 
   if (deps.metrics || deps.trace) {
     const starts = new WeakMap<object, { time: number; finish: (() => void) | undefined }>();

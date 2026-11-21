@@ -183,17 +183,23 @@ export async function tokenExchangeGrant(
   if (!ACCEPTED_TOKEN_TYPES.has(requestedTokenType)) return reject(`unsupported requested_token_type '${requestedTokenType}'`);
   if (get('authorization_details') !== undefined) return reject('authorization_details is not supported by token exchange');
 
+  // RFC 9449 §7: a sender-constrained token may only be exchanged by the holder of its key.
+  // Applies to the actor token too: client authentication does not prove possession of its key.
+  const requireKeyPossession = (t: ResolvedToken, which: 'subject' | 'actor'): void => {
+    const jkt = t.cnf?.jkt;
+    if (t.cnf !== null && (typeof jkt !== 'string' || jkt === '' || jkt !== presentedJkt)) {
+      reject(`${which}_token is sender-constrained; a matching DPoP proof is required`);
+    }
+  };
+
   const subject = await resolveToken(deps, subjectToken, 'subject', maxDepth);
-  // RFC 9449 §7: a sender-constrained subject may only be exchanged by the holder of its key.
-  const subjectJkt = subject.cnf?.jkt;
-  if (subject.cnf !== null && (typeof subjectJkt !== 'string' || subjectJkt === '' || subjectJkt !== presentedJkt)) {
-    return reject('subject_token is sender-constrained; a matching DPoP proof is required');
-  }
+  requireKeyPossession(subject, 'subject');
 
   let actor: ResolvedToken | null = null;
   if (actorToken) {
     actor = await resolveToken(deps, actorToken, 'actor', maxDepth);
     if (actor.clientId !== client.clientId) return reject('actor_token was not issued to this client');
+    requireKeyPossession(actor, 'actor');
   }
 
   // -- delegation policy and act chain --
