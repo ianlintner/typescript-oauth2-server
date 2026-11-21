@@ -26,6 +26,13 @@ test('persistent adapters need a valid URL and metrics require loopback binding'
   rejects({ ...prod, OAUTH2_STORAGE: 'postgres', OAUTH2_DATABASE_URL: 'postgres://user:pass@localhost/db', OAUTH2_METRICS_ENABLED: '1', OAUTH2_HOST: '0.0.0.0' }, /OAUTH2_METRICS_ENABLED/);
 });
 
+test('client auth rate limit defaults and bounds', () => {
+  assert.deepEqual(loadConfig(dev).clientAuthLimit, { maxFailures: 10, windowSeconds: 300 });
+  assert.deepEqual(loadConfig({ ...dev, OAUTH2_CLIENT_AUTH_MAX_FAILURES: '5', OAUTH2_CLIENT_AUTH_WINDOW_SECONDS: '60' }).clientAuthLimit, { maxFailures: 5, windowSeconds: 60 });
+  rejects({ ...dev, OAUTH2_CLIENT_AUTH_MAX_FAILURES: '0' }, /OAUTH2_CLIENT_AUTH_MAX_FAILURES/);
+  rejects({ ...dev, OAUTH2_CLIENT_AUTH_WINDOW_SECONDS: 'abc' }, /OAUTH2_CLIENT_AUTH_WINDOW_SECONDS/);
+});
+
 function rejects(env: Record<string, string | undefined>, pattern: RegExp) {
   assert.throws(() => loadConfig(env), (e) => e instanceof ConfigError && pattern.test(e.message));
 }

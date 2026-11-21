@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS dpop_proofs (
   key TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS trusted_issuers (
   id TEXT PRIMARY KEY,
   issuer TEXT NOT NULL UNIQUE,
@@ -430,6 +435,23 @@ const ops = {
     return Number(db.prepare('INSERT OR IGNORE INTO dpop_proofs (key, expires_at) VALUES (?, ?)').run(key, expiresAt).changes) === 1;
   },
 
+  rateLimitCount(db: DatabaseSync, key: string, now: number): number {
+    const row = db.prepare('SELECT count FROM rate_limits WHERE key = ? AND expires_at > ?').get(key, now) as { count: number } | undefined;
+    return row ? Number(row.count) : 0;
+  },
+
+  // One upsert statement: the database serialises concurrent hits across connections and processes.
+  rateLimitHit(db: DatabaseSync, key: string, windowSeconds: number, now: number): number {
+    const row = db.prepare(
+      `INSERT INTO rate_limits (key, count, expires_at) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         count = CASE WHEN rate_limits.expires_at > ? THEN rate_limits.count + 1 ELSE 1 END,
+         expires_at = CASE WHEN rate_limits.expires_at > ? THEN rate_limits.expires_at ELSE excluded.expires_at END
+       RETURNING count`,
+    ).get(key, now + windowSeconds, now, now) as { count: number };
+    return Number(row.count);
+  },
+
   consumeRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
     // First, check if this token exists and its state (without marking).
     const existing = db.prepare(
@@ -611,6 +633,12 @@ class TxStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
+  rateLimitCount(key: string, now: number): Promise<number> {
+    return this.#use((db) => ops.rateLimitCount(db, key, now));
+  }
+  rateLimitHit(key: string, windowSeconds: number, now: number): Promise<number> {
+    return this.#use((db) => ops.rateLimitHit(db, key, windowSeconds, now));
+  }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#use((db) => ops.revokeTokenFamily(db, family, now));
   }
@@ -753,6 +781,12 @@ export class SqliteStore implements Store {
   }
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
+  }
+  rateLimitCount(key: string, now: number): Promise<number> {
+    return this.#enqueue((db) => ops.rateLimitCount(db, key, now));
+  }
+  rateLimitHit(key: string, windowSeconds: number, now: number): Promise<number> {
+    return this.#enqueue((db) => ops.rateLimitHit(db, key, windowSeconds, now));
   }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));

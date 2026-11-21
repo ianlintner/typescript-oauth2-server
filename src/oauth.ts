@@ -22,6 +22,8 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** Invalid-client rate limit; defaults to DEFAULT_CLIENT_AUTH_LIMIT. */
+  clientAuthLimit?: { maxFailures: number; windowSeconds: number } | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -87,7 +89,8 @@ export function rejectDuplicates(params: URLSearchParams): void {
 function redirectTo(reply: FastifyReply, redirectUri: string, params: Record<string, string | undefined>) {
   const url = new URL(redirectUri);
   for (const [key, value] of Object.entries(params)) if (value !== undefined) url.searchParams.set(key, value);
-  return reply.status(302).header('location', url.toString()).send();
+  // RFC 9700 §4.2.4/§4.12: keep the code/error out of Referer headers and caches.
+  return reply.status(302).header('location', url.toString()).header('referrer-policy', 'no-referrer').header('cache-control', 'no-store').send();
 }
 
 /**
@@ -173,7 +176,56 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   return client;
 }
 
+/** Invalid-client rate limit defaults (RFC 9700 §4.2): 10 failures per client per 5-minute fixed window. */
+export const DEFAULT_CLIENT_AUTH_LIMIT = { maxFailures: 10, windowSeconds: 300 } as const;
+
+/** Best-effort client identifier a request claims, used only to key the failure counter. Never trusted for auth. */
+function claimedClientId(req: FastifyRequest, form: URLSearchParams): string | undefined {
+  try {
+    const assertion = single(form, 'client_assertion');
+    if (assertion !== undefined) {
+      const iss = (JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8')) as Record<string, unknown>).iss;
+      return typeof iss === 'string' && iss !== '' ? iss : undefined;
+    }
+    const header = req.headers.authorization;
+    const m = header === undefined ? null : /^Basic ([A-Za-z0-9+/=]+)$/i.exec(header);
+    if (m) {
+      const decoded = Buffer.from(m[1]!, 'base64').toString('utf8');
+      const sep = decoded.indexOf(':');
+      return sep < 0 ? undefined : formDecode(decoded.slice(0, sep)) || undefined;
+    }
+    return single(form, 'client_id');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Per-client invalid-client rate limiting (RFC 9700 §4.2). Failed authentications
+ * (invalid_client) are counted in the shared Store, so the limit holds across
+ * processes and restarts; successes are never counted. Once a client has hit the
+ * limit in the current window every attempt, including one with correct
+ * credentials, is refused with 429 + Retry-After until the window elapses. The
+ * store is consulted before any credential check, and a store error fails closed.
+ */
 export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
+  const limit = deps.clientAuthLimit ?? DEFAULT_CLIENT_AUTH_LIMIT;
+  const id = claimedClientId(req, form);
+  const key = id === undefined ? undefined : `cauth:${createHash('sha256').update(id).digest('base64url')}`;
+  if (key !== undefined && await deps.store.rateLimitCount(key, deps.clock.now()) >= limit.maxFailures) {
+    throw new OAuthError('temporarily_unavailable', 'too many failed client authentication attempts', limit.windowSeconds);
+  }
+  try {
+    return await authenticateClientUncounted(deps, req, form);
+  } catch (err) {
+    if (key !== undefined && err instanceof OAuthError && err.code === 'invalid_client') {
+      await deps.store.rateLimitHit(key, limit.windowSeconds, deps.clock.now());
+    }
+    throw err;
+  }
+}
+
+async function authenticateClientUncounted(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
   const assertionType = single(form, 'client_assertion_type');

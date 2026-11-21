@@ -138,6 +138,12 @@ for (const [name, make] of factories) {
       assert.equal(await a.getRefreshToken(`child-${id}`, 1001), null);
       assert.deepEqual(await Promise.all([a.consumeDpopJti(proof, 2000, 1000), b.consumeDpopJti(proof, 2000, 1000)]).then(x => x.sort()), [false, true]);
       assert.equal(await b.consumeDpopJti(proof, 3000, 2000), true);
+      const rl = `rl-${id}`;
+      assert.equal(await a.rateLimitCount(rl, 1000), 0);
+      assert.deepEqual(await Promise.all([a.rateLimitHit(rl, 60, 1000), b.rateLimitHit(rl, 60, 1000)]).then(x => x.sort()), [1, 2]);
+      assert.equal(await b.rateLimitCount(rl, 1059), 2);
+      assert.equal(await a.rateLimitCount(rl, 1060), 0);
+      assert.equal(await a.rateLimitHit(rl, 60, 1060), 1);
     } finally { await a.close(); await b.close(); }
   });
 }
