@@ -1,3 +1,4 @@
+import { createPublicKey, type webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { hashClientSecret } from '../client-auth.js';
@@ -103,7 +104,8 @@ function strArray(o: Obj, key: string, where: string, opts: { min?: number } = {
  */
 const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'] as const;
 const PUBLIC_JWK_MEMBERS = ['kty', 'kid', 'use', 'alg', 'key_ops', 'x5c', 'x5t', 'x5t#S256', 'x5u', 'crv', 'x', 'y', 'n', 'e'];
-const EC_CURVES = new Set(['P-256', 'P-384', 'P-521']);
+const EC_COORDINATE_BYTES: Record<string, number> = { 'P-256': 32, 'P-384': 48, 'P-521': 66 };
+const EC_CURVES = new Set(Object.keys(EC_COORDINATE_BYTES));
 const MIN_RSA_MODULUS_BYTES = 256; // RFC 7518 §3.3: RSA keys of at least 2048 bits
 
 function isBase64Url(v: unknown, minBytes = 1): boolean {
@@ -127,11 +129,28 @@ function checkVerificationKey(k: Obj, where: string): Obj {
     if (typeof k.crv !== 'string' || !EC_CURVES.has(k.crv)) fail(`${where}: EC key needs crv P-256, P-384 or P-521`);
     // The reference accepts RS/ES/PS for assertions; these are the EC curves we can actually verify against.
     if (!isBase64Url(k.x, 1) || !isBase64Url(k.y, 1)) fail(`${where}: EC key needs base64url x and y`);
+    // RFC 7518 §6.2.1.2/3: coordinates are the full curve field size, zero-padded.
+    const size = EC_COORDINATE_BYTES[k.crv] as number;
+    if (Buffer.from(k.x as string, 'base64url').byteLength !== size || Buffer.from(k.y as string, 'base64url').byteLength !== size) {
+      fail(`${where}: EC ${k.crv} x and y must be ${size} bytes`);
+    }
   } else if (kty === 'RSA') {
     if (!isBase64Url(k.n, MIN_RSA_MODULUS_BYTES)) fail(`${where}: RSA key needs n of at least 2048 bits`);
     if (!isBase64Url(k.e)) fail(`${where}: RSA key needs base64url e`);
+    // Node's JWK import does not validate RSA parameters: reject a zero/even modulus or an unusable exponent here.
+    const n = Buffer.from(k.n as string, 'base64url');
+    const e = Buffer.from(k.e as string, 'base64url');
+    if (n[0] === 0 || (n[n.length - 1]! & 1) === 0) fail(`${where}: RSA n must be an odd modulus with no leading zero bytes`);
+    if (e.every((b) => b === 0) || (e[e.length - 1]! & 1) === 0 || (e.length === 1 && e[0] === 1)) fail(`${where}: RSA e must be an odd exponent of at least 3`);
   } else {
     fail(`${where}: unsupported kty ${JSON.stringify(kty)} (only EC and RSA are verification keys)`);
+  }
+  // A real import catches what the shape checks cannot (off-curve points, unusable RSA parameters):
+  // such a key would pass startup and then silently fail every assertion.
+  try {
+    createPublicKey({ key: k as unknown as webcrypto.JsonWebKey, format: 'jwk' });
+  } catch {
+    fail(`${where}: not a valid public key (cannot be imported)`);
   }
   if (k.alg !== undefined && (typeof k.alg !== 'string' || !ALG_RE.test(k.alg))) fail(`${where}: alg is not a recognized JWS algorithm`);
   if (k.use !== undefined && k.use !== 'sig') fail(`${where}: use must be "sig"`);

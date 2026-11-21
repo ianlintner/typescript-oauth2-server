@@ -161,11 +161,17 @@ test('private_key_jwt jwks entries must be public verification keys', () => {
   rejects((s) => { s.clients = [pkj([{ ...rsa, d: 'dGVzdA' }])]; }, /private|secret|must not/i);
   rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k3', k: 'c2VjcmV0' }])]; }, /symmetric|oct|must not|kty/i);
   // Malformed verification keys could never verify an assertion: reject at startup, not at first client auth.
-  rejects((s) => { s.clients = [pkj([{}])]; }, /jwks/i);
-  rejects((s) => { s.clients = [pkj([{ kid: 'nokty' }])]; }, /jwks|kty/i);
-  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'bad', crv: 'P-256', x: 'not-base64', y: 'also-not' }])]; }, /jwks|key/i);
-  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'nomaterial' }])]; }, /jwks|key/i);
-  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k4' }])]; }, /jwks|kty/i);
+  rejects((s) => { s.clients = [pkj([{}])]; }, /unsupported kty undefined/);
+  rejects((s) => { s.clients = [pkj([{ kid: 'nokty' }])]; }, /unsupported kty undefined/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'bad', crv: 'P-256', x: 'not-base64', y: 'also-not' }])]; }, /EC key needs base64url x and y/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'nomaterial' }])]; }, /EC key needs crv/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k4' }])]; }, /symmetric key cannot be/);
+  // Structurally plausible but cryptographically unusable keys are refused by a real import.
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'short', crv: 'P-256', x: 'AA', y: 'AA' }])]; }, /EC P-256 x and y must be 32 bytes/);
+  rejects((s) => { s.clients = [pkj([{ ...ec, y: ec.x.replace(/.$/, 'A') }])]; }, /not a valid public key \(cannot be imported\)/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'RSA', kid: 'junk', n: 'A'.repeat(342), e: 'AQAB' }])]; }, /RSA n must be an odd modulus/);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, n: rsa.n.replace(/.$/, 'A') }])]; }, /RSA n must be an odd modulus/);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, e: 'AQ' }])]; }, /RSA e must be an odd exponent/);
 });
 
 test('private_key_jwt seed clients require a nonempty jwks and jwks is rejected elsewhere', () => {
