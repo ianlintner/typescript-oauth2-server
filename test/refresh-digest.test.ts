@@ -204,3 +204,21 @@ test('document store: rotation lineage, replay, revoke and legacy purge on diges
   assert.equal(await store.countLegacyRefreshTokens(), 0);
   assert.equal((await store.docs.list('refresh')).length, 3); // a, b, c remain
 });
+
+test('concurrent rotation and replay of one token leaves no usable token in the family', async () => {
+  const s = await setup();
+  try {
+    const rt1 = await issue(s.server);
+    // Rotation is one store transaction, so the replay is serialized after it: it sees the
+    // consumed parent and revokes the whole grant, including the replacement just issued.
+    const [a, b] = await Promise.all([refresh(s.server, rt1), refresh(s.server, rt1)]);
+    const statuses = [a.statusCode, b.statusCode].sort();
+    assert.deepEqual(statuses, [200, 400], 'exactly one presentation wins the rotation');
+    const db = s.raw();
+    const live = db.prepare('SELECT COUNT(*) AS n FROM refresh_tokens WHERE revoked_at IS NULL AND revoked_by_replay_at IS NULL').get() as unknown as { n: number };
+    db.close();
+    assert.equal(live.n, 0, 'no usable refresh token remains in the family');
+    const winner = a.statusCode === 200 ? a : b;
+    assert.equal((await refresh(s.server, winner.json().refresh_token as string)).statusCode, 400, 'replacement is unusable');
+  } finally { await s.cleanup(); }
+});
