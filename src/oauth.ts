@@ -747,7 +747,11 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const jkt = proofJkt;
 
       const consumed = await deps.store.consumeRefreshToken(presentedId, deps.clock.now());
-      if (!consumed) throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
+      if (!consumed) {
+        // The token passed the lookup but could not be consumed: another request already used it.
+        await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
+        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
+      }
 
       // Check replay: if the family was revoked by replay, fail.
       if (consumed.revokedByReplayAt !== null) throw new OAuthError('invalid_grant');
@@ -766,6 +770,25 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const scopesList = allowedScope ? allowedScope.split(' ') : [];
       const includesOpenid = scopesList.includes('openid');
 
+      const newRtValue = deps.random.token(24);
+      const newRtId = refreshTokenId(newRtValue);
+      await deps.store.saveRefreshToken({
+        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
+        scope: allowedScope, expiresAt: iat + refreshTtl,
+        family: consumed.family,
+        parentJti: consumed.jti,
+        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+      });
+
+      // Rotation vs. replay race: a concurrent replay may revoke the family after this request
+      // consumed the parent but before the replacement above existed, so the revocation missed it.
+      // Revocation always marks the (consumed) parent, so a revoked parent here means we lost the
+      // race: kill the replacement and fail closed without issuing any token.
+      if (!(await deps.store.getRefreshToken(consumed.jti, deps.clock.now()))) {
+        await deps.store.revokeRefreshToken(newRtId, deps.clock.now());
+        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
+      }
+
       const atJti = deps.random.token(16);
       const claims: Record<string, unknown> = {
         iss: deps.issuer,
@@ -783,16 +806,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: consumed.subject,
         scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-      });
-
-      const newRtValue = deps.random.token(24);
-      const newRtId = refreshTokenId(newRtValue);
-      await deps.store.saveRefreshToken({
-        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
-        scope: allowedScope, expiresAt: iat + refreshTtl,
-        family: consumed.family,
-        parentJti: consumed.jti,
-        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
       });
 
       const body: Record<string, unknown> = {

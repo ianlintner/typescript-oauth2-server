@@ -460,26 +460,8 @@ const ops = {
     ).get(now, jti, now) as unknown as RefreshTokenRow | undefined;
     if (!r) return null;
 
-    // Check for sibling replay: if another token in this family was already consumed
-    // that is NOT the direct parent (parent consumption is legitimate — it happened
-    // during the prior rotation), this is a replay attack by a stale bearer.
-    const parentJti = r.parent_jti;
-    const sibling = db.prepare(
-      `SELECT jti FROM refresh_tokens
-       WHERE family = ? AND jti != ? AND consumed_at IS NOT NULL
-         AND (? IS NULL OR jti != ?)
-         AND revoked_at IS NULL AND revoked_by_replay_at IS NULL
-       LIMIT 1`,
-    ).get(r.family, r.jti, parentJti, parentJti) as { jti: string } | undefined;
-
-    if (sibling) {
-      // Replay attack: revoke the entire family.
-      db.prepare(
-        `UPDATE refresh_tokens SET revoked_by_replay_at = ?
-         WHERE family = ? AND revoked_by_replay_at IS NULL AND revoked_at IS NULL`,
-      ).run(now, r.family);
-    }
-
+    // Ancestors of a rotated token are always consumed, so only the presented
+    // token's own consumed state signals a replay (handled above).
     return rowToRefreshToken(r);
   },
 
