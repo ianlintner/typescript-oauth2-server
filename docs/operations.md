@@ -10,7 +10,7 @@ For local parity tests, start disposable PostgreSQL and MongoDB replica-set inst
 
 ## Refresh-token digest cutover (storage format `rt1`)
 
-**Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier, `family` and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client, and every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.
+**Breaking change.** Refresh tokens are bearer credentials. They are no longer stored: the store identifier (`jti`) and `parentJti` hold `rt1.` + a domain-separated SHA-256 digest (base64url) of the value given to the client. `family` is a separate grant identifier shared by every token of one grant (the authorization-code hash, or a fresh id for a device grant); it is not a digest of any refresh token. Every lookup, rotation, replay check and revocation hashes the presented value first. The digest is a non-recoverable verifier. Nothing here changes client-secret handling, and signing keys are untouched.
 
 **What invalidates.** Rows written by earlier builds are keyed by the raw token. They can never match a lookup in this build, so every previously issued refresh token stops working and affected users/clients must re-authorize (session reset). Newly issued tokens keep the same wire format, rotation, replay-detection, DPoP-binding and revocation behavior. There is no legacy fallback.
 

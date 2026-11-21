@@ -113,6 +113,8 @@ export interface AccessTokenRecord {
   revokedAt: number | null;
   /** JWT token hash for lookup. Null for opaque tokens. */
   tokenHash: string | null;
+  /** Identifier of the authorization grant this token descends from. Absent/null for tokens issued before grants were recorded. */
+  grant?: string | null;
 }
 
 export interface RefreshTokenRecord {
@@ -196,10 +198,13 @@ export interface Store {
   /** Mark a refresh token revoked (no-op for unknown). */
   revokeRefreshToken(jti: string, now: number): Promise<boolean>;
   /**
-   * Revoke the entire family (all tokens in the same family that are not
-   * already revoked). Call on replay detection.
+   * Revoke every live access token and refresh token of one grant. A refresh
+   * token's `family` is its grant identifier. Tokens without a recorded grant
+   * are never affected. When `clientId` is given only that client's tokens are
+   * revoked. Returns the number of refresh tokens revoked. Run it inside the
+   * same transaction as the event that triggers it.
    */
-  revokeTokenFamily(family: string, now: number): Promise<number>;
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number>;
   /**
    * Cutover support (operator-initiated only, never called on startup): count
    * refresh-token rows whose identifier is not in the current digest format
