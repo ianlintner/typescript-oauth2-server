@@ -12,3 +12,8 @@ scripts/conformance-run.sh:generic-api-key:46
 
 # Same fake secret, historical commit (line moved from 45 to 46 upstream).
 7015193485a2e060ff37053d1ac8d3c3390aa6d1:scripts/conformance-run.sh:generic-api-key:45
+
+# Sibling PR #45 (RFC 8705), commit 50b8249, docs/mtls.md line 18: documentation
+# prose flagged by the entropy heuristic, not a credential. Reworded in later
+# commits, but that commit stays reachable and the Security job scans all refs.
+50b824980acac440615158bd157fe40b6054a008:docs/mtls.md:generic-api-key:18
