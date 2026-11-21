@@ -497,6 +497,19 @@ test('repeated ignored front-channel parameters do not affect a pushed request',
   await s.server.close();
 });
 
+test('an empty request_uri is treated as an ordinary request for duplicate rejection', async () => {
+  const s = await setup();
+  const res = await s.server.inject({
+    method: 'GET',
+    url: `/oauth/authorize?request_uri=&response_type=code&client_id=conf&redirect_uri=${encodeURIComponent(CB)}`
+      + `&code_challenge=${CHALLENGE}&code_challenge_method=S256&foo=a&foo=b`,
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_request');
+  assert.equal(res.headers.location, undefined);
+  await s.server.close();
+});
+
 test('a denied pushed request does not consume the request_uri', async () => {
   const s = await setup();
   const push = await pushPar(s, {

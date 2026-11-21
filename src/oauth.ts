@@ -479,13 +479,15 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     // parameters supply client_id and redirect_uri; fields present on the GET are
     // ignored (RFC 9126 §2/§3). Only request_uri and client_id are read from the GET,
     // so only those are checked for repetition when a request_uri is present.
-    if (params.has('request_uri')) {
-      single(params, 'request_uri');
+    // `single` treats an empty value as absent, so an empty request_uri is an ordinary
+    // authorization request; decide from that one value so the duplicate policy cannot
+    // diverge from the branch that actually processes the request.
+    const requestUri = single(params, 'request_uri');
+    if (requestUri !== undefined) {
       single(params, 'client_id');
     } else {
       rejectDuplicates(params);
     }
-    const requestUri = single(params, 'request_uri');
     let parClientId: string | undefined;
     let parRedirectUri: string | undefined;
     if (requestUri !== undefined) {
