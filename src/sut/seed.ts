@@ -92,6 +92,53 @@ function strArray(o: Obj, key: string, where: string, opts: { min?: number } = {
   return v as string[];
 }
 
+/**
+ * A seed jwks entry is persisted as client metadata and later handed to the
+ * verifier, so it must be a complete *public* verification key:
+ *  - no private or symmetric material (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`, `k`),
+ *  - a public asymmetric kty (never `oct`),
+ *  - the public parameters the verifier needs (RFC 7518 §6.2 EC / §6.3 RSA).
+ * Anything else would either leak a secret into storage or pass startup and then
+ * silently fail every client assertion, so both cases fail here.
+ */
+const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'] as const;
+const PUBLIC_JWK_MEMBERS = ['kty', 'kid', 'use', 'alg', 'key_ops', 'x5c', 'x5t', 'x5t#S256', 'x5u', 'crv', 'x', 'y', 'n', 'e'];
+const EC_CURVES = new Set(['P-256', 'P-384', 'P-521']);
+const MIN_RSA_MODULUS_BYTES = 256; // RFC 7518 §3.3: RSA keys of at least 2048 bits
+
+function isBase64Url(v: unknown, minBytes = 1): boolean {
+  if (typeof v !== 'string' || v === '' || !/^[A-Za-z0-9_-]+$/.test(v)) return false;
+  const decoded = Buffer.from(v, 'base64url');
+  return decoded.byteLength >= minBytes && decoded.toString('base64url').replace(/=+$/, '') === v.replace(/=+$/, '');
+}
+
+function checkVerificationKey(k: Obj, where: string): Obj {
+  for (const member of PRIVATE_JWK_MEMBERS) {
+    if (k[member] !== undefined) {
+      fail(`${where}: must carry public key material only (${JSON.stringify(member)} is private or symmetric)`);
+    }
+  }
+  for (const member of Object.keys(k)) {
+    if (!PUBLIC_JWK_MEMBERS.includes(member)) fail(`${where}: unknown property ${JSON.stringify(member)}`);
+  }
+  const kty = k.kty;
+  if (kty === 'oct') fail(`${where}: a symmetric key cannot be a client assertion verification key`);
+  if (kty === 'EC') {
+    if (typeof k.crv !== 'string' || !EC_CURVES.has(k.crv)) fail(`${where}: EC key needs crv P-256, P-384 or P-521`);
+    // The reference accepts RS/ES/PS for assertions; these are the EC curves we can actually verify against.
+    if (!isBase64Url(k.x, 1) || !isBase64Url(k.y, 1)) fail(`${where}: EC key needs base64url x and y`);
+  } else if (kty === 'RSA') {
+    if (!isBase64Url(k.n, MIN_RSA_MODULUS_BYTES)) fail(`${where}: RSA key needs n of at least 2048 bits`);
+    if (!isBase64Url(k.e)) fail(`${where}: RSA key needs base64url e`);
+  } else {
+    fail(`${where}: unsupported kty ${JSON.stringify(kty)} (only EC and RSA are verification keys)`);
+  }
+  if (k.alg !== undefined && (typeof k.alg !== 'string' || !ALG_RE.test(k.alg))) fail(`${where}: alg is not a recognized JWS algorithm`);
+  if (k.use !== undefined && k.use !== 'sig') fail(`${where}: use must be "sig"`);
+  if (k.kid !== undefined && (typeof k.kid !== 'string' || k.kid === '')) fail(`${where}: kid must be a nonempty string`);
+  return k;
+}
+
 function parseClient(raw: unknown, index: number): SeedClient {
   const at = `clients[${index}]`;
   const c = obj(raw, at);
@@ -113,7 +160,7 @@ function parseClient(raw: unknown, index: number): SeedClient {
     if (!isObj(raw) || !Array.isArray(raw.keys) || raw.keys.length === 0 || !raw.keys.every(isObj)) {
       fail(`${where}: private_key_jwt needs jwks with at least one key`);
     }
-    jwks = { keys: raw.keys as Obj[] };
+    jwks = { keys: raw.keys.map((key, i) => checkVerificationKey(obj(key, `${where}: jwks.keys[${i}]`), `${where}: jwks.keys[${i}]`)) };
   } else if (c.jwks !== undefined) {
     fail(`${where}: jwks is only valid with token_endpoint_auth_method private_key_jwt`);
   } else if (isPublic) {

@@ -150,6 +150,24 @@ test('a private_key_jwt seed client keeps its public jwks and needs no secret', 
   await store.close();
 });
 
+test('private_key_jwt jwks entries must be public verification keys', () => {
+  const pkj = (keys: unknown[]) => ({ client_id: 'k', token_endpoint_auth_method: 'private_key_jwt', redirect_uris: ['https://a.example/cb'], jwks: { keys } });
+  const ec = { kty: 'EC', kid: 'k1', crv: 'P-256', x: 'MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4', y: '4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM', alg: 'ES256' };
+  const rsa = { kty: 'RSA', kid: 'k2', n: 'sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS8exSZEy_c4gs_7svlJJQ4H9_NxsiIoLwAEk7-Q3UXERGYw_75IDrGA84-lA_-Ct4eTlXHBIY2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU7-VTdL1VbC2tejvcI2BlMkEpk1BzBZI0KQB0GaDWFLN-aEAw3vRw', e: 'AQAB', alg: 'RS256' };
+  const ok = parseSeed(JSON.stringify({ issuer: 'http://localhost:8080', clients: [pkj([ec, rsa])], users: [{ username: 'u', password: 'p' }] }));
+  assert.equal(ok.clients[0]?.jwks?.keys.length, 2);
+  // Private (EC/RSA `d`, symmetric `k`) key material must never be persisted as client metadata.
+  rejects((s) => { s.clients = [pkj([{ ...ec, d: '0oRkRvQSYW09dVQpXUOrYcXVdZea3p1s4XDsC2Y0Yd8' }])]; }, /private|secret|must not/i);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, d: 'dGVzdA' }])]; }, /private|secret|must not/i);
+  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k3', k: 'c2VjcmV0' }])]; }, /symmetric|oct|must not|kty/i);
+  // Malformed verification keys could never verify an assertion: reject at startup, not at first client auth.
+  rejects((s) => { s.clients = [pkj([{}])]; }, /jwks/i);
+  rejects((s) => { s.clients = [pkj([{ kid: 'nokty' }])]; }, /jwks|kty/i);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'bad', crv: 'P-256', x: 'not-base64', y: 'also-not' }])]; }, /jwks|key/i);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'nomaterial' }])]; }, /jwks|key/i);
+  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k4' }])]; }, /jwks|kty/i);
+});
+
 test('private_key_jwt seed clients require a nonempty jwks and jwks is rejected elsewhere', () => {
   const pkj = { client_id: 'k', token_endpoint_auth_method: 'private_key_jwt', redirect_uris: ['https://a.example/cb'] };
   rejects((s) => { s.clients = [pkj]; }, /jwks/);
