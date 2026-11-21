@@ -56,7 +56,13 @@ test('logout is bounded independently of userinfo', async () => {
   const logout = await s.server.inject({ method: 'GET', url: '/oauth/logout' });
   assert.equal(logout.statusCode, 400);
   for (let i = 0; i < BOUNDED_REQUESTS_PER_SOURCE; i += 1) await s.server.inject({ method: 'GET', url: '/oauth/logout' });
-  assert.equal((await s.server.inject({ method: 'GET', url: '/oauth/logout' })).statusCode, 429);
+  const refused = await s.server.inject({ method: 'GET', url: '/oauth/logout' });
+  assert.equal(refused.statusCode, 429);
+  assert.equal((refused.json() as { error: string }).error, 'temporarily_unavailable');
+  // Routes sharing the server that are not bounded are unaffected.
+  for (let i = 0; i < BOUNDED_REQUESTS_PER_SOURCE * 2; i += 1) {
+    assert.equal((await s.server.inject({ method: 'GET', url: '/health' })).statusCode, 200);
+  }
 });
 
 test('unbounded routes and the disabled limiter are never refused', async () => {

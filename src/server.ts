@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyPluginAsync, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
 import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant.js';
@@ -37,20 +37,19 @@ export interface Deps {
   trace?: ((name: string) => () => void) | undefined;
 }
 
-/** Everything a request handler closes over except the end-session hook, which Fastify cannot prebind. */
-export interface OAuthRouteDeps extends Omit<Deps, 'endSession'> {
-  authTime?: OAuthDeps['authTime'] | undefined;
-  endSession?: OAuthDeps['endSession'] | undefined;
-}
+/** Dependencies the OAuth/OIDC plugin closes over: the server's dependency set as a whole. */
+export type OAuthRouteDeps = Deps;
 
 /**
- * Registers the OAuth/OIDC routes on an existing instance, with the request bounds attached first
- * so that every route they own (including /oauth/userinfo and /oauth/logout) is bounded.
+ * The OAuth/OIDC routes plus the per-source request bounds on the work they do. Kept as one plugin,
+ * registered on `app` by {@link buildServer}, so the onRequest bound and the routes it covers always
+ * share an instance and registration scope: the handler checks the path, so nothing outside these
+ * routes is affected.
  */
-export function oauthRoutes(app: FastifyInstance, deps: OAuthRouteDeps): void {
-  if (deps.rateLimit !== false) registerRouteBounds(app, new RouteBounds(), deps.clock);
-  registerOAuthRoutes(app, deps);
-}
+export const oauthRoutes: FastifyPluginAsync<OAuthRouteDeps> = async (instance, deps) => {
+  if (deps.rateLimit !== false) registerRouteBounds(instance, new RouteBounds(), deps.clock);
+  registerOAuthRoutes(instance, deps);
+};
 
 export function buildServer(deps: Deps): FastifyInstance {
   const app = Fastify({ logger: false });
