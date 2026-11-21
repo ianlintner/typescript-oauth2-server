@@ -48,5 +48,5 @@ export const failureKey = {
 export const creationKey = (kind: 'par' | 'device', req: FastifyRequest): string => `create:${kind}:${req.ip}`;
 
 export function tooManyRequests(resetAt: number, now: number): OAuthError {
-  return new OAuthError('temporarily_unavailable', 'too many requests', Math.max(1, resetAt - now));
+  return new OAuthError('temporarily_unavailable', 'too many requests', { retryAfter: Math.max(1, resetAt - now) });
 }

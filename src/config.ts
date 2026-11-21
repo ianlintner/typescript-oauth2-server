@@ -22,6 +22,8 @@ export interface Config {
   adminToken: string | undefined;
   /** Seconds between expired-record sweeps; 0 disables the scheduled sweep. */
   sweepIntervalSeconds: number;
+  /** RFC 9449 §8 DPoP nonces: 'off' (default) or 'required' (every proof must carry a server nonce). */
+  dpopNonce: 'off' | 'required';
 }
 
 type Env = Record<string, string | undefined>;
@@ -120,6 +122,9 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  const dpopNonce = env.OAUTH2_DPOP_NONCE ?? 'off';
+  if (dpopNonce !== 'off' && dpopNonce !== 'required') throw new ConfigError('OAUTH2_DPOP_NONCE must be off or required');
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -149,5 +154,6 @@ export function loadConfig(env: Env): Config {
     signingKeyId,
     adminToken,
     sweepIntervalSeconds,
+    dpopNonce,
   };
 }
