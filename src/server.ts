@@ -32,10 +32,16 @@ export interface Deps {
   adminToken?: string | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
+  /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
+  throttle?: OAuthDeps['throttle'] | undefined;
+  /** Maximum request body in bytes (default 64 KiB; Fastify's own default is 1 MiB). */
+  bodyLimit?: number | undefined;
 }
 
+const DEFAULT_BODY_LIMIT = 64 * 1024;
+
 export function buildServer(deps: Deps): FastifyInstance {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, bodyLimit: deps.bodyLimit ?? DEFAULT_BODY_LIMIT });
 
   if (deps.metrics || deps.trace) {
     const starts = new WeakMap<object, { time: number; finish: (() => void) | undefined }>();
@@ -95,6 +101,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     issuer: deps.issuer,
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
+    throttle: deps.throttle,
     registrationPolicy: deps.registrationPolicy,
   });
 

@@ -1,3 +1,5 @@
+import { DEFAULT_SWEEP_INTERVAL_SECONDS } from './sweep.js';
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -18,6 +20,8 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** Seconds between expired-record sweeps; 0 disables the scheduled sweep. */
+  sweepIntervalSeconds: number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -125,6 +129,12 @@ export function loadConfig(env: Env): Config {
     databasePath = ':memory:';
   }
 
+  let sweepIntervalSeconds = DEFAULT_SWEEP_INTERVAL_SECONDS;
+  if (env.OAUTH2_SWEEP_INTERVAL_SECONDS !== undefined) {
+    if (!/^\d{1,7}$/.test(env.OAUTH2_SWEEP_INTERVAL_SECONDS)) throw new ConfigError('OAUTH2_SWEEP_INTERVAL_SECONDS must be a non-negative integer');
+    sweepIntervalSeconds = Number(env.OAUTH2_SWEEP_INTERVAL_SECONDS);
+  }
+
   return {
     env: mode,
     issuer,
@@ -138,5 +148,6 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    sweepIntervalSeconds,
   };
 }
