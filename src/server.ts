@@ -21,6 +21,8 @@ export interface Deps {
   refreshTokenTtl?: number | undefined;
   /** Per-source request bounds on /oauth/userinfo and /oauth/logout. On by default; `false` disables. */
   rateLimit?: boolean | undefined;
+  /** RFC 9449 §8 server-provided DPoP nonces; absent disables them. */
+  dpopNonce?: OAuthDeps['dpopNonce'] | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
   dynamicRegistration?: boolean | undefined;
   /** Allow-lists (grant types, scopes, redirect schemes) and optional initial access token for registration. */

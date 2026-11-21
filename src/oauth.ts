@@ -3,7 +3,7 @@ import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
-import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
+import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceConfig } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
@@ -22,6 +22,8 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
+  dpopNonce?: DpopNonceConfig | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -583,6 +585,18 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
   });
 
+  // RFC 9449 §8.2: hand the client the current nonce on every successful DPoP response so it can stay ahead of rotation.
+  if (deps.dpopNonce) {
+    const nonceCfg = deps.dpopNonce;
+    app.addHook('onSend', async (req, reply, payload) => {
+      const path = req.routeOptions.url;
+      if ((path === '/oauth/token' || path === '/oauth/userinfo') && req.headers.dpop !== undefined && reply.statusCode < 400 && !reply.hasHeader('dpop-nonce')) {
+        reply.header('dpop-nonce', issueDpopNonce(nonceCfg, deps.clock.now()));
+      }
+      return payload;
+    });
+  }
+
   app.post('/oauth/token', async (req, reply) => {
     const form = req.body;
     if (!(form instanceof URLSearchParams)) {
@@ -1014,9 +1028,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           return reply.status(401).header('www-authenticate', 'DPoP error="invalid_token"').send({ error: 'invalid_token' });
         }
       } catch (err) {
-        if (!(err instanceof OAuthError) || err.code !== 'invalid_dpop_proof') throw err;
-        return reply.status(401).header('www-authenticate', `DPoP error="invalid_dpop_proof", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
-          .send({ error: 'invalid_dpop_proof', ...(err.description ? { error_description: err.description } : {}) });
+        if (!(err instanceof OAuthError) || (err.code !== 'invalid_dpop_proof' && err.code !== 'use_dpop_nonce')) throw err;
+        if (err.dpopNonce !== undefined) reply.header('dpop-nonce', err.dpopNonce);
+        return reply.status(401).header('www-authenticate', `DPoP error="${err.code}", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
+          .send({ error: err.code, ...(err.description ? { error_description: err.description } : {}) });
       }
     }
 
