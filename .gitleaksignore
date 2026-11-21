@@ -13,7 +13,12 @@ scripts/conformance-run.sh:generic-api-key:46
 # Same fake secret, historical commit (line moved from 45 to 46 upstream).
 7015193485a2e060ff37053d1ac8d3c3390aa6d1:scripts/conformance-run.sh:generic-api-key:45
 
-# Sibling PR #45 (RFC 8705), commit 50b8249, docs/mtls.md line 18: documentation
-# prose flagged by the entropy heuristic, not a credential. Reworded in later
-# commits, but that commit stays reachable and the Security job scans all refs.
+# RFC 8705 mTLS PR #45 history, commit 50b8249, docs/mtls.md line 18: plain
+# documentation prose about rejected client certificates, flagged by the
+# generic-api-key entropy heuristic. It contains no credential. The line was
+# reworded in later commits, but 50b8249 stays reachable and the Security job scans all refs.
 50b824980acac440615158bd157fe40b6054a008:docs/mtls.md:generic-api-key:18
+
+# This file's own commit bc48502 quoted that prose in a comment (line 17), which
+# tripped the same heuristic; the comment is reworded, the old commit is ignored.
+bc485029a67bc61f91f5c8009ae2ac383ec04382:.gitleaksignore:generic-api-key:17
