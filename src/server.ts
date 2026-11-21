@@ -37,13 +37,23 @@ export interface Deps {
   trace?: ((name: string) => () => void) | undefined;
 }
 
+/** Everything a request handler closes over except the end-session hook, which Fastify cannot prebind. */
+export interface OAuthRouteDeps extends Omit<Deps, 'endSession'> {
+  authTime?: OAuthDeps['authTime'] | undefined;
+  endSession?: OAuthDeps['endSession'] | undefined;
+}
+
+/**
+ * Registers the OAuth/OIDC routes on an existing instance, with the request bounds attached first
+ * so that every route they own (including /oauth/userinfo and /oauth/logout) is bounded.
+ */
+export function oauthRoutes(app: FastifyInstance, deps: OAuthRouteDeps): void {
+  if (deps.rateLimit !== false) registerRouteBounds(app, new RouteBounds(), deps.clock);
+  registerOAuthRoutes(app, deps);
+}
+
 export function buildServer(deps: Deps): FastifyInstance {
   const app = Fastify({ logger: false });
-  const routeBounds = new RouteBounds();
-
-  // Before routing work: userinfo verifies a JWT on every call and logout may end a session, so
-  // both are bounded per source address (see BOUNDED_ROUTES).
-  if (deps.rateLimit !== false) registerRouteBounds(app, routeBounds, deps.clock);
 
   if (deps.metrics || deps.trace) {
     const starts = new WeakMap<object, { time: number; finish: (() => void) | undefined }>();
@@ -93,7 +103,7 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   if (deps.metrics) app.get('/metrics', async (_req, reply) => reply.type('text/plain; version=0.0.4').send(deps.metrics!.render()));
 
-  registerOAuthRoutes(app, deps);
+  oauthRoutes(app, deps);
 
   registerExtensionRoutes(app, {
     store: deps.store,
