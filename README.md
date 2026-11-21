@@ -26,6 +26,8 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
 
+Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. A replay racing the rotation that consumed the token also revokes the replacement, which is never returned to the client.
+
 ### Dynamic client registration policy
 
 Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a `registrationPolicy`. Every value a registrant supplies must appear on the matching allow-list, otherwise `POST` and `PUT /connect/register` return `invalid_client_metadata` or `invalid_redirect_uri`:
