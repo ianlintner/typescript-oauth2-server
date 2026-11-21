@@ -5,6 +5,7 @@ import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
+import { registerRouteBounds, RouteBounds } from './rate-limit.js';
 
 export interface Deps {
   store: Store;
@@ -19,6 +20,8 @@ export interface Deps {
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
+  /** Per-source request bounds on /oauth/userinfo and /oauth/logout. On by default; `false` disables. */
+  rateLimit?: boolean | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
   dynamicRegistration?: boolean | undefined;
   /** Allow-lists (grant types, scopes, redirect schemes) and optional initial access token for registration. */
@@ -36,6 +39,11 @@ export interface Deps {
 
 export function buildServer(deps: Deps): FastifyInstance {
   const app = Fastify({ logger: false });
+  const routeBounds = new RouteBounds();
+
+  // Before routing work: userinfo verifies a JWT on every call and logout may end a session, so
+  // both are bounded per source address (see BOUNDED_ROUTES).
+  if (deps.rateLimit !== false) registerRouteBounds(app, routeBounds, deps.clock);
 
   if (deps.metrics || deps.trace) {
     const starts = new WeakMap<object, { time: number; finish: (() => void) | undefined }>();
