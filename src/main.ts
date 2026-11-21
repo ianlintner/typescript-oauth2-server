@@ -60,6 +60,9 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     authTime: registry ? makeTestAuthTime(registry) : undefined,
     userClaims: registry ? (sub) => registry!.claimsFor(sub) : undefined,
     endSession: registry ? makeTestEndSession(registry) : undefined,
+    // Conformance mode is loopback-only with an in-memory store, so every scenario shares one source
+    // address; per-source limits would lock later scenarios out after the runner's repeated-failure cases.
+    throttle: mode.enabled ? false : undefined,
   });
   if (registry) registerTestLoginRoutes(server, registry);
 
