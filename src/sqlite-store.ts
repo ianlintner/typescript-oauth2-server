@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS clients (
   registration TEXT,
   token_endpoint_auth_method TEXT,
   jwks TEXT,
-  jwks_uri TEXT
+  jwks_uri TEXT,
+  resources TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -50,7 +51,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   consumed_at INTEGER,
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER,
-  dpop_jkt TEXT
+  dpop_jkt TEXT,
+  resource TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT PRIMARY KEY,
@@ -98,6 +100,7 @@ interface ClientRow {
   token_endpoint_auth_method: string | null;
   jwks: string | null;
   jwks_uri: string | null;
+  resources: string | null;
 }
 
 interface DeviceRow {
@@ -198,6 +201,7 @@ interface RefreshTokenRow {
   revoked_at: number | null;
   revoked_by_replay_at: number | null;
   dpop_jkt: string | null;
+  resource: string | null;
 }
 
 function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
@@ -224,6 +228,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     revokedByReplayAt: r.revoked_by_replay_at,
     revokedAt: r.revoked_at,
     dpopJkt: r.dpop_jkt,
+    resource: r.resource,
   };
 }
 
@@ -235,16 +240,18 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, resources)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
-         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri`,
+         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
+         resources=excluded.resources`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
       c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
+      c.resources && c.resources.length > 0 ? JSON.stringify(c.resources) : null,
     );
   },
 
@@ -326,6 +333,7 @@ const ops = {
       ...(r.token_endpoint_auth_method ? { tokenEndpointAuthMethod: r.token_endpoint_auth_method } : {}),
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
+      ...(r.resources ? { resources: JSON.parse(r.resources) as string[] } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
@@ -419,9 +427,9 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null);
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, resource)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null, t.resource ?? null);
   },
 
   // INSERT OR IGNORE on the primary key: the database decides the winner across connections and processes.
@@ -659,12 +667,14 @@ export class SqliteStore implements Store {
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
     // Databases created before private_key_jwt (RFC 7523 §2.2) lack the client key columns.
-    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri']) {
+    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri', 'resources']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
+    // Databases created before resource indicators (RFC 8707) lack the refresh-token resource column.
+    if (!rtCols.some((c) => c.name === 'resource')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN resource TEXT');
     this.#db = db;
   }
 

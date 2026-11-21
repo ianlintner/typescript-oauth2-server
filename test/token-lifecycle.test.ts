@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import type { FastifyInstance } from 'fastify';
-import { exportPKCS8, generateKeyPair, decodeJwt } from 'jose';
+import { exportPKCS8, generateKeyPair, decodeJwt, decodeProtectedHeader } from 'jose';
 import { hashClientSecret } from '../src/client-auth.js';
 import type { ClientRecord, Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
@@ -40,8 +40,9 @@ async function setup(opts: { user?: string | null; refreshTokenTtl?: number } = 
     enabled: true,
   };
   await store.saveClient({ ...base, clientId: 'pub', clientSecretHash: null });
-  await store.saveClient({ ...base, clientId: 'conf', clientSecretHash: await hashClientSecret(SECRET) });
+  await store.saveClient({ ...base, clientId: 'conf', clientSecretHash: await hashClientSecret(SECRET), resources: ['https://api.example'] });
   // Internal RS (resource server) for introspection
+  await store.saveClient({ ...base, clientId: 'norc', clientSecretHash: await hashClientSecret('norc-secret') });
   await store.saveClient({ ...base, clientId: 'rs-1', clientSecretHash: await hashClientSecret('rs-secret'), grantTypes: [] });
   let now = 1_000_000;
   const clock: Clock = { now: () => now };
@@ -683,5 +684,129 @@ test('revoking an access token with a wrong refresh_token hint still revokes it'
   await revoke(s.server, at, 'refresh_token', { client_id: 'conf', client_secret: SECRET });
   const res = await introspect(s.server, at, 'access_token', { client_id: 'conf', client_secret: SECRET });
   assert.equal(res.json().active, false);
+  await done(s);
+});
+
+// -- Token typing and resource indicators --
+
+test('access tokens carry typ at+jwt and ID tokens carry typ JWT', async () => {
+  const s = await setup();
+  const body = (await exchangeCode(s.server, { scope: 'openid' })).json();
+  assert.equal(decodeProtectedHeader(body.access_token).typ, 'at+jwt');
+  assert.equal(decodeProtectedHeader(body.id_token).typ, 'JWT');
+  await done(s);
+});
+
+test('userinfo rejects an ID token presented as a bearer token', async () => {
+  const s = await setup();
+  const body = (await exchangeCode(s.server, { scope: 'openid' })).json();
+  const ui = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${body.id_token}` } });
+  assert.equal(ui.statusCode, 401);
+  assert.equal(ui.json().error, 'invalid_token');
+  await done(s);
+});
+
+test('resource parameter sets the access-token audience', async () => {
+  const s = await setup();
+  const ok = await token(s.server, { grant_type: 'client_credentials', client_id: 'conf', client_secret: SECRET, scope: 'read', resource: 'https://api.example' });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(decodeJwt(ok.json().access_token).aud, 'https://api.example');
+  assert.equal(decodeJwt(ok.json().access_token).client_id, 'conf');
+
+  const none = await token(s.server, { grant_type: 'client_credentials', client_id: 'conf', client_secret: SECRET, scope: 'read' });
+  assert.equal(decodeJwt(none.json().access_token).aud, 'conf');
+
+  const bad = await token(s.server, { grant_type: 'client_credentials', client_id: 'conf', client_secret: SECRET, scope: 'read', resource: 'https://other.example' });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, 'invalid_target');
+  await done(s);
+});
+
+test('resource is refused for a client with no registered resources, and before the code is consumed', async () => {
+  const s = await setup();
+  const res = await token(s.server, { grant_type: 'client_credentials', client_id: 'norc', client_secret: 'norc-secret', scope: 'read', resource: 'https://api.example' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_target');
+
+  const authz = await s.server.inject({
+    method: 'GET',
+    url: `/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: 'conf', redirect_uri: CB, code_challenge: CHALLENGE, code_challenge_method: 'S256', scope: 'read' })}`,
+  });
+  const code = new URL(authz.headers.location as string).searchParams.get('code')!;
+  const form = { grant_type: 'authorization_code', code, redirect_uri: CB, client_id: 'conf', client_secret: SECRET, code_verifier: VERIFIER };
+  const refused = await token(s.server, { ...form, resource: 'https://other.example' });
+  assert.equal(refused.statusCode, 400);
+  assert.equal(refused.json().error, 'invalid_target');
+  // The refusal did not burn the code.
+  const retry = await token(s.server, { ...form, resource: 'https://api.example' });
+  assert.equal(retry.statusCode, 200);
+  assert.equal(decodeJwt(retry.json().access_token).aud, 'https://api.example');
+  await done(s);
+});
+
+test('refresh carries the resource audience forward', async () => {
+  const s = await setup();
+  const first = (await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, { client_secret: SECRET, resource: 'https://api.example' })).json();
+  assert.equal(decodeJwt(first.access_token).aud, 'https://api.example');
+
+  const refreshed = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token });
+  assert.equal(refreshed.statusCode, 200);
+  assert.equal(decodeJwt(refreshed.json().access_token).aud, 'https://api.example');
+  assert.equal(decodeProtectedHeader(refreshed.json().access_token).typ, 'at+jwt');
+
+  // The resource cannot be changed on refresh, even to another allowed value, and the refusal does not burn the token.
+  const changed = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: refreshed.json().refresh_token, resource: 'https://other.example' });
+  assert.equal(changed.statusCode, 400);
+  assert.equal(changed.json().error, 'invalid_target');
+  const again = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: refreshed.json().refresh_token, resource: 'https://api.example' });
+  assert.equal(again.statusCode, 200);
+  assert.equal(decodeJwt(again.json().access_token).aud, 'https://api.example');
+  await done(s);
+});
+
+test('refresh of a token issued without a resource keeps aud = client id and rejects a new resource', async () => {
+  const s = await setup();
+  const first = (await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, { client_secret: SECRET })).json();
+  const widened = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token, resource: 'https://api.example' });
+  assert.equal(widened.statusCode, 400);
+  assert.equal(widened.json().error, 'invalid_target');
+  const plain = await token(s.server, { grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token });
+  assert.equal(decodeJwt(plain.json().access_token).aud, 'conf');
+  await done(s);
+});
+
+test('refresh revalidates the resource against the client allow-list', async () => {
+  for (const repeat of [false, true]) {
+    const s = await setup();
+    const first = (await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, { client_secret: SECRET, resource: 'https://api.example' })).json();
+    const c = (await s.store.getClient('conf'))!;
+    await s.store.saveClient({ ...c, resources: [] });
+    const res = await token(s.server, {
+      grant_type: 'refresh_token', client_id: 'conf', client_secret: SECRET, refresh_token: first.refresh_token,
+      ...(repeat ? { resource: 'https://api.example' } : {}),
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error, 'invalid_target');
+    await done(s);
+  }
+});
+
+test('userinfo rejects an access token addressed to another API', async () => {
+  const s = await setup();
+  const body = (await exchangeCode(s.server, { client_id: 'conf', scope: 'openid' }, { client_secret: SECRET, resource: 'https://api.example' })).json();
+  assert.equal(decodeJwt(body.access_token).aud, 'https://api.example');
+  const ui = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${body.access_token}` } });
+  assert.equal(ui.statusCode, 401);
+  assert.equal(ui.json().error, 'invalid_token');
+  const plain = (await exchangeCode(s.server, { client_id: 'conf', scope: 'openid' }, { client_secret: SECRET })).json();
+  const ok = await s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${plain.access_token}` } });
+  assert.equal(ok.statusCode, 200);
+  await done(s);
+});
+
+test('discovery advertises access token signing algorithms', async () => {
+  const s = await setup();
+  const doc = (await s.server.inject({ method: 'GET', url: '/.well-known/openid-configuration' })).json();
+  assert.deepEqual(doc.access_token_signing_alg_values_supported, ['ES256']);
   await done(s);
 });
