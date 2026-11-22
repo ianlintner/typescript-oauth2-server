@@ -44,15 +44,18 @@ const STATUS: Record<OAuthErrorCode, number> = {
 export class OAuthError extends Error {
   readonly code: OAuthErrorCode;
   readonly description: string | undefined;
+  /** Seconds until a throttled caller may retry; when set the response is 429 with Retry-After. */
+  readonly retryAfter: number | undefined;
   /** Fresh server nonce to return in a `DPoP-Nonce` header (RFC 9449 §8). */
   readonly dpopNonce: string | undefined;
 
-  constructor(code: OAuthErrorCode, description?: string, dpopNonce?: string) {
+  constructor(code: OAuthErrorCode, description?: string, extra?: { retryAfter?: number; dpopNonce?: string }) {
     super(description ?? code);
-    this.dpopNonce = dpopNonce;
     this.name = 'OAuthError';
     this.code = code;
     this.description = description;
+    this.retryAfter = extra?.retryAfter;
+    this.dpopNonce = extra?.dpopNonce;
   }
 }
 
@@ -76,6 +79,10 @@ export function errorResponse(err: unknown): ErrorResponse {
   // Server-side failure details are never exposed to clients.
   if (err.description !== undefined && err.code !== 'server_error') {
     body.error_description = err.description;
+  }
+  if (err.retryAfter !== undefined) {
+    headers['retry-after'] = String(Math.ceil(err.retryAfter));
+    return { status: 429, headers, body };
   }
   return { status: STATUS[err.code], headers, body };
 }

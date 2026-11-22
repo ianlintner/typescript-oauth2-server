@@ -149,7 +149,7 @@ export async function validateDpopProof(deps: DpopDeps, header: string | string[
   // so a use_dpop_nonce rejection does not burn the proof's identifier.
   const nonceCfg = deps.dpopNonce;
   if (nonceCfg && (nonceCfg.required || payload.nonce !== undefined) && !isValidDpopNonce(nonceCfg, payload.nonce, now)) {
-    throw new OAuthError('use_dpop_nonce', payload.nonce === undefined ? 'DPoP proof must include a server-provided nonce' : 'DPoP nonce is invalid or expired', issueDpopNonce(nonceCfg, now));
+    throw new OAuthError('use_dpop_nonce', payload.nonce === undefined ? 'DPoP proof must include a server-provided nonce' : 'DPoP nonce is invalid or expired', { dpopNonce: issueDpopNonce(nonceCfg, now) });
   }
 
   const jkt = await calculateJwkThumbprint(jwk);
