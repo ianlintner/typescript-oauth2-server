@@ -41,6 +41,12 @@ Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a
 
 Embedders that enabled registration without a policy now get these defaults; list any previously accepted grant types, scopes or schemes explicitly to keep them.
 
+## End-session and userinfo checks
+
+`GET /oauth/logout` requires an `id_token_hint`. A request without one is refused with `400 invalid_request` and does not call `endSession`. The hint must be an ID token issued by this server: access tokens (which carry a `client_id` claim) are rejected, every audience must name an existing enabled client, and expired hints remain acceptable. The route has no session-subject hook, so the hint's `sub` is not compared with a current session; embedders that need per-session confirmation must add that separately. `GET /oauth/userinfo` re-reads the issuing client on every request and refuses tokens whose client is missing or disabled with the existing `401 invalid_token`.
+
+`GET /oauth/userinfo` and `GET /oauth/logout` are limited to 300 requests per 60 s per client address with `@fastify/rate-limit` (429 `temporarily_unavailable` + `Retry-After`). `OAUTH2_RATE_LIMIT=off` disables the bound and a positive integer changes the max; library embedders can set `Deps.rateLimit` to the same values. The client address is the TCP peer unless `OAUTH2_TRUSTED_PROXIES` names the reverse-proxy hops whose `X-Forwarded-For` should be trusted. Limits are per-process, not shared across replicas.
+
 ## Token exchange (RFC 8693)
 
 `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` is advertised in discovery and available to confidential clients registered with that grant type.
