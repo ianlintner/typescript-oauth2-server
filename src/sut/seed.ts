@@ -8,6 +8,8 @@ export interface SeedClient {
   clientId: string;
   /** Plaintext only until applySeed hashes it; null for public clients. */
   clientSecret: string | null;
+  /** Registered RFC 7591 client authentication method, when the seed declared one. */
+  authMethod?: string;
   redirectUris: string[];
   grantTypes: string[];
   scopes: string[];
@@ -136,7 +138,7 @@ function parseClient(raw: unknown, index: number): SeedClient {
   }
   const allowedActors = c.allowed_actors === undefined ? undefined : strArray(c, 'allowed_actors', where);
   if (allowedActors?.some((a) => a === '')) fail(`${where}: allowed_actors entries must be nonempty`);
-  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes, ...(allowedActors ? { allowedActors } : {}) };
+  return { clientId, clientSecret: secret, ...(method !== undefined ? { authMethod: method } : {}), redirectUris, grantTypes, scopes, ...(allowedActors ? { allowedActors } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -254,6 +256,7 @@ export async function applySeed(seed: Seed, store: Store): Promise<void> {
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
+      ...(c.authMethod !== undefined ? { tokenEndpointAuthMethod: c.authMethod as ClientRecord['tokenEndpointAuthMethod'] } : {}),
       ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
     });
   }

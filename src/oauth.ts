@@ -218,7 +218,9 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
   }
 }
 
-let dummySecretHash: Promise<string> | undefined;
+// Precomputed once so every client-id shape performs exactly one derivation; hashing a
+// dummy secret per request would leak existence/type through response time.
+const DUMMY_SECRET_HASH = hashClientSecret('dummy-secret');
 
 /** Filled in by the credential check: whether the presented id resolved to a stored client. */
 interface ClientLookup { registered: boolean }
@@ -235,6 +237,7 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
     return authenticateByAssertion(deps, assertion, id);
   }
   const header = req.headers.authorization;
+  let mechanism: 'basic' | 'post' | 'none' = secret === undefined ? 'none' : 'post';
   if (header !== undefined) {
     const match = /^Basic ([A-Za-z0-9+/=]+)$/i.exec(header);
     if (!match) throw new OAuthError('invalid_client', 'unsupported client authentication');
@@ -246,24 +249,35 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
     if (secret !== undefined) throw new OAuthError('invalid_request', 'multiple client authentication methods');
     id = headerId;
     secret = formDecode(decoded.slice(sep + 1));
+    mechanism = 'basic';
   }
   const invalid = new OAuthError('invalid_client', 'client authentication failed');
   if (!id) throw invalid;
   const client = await deps.store.getClient(id);
   lookup.registered = client !== null;
-  if (!client || !client.enabled) {
-    // Equalise work so response timing does not reveal which client ids exist.
-    dummySecretHash ??= hashClientSecret('dummy-secret');
-    await verifyClientSecret(secret ?? '', await dummySecretHash);
-    throw invalid;
-  }
-  if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
-  if (client.clientSecretHash === null) {
-    if (secret) throw invalid; // public clients never authenticate with a secret
-    return client;
-  }
-  if (!secret || !(await verifyClientSecret(secret, client.clientSecretHash))) throw invalid;
-  return client;
+  // RFC 7591 §2: honour the registered method. Clients written directly to the store have
+  // no method, so they keep accepting either secret transport for compatibility.
+  const registered = client?.tokenEndpointAuthMethod ?? undefined;
+  // Clients written directly to the store have no registered method: secrets may travel by
+  // Basic or body when a hash exists; a client with no hash is an implicitly public client.
+  const effectiveMethod = registered ?? (client?.clientSecretHash === null && client?.tokenEndpointAuthMethod !== 'private_key_jwt' ? 'none' : undefined);
+  const methodOk = effectiveMethod === undefined
+    ? mechanism === 'basic' || mechanism === 'post'
+    : effectiveMethod === 'client_secret_basic' ? mechanism === 'basic'
+      : effectiveMethod === 'client_secret_post' ? mechanism === 'post'
+        : effectiveMethod === 'none' ? mechanism === 'none'
+          : false; // private_key_jwt authenticates by assertion, handled above
+  const usable = client !== null && client.enabled && methodOk
+    && (effectiveMethod === 'none' || (client.clientSecretHash !== null
+      && client.tokenEndpointAuthMethod !== 'private_key_jwt'));
+  // Public clients registered as `none` authenticate by client_id alone; they still pay the
+  // same single derivation against the dummy hash as every other request shape.
+  const targetHash = usable && effectiveMethod !== 'none' ? client!.clientSecretHash! : await DUMMY_SECRET_HASH;
+  // Exactly one derivation for every client-id shape: unknown ids, public clients and
+  // assertion-based clients all verify against the same precomputed synthetic hash.
+  const verified = await verifyClientSecret(secret ?? 'dummy-secret', targetHash);
+  if (!usable || !verified) throw invalid;
+  return client!;
 }
 
 export function bearerToken(req: FastifyRequest): string | undefined {
@@ -987,6 +1001,9 @@ export function registerOAuthRoutes(
     let client: ClientRecord;
     try {
       client = await authenticateClient(deps, req, form);
+      // RFC 7662 §2.1: introspection discloses token metadata, so a caller that proved
+      // no credential must not be able to use it. Revocation (RFC 7009) is unaffected.
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'introspection requires client authentication');
     } catch {
       throw new OAuthError('invalid_client', 'introspection requires client authentication');
     }

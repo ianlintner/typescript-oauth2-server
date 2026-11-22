@@ -28,6 +28,10 @@ Run with `pnpm start` after exporting the variables above. Signing keys are supp
 
 Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. A replay racing the rotation that consumed the token also revokes the replacement, which is never returned to the client.
 
+### Client authentication method
+
+`authenticateClient` honours the registered `token_endpoint_auth_method` on every endpoint that authenticates a client: `client_secret_basic` accepts only the Basic header, `client_secret_post` accepts only a body secret, `none` accepts only `client_id`, and `private_key_jwt` requires a signed assertion. Clients written directly to the store without a registered method keep accepting Basic or body secrets; a client without a secret hash is treated as a public client. A method mismatch produces the same opaque `invalid_client` response as any other authentication failure. `POST /oauth/introspect` additionally rejects public clients, because it discloses token metadata: a caller that proved no credential cannot use it. `POST /oauth/revoke` still allows public clients to revoke their own tokens (RFC 7009 §2.1) and returns no data.
+
 ### Dynamic client registration policy
 
 Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a `registrationPolicy`. Every value a registrant supplies must appear on the matching allow-list, otherwise `POST` and `PUT /connect/register` return `invalid_client_metadata` or `invalid_redirect_uri`:

@@ -300,7 +300,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grantTypes,
       scopes: scope.split(' ').filter((s) => s !== ''),
       enabled: true,
-      ...(jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks } : {}),
+      tokenEndpointAuthMethod: authMethod,
+      ...(jwks ? { jwks } : {}),
       registration: { tokenHash: sha256(regToken), issuedAt: now, metadata },
     };
     await deps.store.saveClient(client);
@@ -368,6 +369,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       record.jwks = newJwks;
     }
     record.registration = prev;
+    record.tokenEndpointAuthMethod = authMethod;
     record.redirectUris = redirectUris;
     record.grantTypes = grantTypes;
     record.scopes = scope.split(' ').filter((s) => s !== '');
