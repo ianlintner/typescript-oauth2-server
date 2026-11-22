@@ -58,6 +58,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     maxDelegationDepth: config.maxDelegationDepth,
     trustProxy: config.trustedProxies,
     dpopNonce: config.dpopNonce === 'required' ? { key: deriveDpopNonceKey(config.sessionSecret), required: true } : undefined,
+    rateLimit: config.rateLimit === 'off' ? false : config.rateLimit === 'on' ? undefined : config.rateLimit,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
     consent,

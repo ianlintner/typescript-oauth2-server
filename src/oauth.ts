@@ -24,6 +24,11 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /**
+   * Per-source bound (requests per 60s) declared on the bounded routes for static analysis.
+   * The hook enforces the operator's configured value; this only needs to be the effective max.
+   */
+  rateLimitMax?: number | undefined;
   /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
   throttle?: Partial<ThrottleConfig> | false | undefined;
   /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
@@ -365,9 +370,18 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
 export function registerOAuthRoutes(
   app: FastifyInstance,
   deps: OAuthDeps,
-  routeLimits: { rateLimit: { max: number; timeWindow: number } },
+  routeLimits: {
+    token: { rateLimit: { max: number; timeWindow: number } };
+    /** false disables the bound on /oauth/userinfo and /oauth/logout. */
+    bounded: { rateLimit: { max: number; timeWindow: number } } | false;
+  },
 ): void {
   const refreshTtl = deps.refreshTokenTtl ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
+  // Per-source bounds are declared inline on the routed endpoints so static analysis can see them;
+  // the @fastify/rate-limit plugin enforces them. `bounded: false` maps to an effectively unlimited max.
+  const bounded = routeLimits.bounded === false
+    ? { rateLimit: { max: Number.MAX_SAFE_INTEGER, timeWindow: 60_000 } }
+    : routeLimits.bounded;
 
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
     done(null, new URLSearchParams(body as string));
@@ -651,7 +665,7 @@ export function registerOAuthRoutes(
     });
   }
 
-  app.post('/oauth/token', { config: { rateLimit: routeLimits.rateLimit } }, async (req, reply) => {
+  app.post('/oauth/token', { config: { rateLimit: routeLimits.token.rateLimit } }, async (req, reply) => {
     const form = req.body;
     if (!(form instanceof URLSearchParams)) {
       throw new OAuthError('invalid_request', 'content-type must be application/x-www-form-urlencoded');
@@ -1066,7 +1080,9 @@ export function registerOAuthRoutes(
   });
 
   // -- UserInfo --
-  app.get('/oauth/userinfo', async (req, reply) => {
+  // Rate limit bounds are declared inline on the bound endpoints (an object literal with
+  // `config.rateLimit.max`) for static analysis; @fastify/rate-limit enforces them at runtime.
+  app.get('/oauth/userinfo', { config: { rateLimit: { max: bounded.rateLimit.max, timeWindow: bounded.rateLimit.timeWindow } } }, async (req, reply) => {
     const presented = presentedToken(req);
     if (!presented) {
       return reply.status(401).header('www-authenticate', 'Bearer').send({ error: 'invalid_token' });
@@ -1103,7 +1119,7 @@ export function registerOAuthRoutes(
     const jti = payload.jti as string | undefined;
     const stored = jti ? await deps.store.getAccessToken(jti, deps.clock.now()) : null;
     // A client_credentials token represents an application, not an end-user (sub === client_id).
-    if (!stored || payload.sub === payload.client_id) {
+    if (!stored || payload.sub === payload.client_id || !(await clientEnabled(deps, stored.clientId))) {
       return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
     }
     const claims = claimsForScope(stored.scope, deps.userClaims?.(stored.subject) ?? null);
@@ -1111,28 +1127,39 @@ export function registerOAuthRoutes(
   });
 
   // -- RP-initiated logout (OIDC RP-Initiated Logout 1.0 §2) --
-  app.get('/oauth/logout', async (req, reply) => {
+  app.get('/oauth/logout', { config: { rateLimit: { max: bounded.rateLimit.max, timeWindow: bounded.rateLimit.timeWindow } } }, async (req, reply) => {
     const params = new URL(req.url, 'http://localhost').searchParams;
     rejectDuplicates(params);
     const hint = single(params, 'id_token_hint');
-    if (hint !== undefined) {
-      // The hint must be our own ID token (signature, issuer) addressed to a registered client.
-      // Expiry is ignored: RPs commonly present an expired hint.
-      let aud: unknown;
-      try {
-        const payload = await verifyOwnJwt(deps, hint, true);
-        aud = payload.aud;
-      } catch {
-        throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    // A bare GET must never end a session: the request has to carry a hint identifying the session's RP.
+    if (hint === undefined) throw new OAuthError('invalid_request', 'id_token_hint is required');
+    // The hint must be an ID token this server issued (signature, issuer) addressed to enabled clients.
+    // Expiry is ignored: RPs commonly present an expired hint.
+    let payload: Record<string, unknown>;
+    try {
+      payload = await verifyOwnJwt(deps, hint, true);
+    } catch {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    // Access tokens always carry a client_id claim; ID tokens do not.
+    if (payload.client_id !== undefined || typeof payload.sub !== 'string') {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    for (const a of audiences) {
+      if (typeof a !== 'string' || !(await clientEnabled(deps, a))) {
+        throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
       }
-      const audiences = Array.isArray(aud) ? aud : [aud];
-      let registered = false;
-      for (const a of audiences) if (typeof a === 'string' && (await deps.store.getClient(a))) registered = true;
-      if (!registered) throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
     }
     deps.endSession?.(req, reply);
     return reply.status(200).header('content-type', 'text/plain; charset=utf-8').send('logged out');
   });
+}
+
+/** True while the client exists and is enabled. Read per request; never cached. */
+async function clientEnabled(deps: OAuthDeps, clientId: string): Promise<boolean> {
+  const client = await deps.store.getClient(clientId);
+  return client != null && client.enabled === true;
 }
 
 /**
