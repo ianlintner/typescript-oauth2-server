@@ -7,6 +7,7 @@ export type OAuthErrorCode =
   | 'invalid_scope'
   | 'invalid_target'
   | 'invalid_dpop_proof'
+  | 'use_dpop_nonce'
   | 'access_denied'
   | 'server_error'
   | 'temporarily_unavailable'
@@ -27,6 +28,7 @@ const STATUS: Record<OAuthErrorCode, number> = {
   invalid_scope: 400,
   invalid_target: 400,
   invalid_dpop_proof: 400,
+  use_dpop_nonce: 400,
   access_denied: 403,
   server_error: 500,
   temporarily_unavailable: 503,
@@ -42,9 +44,12 @@ const STATUS: Record<OAuthErrorCode, number> = {
 export class OAuthError extends Error {
   readonly code: OAuthErrorCode;
   readonly description: string | undefined;
+  /** Fresh server nonce to return in a `DPoP-Nonce` header (RFC 9449 §8). */
+  readonly dpopNonce: string | undefined;
 
-  constructor(code: OAuthErrorCode, description?: string) {
+  constructor(code: OAuthErrorCode, description?: string, dpopNonce?: string) {
     super(description ?? code);
+    this.dpopNonce = dpopNonce;
     this.name = 'OAuthError';
     this.code = code;
     this.description = description;
@@ -66,6 +71,7 @@ export function errorResponse(err: unknown): ErrorResponse {
   if (err.code === 'invalid_client') {
     headers['www-authenticate'] = 'Basic realm="oauth2", charset="UTF-8"';
   }
+  if (err.dpopNonce !== undefined) headers['dpop-nonce'] = err.dpopNonce;
   const body: ErrorResponse['body'] = { error: err.code };
   // Server-side failure details are never exposed to clients.
   if (err.description !== undefined && err.code !== 'server_error') {

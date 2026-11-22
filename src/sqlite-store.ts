@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS clients (
   token_endpoint_auth_method TEXT,
   jwks TEXT,
   jwks_uri TEXT,
-  resources TEXT
+  resources TEXT,
+  allowed_actors TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -101,6 +102,7 @@ interface ClientRow {
   jwks: string | null;
   jwks_uri: string | null;
   resources: string | null;
+  allowed_actors: string | null;
 }
 
 interface DeviceRow {
@@ -240,18 +242,19 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, resources)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, resources, allowed_actors)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
          token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
-         resources=excluded.resources`,
+         resources=excluded.resources, allowed_actors=excluded.allowed_actors`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
       c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
       c.resources && c.resources.length > 0 ? JSON.stringify(c.resources) : null,
+      c.allowedActors ? JSON.stringify(c.allowedActors) : null,
     );
   },
 
@@ -334,6 +337,7 @@ const ops = {
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
       ...(r.resources ? { resources: JSON.parse(r.resources) as string[] } : {}),
+      ...(r.allowed_actors ? { allowedActors: JSON.parse(r.allowed_actors) as string[] } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
@@ -670,6 +674,8 @@ export class SqliteStore implements Store {
     for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri', 'resources']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
+    // Databases created before RFC 8693 token exchange lack the delegation allow-list column.
+    if (!cols.some((c) => c.name === 'allowed_actors')) db.exec('ALTER TABLE clients ADD COLUMN allowed_actors TEXT');
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');

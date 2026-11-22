@@ -3,10 +3,11 @@ import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
-import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
+import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceConfig } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
+import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
@@ -22,6 +23,10 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
+  maxDelegationDepth?: number | undefined;
+  /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
+  dpopNonce?: DpopNonceConfig | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -335,7 +340,11 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   return body;
 }
 
-export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void {
+export function registerOAuthRoutes(
+  app: FastifyInstance,
+  deps: OAuthDeps,
+  routeLimits: { rateLimit: { max: number; timeWindow: number } },
+): void {
   const refreshTtl = deps.refreshTokenTtl ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
 
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
@@ -603,7 +612,19 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
   });
 
-  app.post('/oauth/token', async (req, reply) => {
+  // RFC 9449 §8.2: hand the client the current nonce on every successful DPoP response so it can stay ahead of rotation.
+  if (deps.dpopNonce) {
+    const nonceCfg = deps.dpopNonce;
+    app.addHook('onSend', async (req, reply, payload) => {
+      const path = req.routeOptions.url;
+      if ((path === '/oauth/token' || path === '/oauth/userinfo') && req.headers.dpop !== undefined && reply.statusCode < 400 && !reply.hasHeader('dpop-nonce')) {
+        reply.header('dpop-nonce', issueDpopNonce(nonceCfg, deps.clock.now()));
+      }
+      return payload;
+    });
+  }
+
+  app.post('/oauth/token', { config: { rateLimit: routeLimits.rateLimit } }, async (req, reply) => {
     const form = req.body;
     if (!(form instanceof URLSearchParams)) {
       throw new OAuthError('invalid_request', 'content-type must be application/x-www-form-urlencoded');
@@ -850,6 +871,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       return reply.header('pragma', 'no-cache').send(body);
     }
 
+    // -- token-exchange (RFC 8693) --
+    if (grantType === TOKEN_EXCHANGE_GRANT_TYPE) {
+      const client = await authenticateClient(deps, req, form);
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use token-exchange');
+      if (!client.grantTypes.includes(TOKEN_EXCHANGE_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
+      const jkt = await tokenEndpointProof(req);
+      const body = await tokenExchangeGrant(deps, client, form, jkt, ACCESS_TOKEN_TTL_SECONDS);
+      return reply.header('pragma', 'no-cache').send(body);
+    }
+
     throw new OAuthError('unsupported_grant_type');
   });
 
@@ -970,7 +1001,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     registration_endpoint: `${deps.issuer}/connect/register`,
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', TOKEN_EXCHANGE_GRANT_TYPE],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
@@ -1015,9 +1046,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           return reply.status(401).header('www-authenticate', 'DPoP error="invalid_token"').send({ error: 'invalid_token' });
         }
       } catch (err) {
-        if (!(err instanceof OAuthError) || err.code !== 'invalid_dpop_proof') throw err;
-        return reply.status(401).header('www-authenticate', `DPoP error="invalid_dpop_proof", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
-          .send({ error: 'invalid_dpop_proof', ...(err.description ? { error_description: err.description } : {}) });
+        if (!(err instanceof OAuthError) || (err.code !== 'invalid_dpop_proof' && err.code !== 'use_dpop_nonce')) throw err;
+        if (err.dpopNonce !== undefined) reply.header('dpop-nonce', err.dpopNonce);
+        return reply.status(401).header('www-authenticate', `DPoP error="${err.code}", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
+          .send({ error: err.code, ...(err.description ? { error_description: err.description } : {}) });
       }
     }
 

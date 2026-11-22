@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { calculateJwkThumbprint, decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { OAuthError } from './errors.js';
 import type { Clock, Store } from './ports.js';
@@ -22,9 +22,59 @@ export interface DpopCheck {
   accessToken?: string | undefined;
 }
 
+/**
+ * Server-provided DPoP nonces (RFC 9449 §8/§9). Nonces are stateless: an HMAC
+ * over the start of a rotation window, so any process holding the same key
+ * issues and accepts the same values and nothing is stored. Replay is already
+ * handled by the jti store; a nonce only proves the proof was made recently
+ * against this server.
+ */
+export interface DpopNonceConfig {
+  /** HMAC key, >= 32 bytes. Derive from a secret with `deriveDpopNonceKey`. */
+  key: Buffer;
+  /** When true, every proof must carry a currently valid nonce; otherwise a nonce is not demanded (a presented one is still checked). */
+  required: boolean;
+  /** Rotation window length, seconds. */
+  rotationSeconds?: number | undefined;
+  /** How long a nonce stays acceptable after its window ends, seconds. */
+  graceSeconds?: number | undefined;
+}
+
+export const DPOP_NONCE_ROTATION_SECONDS = 60;
+export const DPOP_NONCE_GRACE_SECONDS = 60;
+const MIN_NONCE_KEY_BYTES = 32;
+
 export interface DpopDeps {
   store: Store;
   clock: Clock;
+  /** Absent means DPoP nonces are disabled (slice-1 behaviour). */
+  dpopNonce?: DpopNonceConfig | undefined;
+}
+
+/** Domain-separated nonce key from an application secret, so the secret is never used directly as an HMAC key. */
+export const deriveDpopNonceKey = (secret: string): Buffer => createHmac('sha256', secret).update('dpop-nonce-key:v1').digest();
+
+const nonceMac = (cfg: DpopNonceConfig, windowStart: number): string =>
+  createHmac('sha256', cfg.key).update(`dpop-nonce:v1:${windowStart}`).digest('base64url');
+
+/** Issue the nonce for the current rotation window: `<windowStart>.<mac>`. */
+export function issueDpopNonce(cfg: DpopNonceConfig, now: number): string {
+  if (cfg.key.length < MIN_NONCE_KEY_BYTES) throw new Error('DPoP nonce key is too short');
+  const rot = cfg.rotationSeconds ?? DPOP_NONCE_ROTATION_SECONDS;
+  const start = Math.floor(now / rot) * rot;
+  return `${start}.${nonceMac(cfg, start)}`;
+}
+
+/** True only for a nonce this key issued, not from the future, and within window + grace. Forged, malformed and stale values fail. */
+export function isValidDpopNonce(cfg: DpopNonceConfig, nonce: unknown, now: number): boolean {
+  if (typeof nonce !== 'string' || cfg.key.length < MIN_NONCE_KEY_BYTES) return false;
+  const m = /^(\d{1,15})\.([A-Za-z0-9_-]{43})$/.exec(nonce);
+  if (!m) return false;
+  const start = Number(m[1]);
+  const rot = cfg.rotationSeconds ?? DPOP_NONCE_ROTATION_SECONDS;
+  const grace = cfg.graceSeconds ?? DPOP_NONCE_GRACE_SECONDS;
+  if (start % rot !== 0 || start > now || now >= start + rot + grace) return false;
+  return safeEqual(m[2]!, nonceMac(cfg, start));
 }
 
 const invalid = (why: string): OAuthError => new OAuthError('invalid_dpop_proof', why);
@@ -93,6 +143,13 @@ export async function validateDpopProof(deps: DpopDeps, header: string | string[
   if (check.accessToken !== undefined) {
     if (typeof ath !== 'string') throw invalid('ath is required for protected-resource requests');
     if (!safeEqual(ath, accessTokenHash(check.accessToken))) throw invalid('ath does not match the access token');
+  }
+
+  // Checked after the signature (only the key holder is handed a fresh nonce) and before the jti is consumed,
+  // so a use_dpop_nonce rejection does not burn the proof's identifier.
+  const nonceCfg = deps.dpopNonce;
+  if (nonceCfg && (nonceCfg.required || payload.nonce !== undefined) && !isValidDpopNonce(nonceCfg, payload.nonce, now)) {
+    throw new OAuthError('use_dpop_nonce', payload.nonce === undefined ? 'DPoP proof must include a server-provided nonce' : 'DPoP nonce is invalid or expired', issueDpopNonce(nonceCfg, now));
   }
 
   const jkt = await calculateJwkThumbprint(jwk);

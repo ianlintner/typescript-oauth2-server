@@ -33,6 +33,11 @@ export interface ClientRecord {
   jwksUri?: string | null | undefined;
   /** Resource indicators (RFC 8707) this client may request. Absent or empty means `resource` is refused. */
   resources?: string[] | null | undefined;
+  /**
+   * RFC 8693 delegation allow-list: client_ids permitted to exchange tokens issued to this client
+   * or to act for its subjects. Operator-provisioned only; never settable via dynamic registration.
+   */
+  allowedActors?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }

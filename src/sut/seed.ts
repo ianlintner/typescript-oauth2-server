@@ -11,6 +11,8 @@ export interface SeedClient {
   redirectUris: string[];
   grantTypes: string[];
   scopes: string[];
+  /** RFC 8693 delegation allow-list (client_ids). */
+  allowedActors?: string[];
 }
 export interface SeedUser {
   username: string;
@@ -45,6 +47,7 @@ const GRANT_TYPES = new Set([
   'client_credentials',
   'urn:ietf:params:oauth:grant-type:device_code',
   'urn:ietf:params:oauth:grant-type:jwt-bearer',
+  'urn:ietf:params:oauth:grant-type:token-exchange',
 ]);
 const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post']);
 const ALG_RE = /^(RS|ES|PS|HS)[0-9]{3}$/;
@@ -93,7 +96,7 @@ function strArray(o: Obj, key: string, where: string, opts: { min?: number } = {
 function parseClient(raw: unknown, index: number): SeedClient {
   const at = `clients[${index}]`;
   const c = obj(raw, at);
-  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types'], at);
+  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types', 'allowed_actors'], at);
   const clientId = str(c, 'client_id', at);
   const where = `client ${JSON.stringify(clientId)}`;
   optStr(c, 'name', where);
@@ -131,7 +134,9 @@ function parseClient(raw: unknown, index: number): SeedClient {
   for (const grant of grantTypes) {
     if (!GRANT_TYPES.has(grant)) fail(`${where}: unsupported grant type ${JSON.stringify(grant)}`);
   }
-  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes };
+  const allowedActors = c.allowed_actors === undefined ? undefined : strArray(c, 'allowed_actors', where);
+  if (allowedActors?.some((a) => a === '')) fail(`${where}: allowed_actors entries must be nonempty`);
+  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes, ...(allowedActors ? { allowedActors } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -249,6 +254,7 @@ export async function applySeed(seed: Seed, store: Store): Promise<void> {
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
+      ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
     });
   }
   await store.transaction(async (tx) => {

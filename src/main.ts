@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
+import { deriveDpopNonceKey } from './dpop.js';
 import { cryptoRandom, systemClock } from './runtime.js';
 import { buildServer } from './server.js';
 import { createJoseSigner } from './signer.js';
@@ -53,6 +54,9 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     issuer: config.issuer,
     metrics: config.metricsEnabled ? new Metrics() : undefined,
     adminToken: config.adminToken,
+    maxDelegationDepth: config.maxDelegationDepth,
+    trustProxy: config.trustedProxies,
+    dpopNonce: config.dpopNonce === 'required' ? { key: deriveDpopNonceKey(config.sessionSecret), required: true } : undefined,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
     consent,
