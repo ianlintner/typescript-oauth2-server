@@ -13,8 +13,4 @@ implementation: ts-oauth2-server
 contract: b7620924068f32c8800cb23c8d47b6c1b2b6c583
 profiles: [core, token-lifecycle, oidc-basic, extended-grants, sender-constrained]
 endpoint: http://localhost:8080
-deviations:
-  - requirement: RFC9700-2.1.1-code-replay-revokes-tokens
-    profile: token-lifecycle
-    reason: Replaying an authorization code is rejected, but tokens already issued from that code are not revoked and the refresh token is not refused. Needs auth-code-to-token linkage; tracked by a repo-owned fix card.
-
+deviations: []

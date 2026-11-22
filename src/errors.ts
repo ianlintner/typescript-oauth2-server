@@ -5,7 +5,9 @@ export type OAuthErrorCode =
   | 'unauthorized_client'
   | 'unsupported_grant_type'
   | 'invalid_scope'
+  | 'invalid_target'
   | 'invalid_dpop_proof'
+  | 'use_dpop_nonce'
   | 'access_denied'
   | 'server_error'
   | 'temporarily_unavailable'
@@ -24,7 +26,9 @@ const STATUS: Record<OAuthErrorCode, number> = {
   unauthorized_client: 400,
   unsupported_grant_type: 400,
   invalid_scope: 400,
+  invalid_target: 400,
   invalid_dpop_proof: 400,
+  use_dpop_nonce: 400,
   access_denied: 403,
   server_error: 500,
   temporarily_unavailable: 503,
@@ -40,12 +44,18 @@ const STATUS: Record<OAuthErrorCode, number> = {
 export class OAuthError extends Error {
   readonly code: OAuthErrorCode;
   readonly description: string | undefined;
+  /** Seconds until a throttled caller may retry; when set the response is 429 with Retry-After. */
+  readonly retryAfter: number | undefined;
+  /** Fresh server nonce to return in a `DPoP-Nonce` header (RFC 9449 §8). */
+  readonly dpopNonce: string | undefined;
 
-  constructor(code: OAuthErrorCode, description?: string) {
+  constructor(code: OAuthErrorCode, description?: string, extra?: { retryAfter?: number; dpopNonce?: string }) {
     super(description ?? code);
     this.name = 'OAuthError';
     this.code = code;
     this.description = description;
+    this.retryAfter = extra?.retryAfter;
+    this.dpopNonce = extra?.dpopNonce;
   }
 }
 
@@ -64,10 +74,15 @@ export function errorResponse(err: unknown): ErrorResponse {
   if (err.code === 'invalid_client') {
     headers['www-authenticate'] = 'Basic realm="oauth2", charset="UTF-8"';
   }
+  if (err.dpopNonce !== undefined) headers['dpop-nonce'] = err.dpopNonce;
   const body: ErrorResponse['body'] = { error: err.code };
   // Server-side failure details are never exposed to clients.
   if (err.description !== undefined && err.code !== 'server_error') {
     body.error_description = err.description;
+  }
+  if (err.retryAfter !== undefined) {
+    headers['retry-after'] = String(Math.ceil(err.retryAfter));
+    return { status: 429, headers, body };
   }
   return { status: STATUS[err.code], headers, body };
 }

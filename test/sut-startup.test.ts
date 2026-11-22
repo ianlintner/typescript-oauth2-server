@@ -209,6 +209,44 @@ test('startup aborts before listening for a missing, unreadable or invalid seed'
   }
 });
 
+async function failedTokenStatuses(base: string, attempts: number): Promise<number[]> {
+  const statuses: number[] = [];
+  for (let i = 0; i < attempts; i++) {
+    const res = await fetch(`${base}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        authorization: `Basic ${Buffer.from('client-cc:wrong').toString('base64')}`,
+      },
+      body: 'grant_type=client_credentials',
+    });
+    statuses.push(res.status);
+  }
+  return statuses;
+}
+
+test('conformance mode does not throttle repeated failures; normal mode does', async () => {
+  const conformance = { ...(await baseEnv()), OAUTH2_CONFORMANCE_MODE: '1', OAUTH2_CONFORMANCE_SEED: SEED_PATH };
+  await withServer(conformance, async (base) => {
+    assert.ok((await failedTokenStatuses(base, 25)).every((s) => s === 401));
+    // A correct secret is still honoured after the failures.
+    const ok = await fetch(`${base}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        authorization: `Basic ${Buffer.from('client-cc:test-only-cc-secret').toString('base64')}`,
+      },
+      body: 'grant_type=client_credentials',
+    });
+    assert.equal(ok.status, 200);
+  });
+  const normal = await baseEnv();
+  await withServer(normal, async (base) => {
+    // No seed was applied, so the id is unknown; the per-source bound still applies.
+    assert.ok((await failedTokenStatuses(base, 25)).includes(429));
+  });
+});
+
 test('startup aborts for a missing seed variable or ambiguous mode value', async () => {
   const noSeed: Record<string, string> = { ...(await baseEnv()), OAUTH2_CONFORMANCE_MODE: '1' };
   await assert.rejects(startServer(noSeed), /OAUTH2_CONFORMANCE_SEED/);

@@ -181,3 +181,19 @@ test('private_key_jwt seed clients require a nonempty jwks and jwks is rejected 
   rejects((s) => { s.clients = [{ ...pkj, client_secret: 's', jwks: { keys: [{ kty: 'EC' }] } }]; }, /secret/);
   rejects((s) => { s.clients = [{ client_id: 'p', public: true, token_endpoint_auth_method: 'none', redirect_uris: ['https://a.example/cb'], jwks: { keys: [{ kty: 'EC' }] } }]; }, /jwks/);
 });
+
+test('allowed_actors (RFC 8693) is parsed, validated and stored on the client', async () => {
+  const withActors = (actors: unknown) => JSON.stringify({
+    ...minimal,
+    clients: [{ client_id: 'c', client_secret: 's3cret', redirect_uris: ['https://a.example/cb'], grant_types: ['urn:ietf:params:oauth:grant-type:token-exchange'], allowed_actors: actors }],
+  });
+  const seed = parseSeed(withActors(['svc-a', 'svc-b']));
+  assert.deepEqual(seed.clients[0]?.allowedActors, ['svc-a', 'svc-b']);
+  assert.throws(() => parseSeed(withActors('svc-a')), SeedError);
+  assert.throws(() => parseSeed(withActors([''])), /nonempty/);
+  const store = new SqliteStore(':memory:');
+  await store.init();
+  await applySeed(seed, store);
+  assert.deepEqual((await store.getClient('c'))?.allowedActors, ['svc-a', 'svc-b']);
+  assert.equal(parseSeed(JSON.stringify(minimal)).clients[0]?.allowedActors, undefined);
+});

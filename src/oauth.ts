@@ -3,11 +3,13 @@ import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
-import { DPOP_SIGNING_ALGS, validateDpopProof } from './dpop.js';
+import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceConfig } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
+import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
+import { failureKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
 
 export const CODE_TTL_SECONDS = 60;
 export const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -22,6 +24,17 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /**
+   * Per-source bound (requests per 60s) declared on the bounded routes for static analysis.
+   * The hook enforces the operator's configured value; this only needs to be the effective max.
+   */
+  rateLimitMax?: number | undefined;
+  /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
+  throttle?: Partial<ThrottleConfig> | false | undefined;
+  /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
+  maxDelegationDepth?: number | undefined;
+  /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
+  dpopNonce?: DpopNonceConfig | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -173,7 +186,49 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   return client;
 }
 
+/** Client id the request presents (form or Basic header), without validating anything. */
+function presentedClientId(req: FastifyRequest, form: URLSearchParams): string | undefined {
+  const fromForm = form.getAll('client_id')[0];
+  const m = /^Basic ([A-Za-z0-9+/=]+)$/i.exec(req.headers.authorization ?? '');
+  if (!m) return fromForm;
+  const decoded = Buffer.from(m[1]!, 'base64').toString('utf8');
+  const sep = decoded.indexOf(':');
+  return sep < 0 ? fromForm : formDecode(decoded.slice(0, sep));
+}
+
+/**
+ * Client authentication with bounded failures: once a client id or a source address has used up its
+ * failures for the current window the request is refused with 429 before any credential work runs.
+ */
 export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
+  const limits = resolveThrottle(deps);
+  if (!limits) return authenticateClientUnthrottled(deps, req, form);
+  const now = deps.clock.now();
+  const id = presentedClientId(req, form);
+  const sourceKey = failureKey.source(req);
+  const source = await deps.store.peekWindow(sourceKey, now);
+  if (source && source.count >= limits.maxFailuresPerSource) throw tooManyRequests(source.resetAt, now);
+  const client = id ? await deps.store.peekWindow(failureKey.client(id), now) : null;
+  if (client && client.count >= limits.maxFailuresPerClient) throw tooManyRequests(client.resetAt, now);
+  const lookup: ClientLookup = { registered: false };
+  try {
+    return await authenticateClientUnthrottled(deps, req, form, lookup);
+  } catch (err) {
+    if (err instanceof OAuthError && err.code === 'invalid_client') {
+      await deps.store.recordWindowHit(sourceKey, limits.windowSeconds, now);
+      // Only registered ids get their own counter, so rotating random ids cannot grow storage.
+      if (id !== undefined && lookup.registered) await deps.store.recordWindowHit(failureKey.client(id), limits.windowSeconds, now);
+    }
+    throw err;
+  }
+}
+
+let dummySecretHash: Promise<string> | undefined;
+
+/** Filled in by the credential check: whether the presented id resolved to a stored client. */
+interface ClientLookup { registered: boolean }
+
+async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams, lookup: ClientLookup = { registered: false }): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
   const assertionType = single(form, 'client_assertion_type');
@@ -200,9 +255,11 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
   const invalid = new OAuthError('invalid_client', 'client authentication failed');
   if (!id) throw invalid;
   const client = await deps.store.getClient(id);
+  lookup.registered = client !== null;
   if (!client || !client.enabled) {
     // Equalise work so response timing does not reveal which client ids exist.
-    if (secret) await verifyClientSecret(secret, await hashClientSecret('dummy-secret'));
+    dummySecretHash ??= hashClientSecret('dummy-secret');
+    await verifyClientSecret(secret ?? '', await dummySecretHash);
     throw invalid;
   }
   if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
@@ -279,9 +336,10 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   if (scopes !== '') claims.scope = scopes;
   const accessToken = await deps.signer.sign(claims);
 
+  const grant = deps.random.token(24);
   await deps.store.saveAccessToken({
     jti: atJti, clientId: client.clientId, subject, scope: scopes,
-    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant,
   });
 
   const body: Record<string, unknown> = {
@@ -302,7 +360,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
     const rtId = refreshTokenId(rtValue);
     await deps.store.saveRefreshToken({
       jti: rtId, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
-      family: rtId, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+      family: grant, parentJti: null, revokedByReplayAt: null, revokedAt: null,
     });
     body.refresh_token = rtValue;
   }
@@ -310,8 +368,21 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   return body;
 }
 
-export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void {
+export function registerOAuthRoutes(
+  app: FastifyInstance,
+  deps: OAuthDeps,
+  routeLimits: {
+    token: { rateLimit: { max: number; timeWindow: number } };
+    /** false disables the bound on /oauth/userinfo and /oauth/logout. */
+    bounded: { rateLimit: { max: number; timeWindow: number } } | false;
+  },
+): void {
   const refreshTtl = deps.refreshTokenTtl ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
+  // Per-source bounds are declared inline on the routed endpoints so static analysis can see them;
+  // the @fastify/rate-limit plugin enforces them. `bounded: false` maps to an effectively unlimited max.
+  const bounded = routeLimits.bounded === false
+    ? { rateLimit: { max: Number.MAX_SAFE_INTEGER, timeWindow: 60_000 } }
+    : routeLimits.bounded;
 
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
     done(null, new URLSearchParams(body as string));
@@ -461,7 +532,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
     await deps.store.saveAccessToken({
       jti: atJti, clientId: client.clientId, subject, scope,
-      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
     });
 
     return {
@@ -583,7 +654,19 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
   });
 
-  app.post('/oauth/token', async (req, reply) => {
+  // RFC 9449 §8.2: hand the client the current nonce on every successful DPoP response so it can stay ahead of rotation.
+  if (deps.dpopNonce) {
+    const nonceCfg = deps.dpopNonce;
+    app.addHook('onSend', async (req, reply, payload) => {
+      const path = req.routeOptions.url;
+      if ((path === '/oauth/token' || path === '/oauth/userinfo') && req.headers.dpop !== undefined && reply.statusCode < 400 && !reply.hasHeader('dpop-nonce')) {
+        reply.header('dpop-nonce', issueDpopNonce(nonceCfg, deps.clock.now()));
+      }
+      return payload;
+    });
+  }
+
+  app.post('/oauth/token', { config: { rateLimit: routeLimits.token.rateLimit } }, async (req, reply) => {
     const form = req.body;
     if (!(form instanceof URLSearchParams)) {
       throw new OAuthError('invalid_request', 'content-type must be application/x-www-form-urlencoded');
@@ -605,84 +688,91 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (!code) throw new OAuthError('invalid_request', 'code is required');
       if (!redirectUri) throw new OAuthError('invalid_request', 'redirect_uri is required');
 
-      // Consume atomically; a code presented by the wrong client is rolled back so it cannot be burned by others.
-      const record = await deps.store.transaction(async (tx) => {
-        const consumed = await tx.consumeAuthorizationCode(sha256Hex(code), deps.clock.now());
-        if (!consumed) return null;
-        if (consumed.clientId !== client.clientId) throw new OAuthError('invalid_grant');
-        return consumed;
-      });
-      if (!record) throw new OAuthError('invalid_grant', 'authorization code is invalid, expired or already used');
-      if (record.redirectUri !== redirectUri) throw new OAuthError('invalid_grant', 'redirect_uri mismatch');
-      // RFC 7636 §4.3: a challenge was bound at authorization, so an exchange without a
-      // verifier fails verification (invalid_grant); the code is already consumed above.
-      if (
-        !verifier || !VERIFIER_RE.test(verifier)
-        || !safeEqual(createHash('sha256').update(verifier).digest('base64url'), record.codeChallenge)
-      ) {
-        throw new OAuthError('invalid_grant', 'PKCE verification failed');
-      }
+      // Consumption, validation and issuance share one transaction so a concurrent replay
+      // (which revokes the grant) is ordered either before the code is spent or after every
+      // descendant token exists. Validation failures after consumption still burn the code.
+      const outcome = await deps.store.transaction(async (tx): Promise<{ error: OAuthError } | { body: Record<string, unknown> }> => {
+        const record = await tx.consumeAuthorizationCode(sha256Hex(code), deps.clock.now());
+        if (!record) {
+          // A code that cannot be redeemed again also withdraws whatever its earlier redemption issued.
+          await tx.revokeGrant(sha256Hex(code), deps.clock.now(), client.clientId);
+          return { error: new OAuthError('invalid_grant', 'authorization code is invalid, expired or already used') };
+        }
+        // A code presented by the wrong client is rolled back so it cannot be burned by others.
+        if (record.clientId !== client.clientId) throw new OAuthError('invalid_grant');
+        if (record.redirectUri !== redirectUri) return { error: new OAuthError('invalid_grant', 'redirect_uri mismatch') };
+        // RFC 7636 §4.3: a challenge was bound at authorization, so an exchange without a
+        // verifier fails verification (invalid_grant); the code is already consumed above.
+        if (
+          !verifier || !VERIFIER_RE.test(verifier)
+          || !safeEqual(createHash('sha256').update(verifier).digest('base64url'), record.codeChallenge)
+        ) {
+          return { error: new OAuthError('invalid_grant', 'PKCE verification failed') };
+        }
 
-      const iat = deps.clock.now();
-      const scopes = record.scope;
-      const scopesList = scopes ? scopes.split(' ') : [];
-      const includesOpenid = scopesList.includes('openid');
+        const iat = deps.clock.now();
+        const scopes = record.scope;
+        const scopesList = scopes ? scopes.split(' ') : [];
+        const includesOpenid = scopesList.includes('openid');
 
-      const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: record.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (scopes !== '') claims.scope = scopes;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
-
-      await deps.store.saveAccessToken({
-        jti: atJti, clientId: client.clientId, subject: record.subject,
-        scope: scopes, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-      });
-
-      const body: Record<string, unknown> = {
-        access_token: accessToken,
-        token_type: jkt ? 'DPoP' : 'Bearer',
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        ...(scopes !== '' ? { scope: scopes } : {}),
-      };
-
-      // ID token for openid
-      if (includesOpenid) {
-        const idClaims: Record<string, unknown> = {
+        const atJti = deps.random.token(16);
+        const claims: Record<string, unknown> = {
           iss: deps.issuer,
           sub: record.subject,
           aud: client.clientId,
+          client_id: client.clientId,
           iat,
           exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-          jti: deps.random.token(16),
+          jti: atJti,
         };
-        if (record.nonce) idClaims.nonce = record.nonce;
-        if (record.authTime !== null) idClaims.auth_time = record.authTime;
-        body.id_token = await deps.signer.sign(idClaims);
-      }
+        if (scopes !== '') claims.scope = scopes;
+        if (jkt) claims.cnf = { jkt };
+        const accessToken = await deps.signer.sign(claims);
 
-      // Refresh token
-      if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-        const rtValue = deps.random.token(24);
-        const rtId = refreshTokenId(rtValue);
-        await deps.store.saveRefreshToken({
-          jti: rtId, clientId: client.clientId, subject: record.subject,
-          scope: scopes, expiresAt: iat + refreshTtl,
-          family: rtId, // each auth code creates a new family (digest of its first token)
-          parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        await tx.saveAccessToken({
+          jti: atJti, clientId: client.clientId, subject: record.subject,
+          scope: scopes, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+          grant: record.codeHash,
         });
-        body.refresh_token = rtValue;
-      }
 
-      return reply.header('pragma', 'no-cache').send(body);
+        const body: Record<string, unknown> = {
+          access_token: accessToken,
+          token_type: jkt ? 'DPoP' : 'Bearer',
+          expires_in: ACCESS_TOKEN_TTL_SECONDS,
+          ...(scopes !== '' ? { scope: scopes } : {}),
+        };
+
+        // ID token for openid
+        if (includesOpenid) {
+          const idClaims: Record<string, unknown> = {
+            iss: deps.issuer,
+            sub: record.subject,
+            aud: client.clientId,
+            iat,
+            exp: iat + ACCESS_TOKEN_TTL_SECONDS,
+            jti: deps.random.token(16),
+          };
+          if (record.nonce) idClaims.nonce = record.nonce;
+          if (record.authTime !== null) idClaims.auth_time = record.authTime;
+          body.id_token = await deps.signer.sign(idClaims);
+        }
+
+        // Refresh token
+        if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
+          const rtValue = deps.random.token(24);
+          const rtId = refreshTokenId(rtValue);
+          await tx.saveRefreshToken({
+            jti: rtId, clientId: client.clientId, subject: record.subject,
+            scope: scopes, expiresAt: iat + refreshTtl,
+            family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
+            parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+          });
+          body.refresh_token = rtValue;
+        }
+        return { body };
+      });
+      if ('error' in outcome) throw outcome.error;
+      return reply.header('pragma', 'no-cache').send(outcome.body);
     }
 
     // -- client_credentials --
@@ -714,7 +804,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: client.clientId,
-        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
       });
 
       return reply.header('pragma', 'no-cache').send({
@@ -746,85 +836,82 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       }
       const jkt = proofJkt;
 
-      const consumed = await deps.store.consumeRefreshToken(presentedId, deps.clock.now());
-      if (!consumed) {
-        // The token passed the lookup but could not be consumed: another request already used it.
-        await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
-        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
-      }
+      // Rotation (consume + new tokens) is one transaction, so a concurrent replay's grant
+      // revocation is ordered before the token is spent or after its successors exist.
+      const outcome = await deps.store.transaction(async (tx): Promise<{ error: OAuthError } | { body: Record<string, unknown> }> => {
+        const consumed = await tx.consumeRefreshToken(presentedId, deps.clock.now());
+        if (!consumed) {
+          // The token passed the lookup but could not be consumed: another request already used it.
+          await tx.revokeGrant(lookedUp.family, deps.clock.now(), client.clientId);
+          return { error: new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used') };
+        }
 
-      // Check replay: if the family was revoked by replay, fail.
-      if (consumed.revokedByReplayAt !== null) throw new OAuthError('invalid_grant');
+        // Check replay: if the family was revoked by replay, fail.
+        if (consumed.revokedByReplayAt !== null) return { error: new OAuthError('invalid_grant') };
 
-      let allowedScope = consumed.scope;
-      const requestedScope = single(form, 'scope');
-      if (requestedScope !== undefined) {
-        const requested = requestedScope.split(' ').filter((s) => s !== '');
-        // Cannot escalate
-        const originalScopes = new Set(consumed.scope.split(' '));
-        if (requested.some((s) => !originalScopes.has(s))) throw new OAuthError('invalid_scope');
-        allowedScope = requested.join(' ');
-      }
+        let allowedScope = consumed.scope;
+        const requestedScope = single(form, 'scope');
+        if (requestedScope !== undefined) {
+          const requested = requestedScope.split(' ').filter((s) => s !== '');
+          // Cannot escalate
+          const originalScopes = new Set(consumed.scope.split(' '));
+          if (requested.some((s) => !originalScopes.has(s))) return { error: new OAuthError('invalid_scope') };
+          allowedScope = requested.join(' ');
+        }
 
-      const iat = deps.clock.now();
-      const scopesList = allowedScope ? allowedScope.split(' ') : [];
-      const includesOpenid = scopesList.includes('openid');
+        const iat = deps.clock.now();
+        const scopesList = allowedScope ? allowedScope.split(' ') : [];
+        const includesOpenid = scopesList.includes('openid');
 
-      const newRtValue = deps.random.token(24);
-      const newRtId = refreshTokenId(newRtValue);
-      await deps.store.saveRefreshToken({
-        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
-        scope: allowedScope, expiresAt: iat + refreshTtl,
-        family: consumed.family,
-        parentJti: consumed.jti,
-        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
-      });
-
-      // Rotation vs. replay race: a concurrent replay may revoke the family after this request
-      // consumed the parent but before the replacement above existed, so the revocation missed it.
-      // Revocation always marks the (consumed) parent, so a revoked parent here means we lost the
-      // race: kill the replacement and fail closed without issuing any token.
-      if (!(await deps.store.getRefreshToken(consumed.jti, deps.clock.now()))) {
-        await deps.store.revokeRefreshToken(newRtId, deps.clock.now());
-        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
-      }
-
-      const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: consumed.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (allowedScope) claims.scope = allowedScope;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
-
-      await deps.store.saveAccessToken({
-        jti: atJti, clientId: client.clientId, subject: consumed.subject,
-        scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-      });
-
-      const body: Record<string, unknown> = {
-        access_token: accessToken,
-        token_type: jkt ? 'DPoP' : 'Bearer',
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        refresh_token: newRtValue,
-        ...(allowedScope ? { scope: allowedScope } : {}),
-      };
-
-      if (includesOpenid) {
-        const idClaims: Record<string, unknown> = {
-          iss: deps.issuer, sub: consumed.subject, aud: client.clientId,
-          iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
+        const atJti = deps.random.token(16);
+        const claims: Record<string, unknown> = {
+          iss: deps.issuer,
+          sub: consumed.subject,
+          aud: client.clientId,
+          client_id: client.clientId,
+          iat,
+          exp: iat + ACCESS_TOKEN_TTL_SECONDS,
+          jti: atJti,
         };
-        body.id_token = await deps.signer.sign(idClaims);
-      }
+        if (allowedScope) claims.scope = allowedScope;
+        if (jkt) claims.cnf = { jkt };
+        const accessToken = await deps.signer.sign(claims);
 
-      return reply.header('pragma', 'no-cache').send(body);
+        await tx.saveAccessToken({
+          jti: atJti, clientId: client.clientId, subject: consumed.subject,
+          scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+          grant: consumed.family,
+        });
+
+        const newRtValue = deps.random.token(24);
+        const newRtId = refreshTokenId(newRtValue);
+        await tx.saveRefreshToken({
+          jti: newRtId, clientId: client.clientId, subject: consumed.subject,
+          scope: allowedScope, expiresAt: iat + refreshTtl,
+          family: consumed.family,
+          parentJti: consumed.jti,
+          revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        });
+
+        const body: Record<string, unknown> = {
+          access_token: accessToken,
+          token_type: jkt ? 'DPoP' : 'Bearer',
+          expires_in: ACCESS_TOKEN_TTL_SECONDS,
+          refresh_token: newRtValue,
+          ...(allowedScope ? { scope: allowedScope } : {}),
+        };
+
+        if (includesOpenid) {
+          const idClaims: Record<string, unknown> = {
+            iss: deps.issuer, sub: consumed.subject, aud: client.clientId,
+            iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
+          };
+          body.id_token = await deps.signer.sign(idClaims);
+        }
+        return { body };
+      });
+      if ('error' in outcome) throw outcome.error;
+      return reply.header('pragma', 'no-cache').send(outcome.body);
     }
 
     // -- device_code (RFC 8628 §3.4) --
@@ -847,6 +934,16 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use jwt-bearer');
       if (!client.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
       const body = await jwtBearerGrant(client, form, req);
+      return reply.header('pragma', 'no-cache').send(body);
+    }
+
+    // -- token-exchange (RFC 8693) --
+    if (grantType === TOKEN_EXCHANGE_GRANT_TYPE) {
+      const client = await authenticateClient(deps, req, form);
+      if (isPublicClient(client)) throw new OAuthError('invalid_client', 'public clients cannot use token-exchange');
+      if (!client.grantTypes.includes(TOKEN_EXCHANGE_GRANT_TYPE)) throw new OAuthError('unauthorized_client');
+      const jkt = await tokenEndpointProof(req);
+      const body = await tokenExchangeGrant(deps, client, form, jkt, ACCESS_TOKEN_TTL_SECONDS);
       return reply.header('pragma', 'no-cache').send(body);
     }
 
@@ -887,7 +984,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
       const id = refreshTokenId(token);
       const rt = await deps.store.getRefreshToken(id, now);
       if (!rt || rt.clientId !== client.clientId) return false;
-      await deps.store.revokeRefreshToken(id, now);
+      await deps.store.transaction(async (tx) => {
+        await tx.revokeRefreshToken(id, now);
+        await tx.revokeGrant(rt.family, now, client.clientId);
+      });
       return true;
     };
     if (hint === 'refresh_token') {
@@ -970,7 +1070,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     registration_endpoint: `${deps.issuer}/connect/register`,
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', TOKEN_EXCHANGE_GRANT_TYPE],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
     code_challenge_methods_supported: ['S256'],
@@ -988,7 +1088,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- UserInfo --
-  app.get('/oauth/userinfo', async (req, reply) => {
+  // Rate limit bounds are declared inline on the bound endpoints (an object literal with
+  // `config.rateLimit.max`) for static analysis; @fastify/rate-limit enforces them at runtime.
+  app.get('/oauth/userinfo', { config: { rateLimit: { max: bounded.rateLimit.max, timeWindow: bounded.rateLimit.timeWindow } } }, async (req, reply) => {
     const presented = presentedToken(req);
     if (!presented) {
       return reply.status(401).header('www-authenticate', 'Bearer').send({ error: 'invalid_token' });
@@ -1014,9 +1116,10 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
           return reply.status(401).header('www-authenticate', 'DPoP error="invalid_token"').send({ error: 'invalid_token' });
         }
       } catch (err) {
-        if (!(err instanceof OAuthError) || err.code !== 'invalid_dpop_proof') throw err;
-        return reply.status(401).header('www-authenticate', `DPoP error="invalid_dpop_proof", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
-          .send({ error: 'invalid_dpop_proof', ...(err.description ? { error_description: err.description } : {}) });
+        if (!(err instanceof OAuthError) || (err.code !== 'invalid_dpop_proof' && err.code !== 'use_dpop_nonce')) throw err;
+        if (err.dpopNonce !== undefined) reply.header('dpop-nonce', err.dpopNonce);
+        return reply.status(401).header('www-authenticate', `DPoP error="${err.code}", algs="${DPOP_SIGNING_ALGS.join(' ')}"`)
+          .send({ error: err.code, ...(err.description ? { error_description: err.description } : {}) });
       }
     }
 
@@ -1024,7 +1127,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
     const jti = payload.jti as string | undefined;
     const stored = jti ? await deps.store.getAccessToken(jti, deps.clock.now()) : null;
     // A client_credentials token represents an application, not an end-user (sub === client_id).
-    if (!stored || payload.sub === payload.client_id) {
+    if (!stored || payload.sub === payload.client_id || !(await clientEnabled(deps, stored.clientId))) {
       return reply.status(401).header('www-authenticate', 'Bearer error="invalid_token"').send({ error: 'invalid_token' });
     }
     const claims = claimsForScope(stored.scope, deps.userClaims?.(stored.subject) ?? null);
@@ -1032,28 +1135,39 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- RP-initiated logout (OIDC RP-Initiated Logout 1.0 §2) --
-  app.get('/oauth/logout', async (req, reply) => {
+  app.get('/oauth/logout', { config: { rateLimit: { max: bounded.rateLimit.max, timeWindow: bounded.rateLimit.timeWindow } } }, async (req, reply) => {
     const params = new URL(req.url, 'http://localhost').searchParams;
     rejectDuplicates(params);
     const hint = single(params, 'id_token_hint');
-    if (hint !== undefined) {
-      // The hint must be our own ID token (signature, issuer) addressed to a registered client.
-      // Expiry is ignored: RPs commonly present an expired hint.
-      let aud: unknown;
-      try {
-        const payload = await verifyOwnJwt(deps, hint, true);
-        aud = payload.aud;
-      } catch {
-        throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    // A bare GET must never end a session: the request has to carry a hint identifying the session's RP.
+    if (hint === undefined) throw new OAuthError('invalid_request', 'id_token_hint is required');
+    // The hint must be an ID token this server issued (signature, issuer) addressed to enabled clients.
+    // Expiry is ignored: RPs commonly present an expired hint.
+    let payload: Record<string, unknown>;
+    try {
+      payload = await verifyOwnJwt(deps, hint, true);
+    } catch {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    // Access tokens always carry a client_id claim; ID tokens do not.
+    if (payload.client_id !== undefined || typeof payload.sub !== 'string') {
+      throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
+    }
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    for (const a of audiences) {
+      if (typeof a !== 'string' || !(await clientEnabled(deps, a))) {
+        throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
       }
-      const audiences = Array.isArray(aud) ? aud : [aud];
-      let registered = false;
-      for (const a of audiences) if (typeof a === 'string' && (await deps.store.getClient(a))) registered = true;
-      if (!registered) throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
     }
     deps.endSession?.(req, reply);
     return reply.status(200).header('content-type', 'text/plain; charset=utf-8').send('logged out');
   });
+}
+
+/** True while the client exists and is enabled. Read per request; never cached. */
+async function clientEnabled(deps: OAuthDeps, clientId: string): Promise<boolean> {
+  const client = await deps.store.getClient(clientId);
+  return client != null && client.enabled === true;
 }
 
 /**

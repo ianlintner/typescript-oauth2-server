@@ -46,6 +46,13 @@ test('valid production config loads', () => {
   assert.equal(c.issuer, 'https://auth.example.com');
 });
 
+test('rate limit setting defaults on and accepts off or a positive integer', () => {
+  assert.equal(loadConfig(dev).rateLimit, 'on');
+  assert.equal(loadConfig({ ...dev, OAUTH2_RATE_LIMIT: 'off' }).rateLimit, 'off');
+  assert.equal(loadConfig({ ...dev, OAUTH2_RATE_LIMIT: '600' }).rateLimit, 600);
+  for (const bad of ['0', '-1', 'abc', '1.5']) rejects({ ...dev, OAUTH2_RATE_LIMIT: bad }, /OAUTH2_RATE_LIMIT/);
+});
+
 test('missing issuer fails closed', () => {
   rejects({ ...dev, OAUTH2_ISSUER: undefined }, /OAUTH2_ISSUER/);
   rejects({ ...dev, OAUTH2_ISSUER: '  ' }, /OAUTH2_ISSUER/);
@@ -139,4 +146,23 @@ test('config errors never echo secret values', () => {
   } catch (e) {
     assert.equal(String((e as Error).message).includes('tooshort-secret-value'), false);
   }
+});
+
+test('OAUTH2_MAX_DELEGATION_DEPTH defaults to 4 and must be a positive integer', () => {
+  assert.equal(loadConfig(dev).maxDelegationDepth, 4);
+  assert.equal(loadConfig({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '7' }).maxDelegationDepth, 7);
+  rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '0' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
+  rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '-1' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
+  rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '2.5' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
+  rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: 'abc' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
+  rejects({ ...dev, OAUTH2_MAX_DELEGATION_DEPTH: '100' }, /OAUTH2_MAX_DELEGATION_DEPTH/);
+});
+
+test('OAUTH2_TRUSTED_PROXIES is an explicit IP/CIDR list; unset trusts none and blanket values are refused', () => {
+  assert.equal(loadConfig(dev).trustedProxies, undefined);
+  assert.equal(loadConfig({ ...dev, OAUTH2_TRUSTED_PROXIES: '10.0.0.1, 192.168.0.0/16' }).trustedProxies, '10.0.0.1,192.168.0.0/16');
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: 'true' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: '0.0.0.0/0' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: '10.0.0.1/33' }, /OAUTH2_TRUSTED_PROXIES/);
+  rejects({ ...dev, OAUTH2_TRUSTED_PROXIES: 'proxy.internal' }, /OAUTH2_TRUSTED_PROXIES/);
 });
