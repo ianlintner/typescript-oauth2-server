@@ -137,6 +137,12 @@ export interface RefreshTokenRecord {
   dpopJkt?: string | null;
 }
 
+/** State of a fixed-window counter: hits so far and the epoch second the window ends. */
+export interface WindowCount {
+  count: number;
+  resetAt: number;
+}
+
 export interface Store {
   init(): Promise<void>;
   close(): Promise<void>;
@@ -221,6 +227,21 @@ export interface Store {
    * expiresAt <= now are purged. Must be safe across processes sharing the store.
    */
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean>;
+
+  /**
+   * Atomically add one hit to the fixed-window counter `key`. A missing or expired
+   * window starts a new one of `windowSeconds`. Shared by every process using the store.
+   */
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount>;
+  /** Current counter for `key`, or null when it has no live window. Does not modify state. */
+  peekWindow(key: string, now: number): Promise<WindowCount | null>;
+  /** Number of unexpired pushed requests / device codes, optionally restricted to one client. */
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number>;
+  /**
+   * Remove every record whose expiry is at or before `now` (codes, tokens, device codes,
+   * pushed requests, DPoP proofs, counter windows). Idempotent; returns the number removed.
+   */
+  sweepExpired(now: number): Promise<number>;
 
   /** Run `fn` atomically; commits on resolve, rolls back and rethrows on reject. Not reentrant. */
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T>;
