@@ -23,6 +23,11 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /**
+   * Per-source bound (requests per 60s) declared on the bounded routes for static analysis.
+   * The hook enforces the operator's configured value; this only needs to be the effective max.
+   */
+  rateLimitMax?: number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
   dpopNonce?: DpopNonceConfig | undefined;
   /**
@@ -315,6 +320,10 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
 
 export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void {
   const refreshTtl = deps.refreshTokenTtl ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
+  // per-source bound in requests, declared inline on the bounded routes. This is a local config key,
+  // not @fastify/rate-limit (not a dependency): the onRequest hook reads `max`; `timeWindow` is
+  // documentation, the enforced window is BOUNDED_WINDOW_SECONDS.
+  const boundedMax = deps.rateLimitMax ?? BOUNDED_REQUESTS_PER_SOURCE;
 
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
     done(null, new URLSearchParams(body as string));
@@ -1003,7 +1012,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- UserInfo --
-  app.get('/oauth/userinfo', { config: { rateLimit: { max: BOUNDED_REQUESTS_PER_SOURCE, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
+  app.get('/oauth/userinfo', { config: { rateLimit: { max: boundedMax, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
     const presented = presentedToken(req);
     if (!presented) {
       return reply.status(401).header('www-authenticate', 'Bearer').send({ error: 'invalid_token' });
@@ -1048,7 +1057,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- RP-initiated logout (OIDC RP-Initiated Logout 1.0 §2) --
-  app.get('/oauth/logout', { config: { rateLimit: { max: BOUNDED_REQUESTS_PER_SOURCE, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
+  app.get('/oauth/logout', { config: { rateLimit: { max: boundedMax, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
     const params = new URL(req.url, 'http://localhost').searchParams;
     rejectDuplicates(params);
     const hint = single(params, 'id_token_hint');

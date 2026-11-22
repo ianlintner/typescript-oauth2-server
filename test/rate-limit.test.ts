@@ -12,7 +12,7 @@ import { buildServer } from '../src/server.js';
 const ISSUER = 'http://localhost:8080';
 const CB = 'https://app.example/cb';
 
-async function setup(opts: { rateLimit?: boolean } = {}) {
+async function setup(opts: { rateLimit?: boolean | number } = {}) {
   const pair = await generateKeyPair('ES256', { extractable: true });
   const signer = await createJoseSigner(await exportPKCS8(pair.privateKey), 'k1');
   const store = new SqliteStore(':memory:');
@@ -63,6 +63,13 @@ test('logout is bounded independently of userinfo', async () => {
   for (let i = 0; i < BOUNDED_REQUESTS_PER_SOURCE * 2; i += 1) {
     assert.equal((await s.server.inject({ method: 'GET', url: '/health' })).statusCode, 200);
   }
+});
+
+test('a configured max overrides the default', async () => {
+  const customMax = 3;
+  const s = await setup({ rateLimit: customMax });
+  for (let i = 0; i < customMax; i += 1) assert.equal((await userinfo(s)).statusCode, 401);
+  assert.equal((await userinfo(s)).statusCode, 429);
 });
 
 test('unbounded routes and the disabled limiter are never refused', async () => {

@@ -1,8 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 
-/** Requests one source address may make to a bounded route per {@link BOUNDED_WINDOW_SECONDS}. */
-export const BOUNDED_REQUESTS_PER_SOURCE = 30;
+/**
+ * Requests one source address may make to a bounded route per {@link BOUNDED_WINDOW_SECONDS}.
+ * Deliberately generous: a single IP can be a reverse proxy or a backend that calls userinfo for
+ * many users. Operators can raise it further (or disable the bound) through OAUTH2_RATE_LIMIT.
+ */
+export const BOUNDED_REQUESTS_PER_SOURCE = 300;
 /** Fixed window for every per-route bound, in seconds. */
 export const BOUNDED_WINDOW_SECONDS = 60;
 
@@ -64,11 +68,16 @@ export const retryAfterSeconds = (window: Window, now: number): number =>
  * RFC 6749 §5.2 `temporarily_unavailable` and Retry-After. Runs as onRequest, before routing handlers,
  * so no JWT verification, store lookup or session change happens for a refused request.
  */
-export function registerRouteBounds(app: FastifyInstance, bounds: RouteBounds, clock: { now(): number }): void {
+export function registerRouteBounds(
+  app: FastifyInstance,
+  bounds: RouteBounds,
+  clock: { now(): number },
+  defaultMax: number = BOUNDED_REQUESTS_PER_SOURCE,
+): void {
   app.addHook('onRequest', (req, reply, done) => {
     const path = req.routeOptions.url;
     const limit = (req.routeOptions.config as { rateLimit?: { max?: number } } | undefined)?.rateLimit?.max;
-    const max = typeof limit === 'number' ? limit : BOUNDED_REQUESTS_PER_SOURCE;
+    const max = typeof limit === 'number' ? limit : defaultMax;
     const window = path === undefined ? null : bounds.hit(req.method, path, req.ip, clock.now());
     if (!window || window.count <= max) return done();
     const retryAfter = retryAfterSeconds(window, clock.now());

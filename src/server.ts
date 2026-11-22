@@ -5,6 +5,7 @@ import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
 import { Metrics, ROUTES } from './metrics.js';
+import { BOUNDED_REQUESTS_PER_SOURCE } from './rate-limit.js';
 
 export interface Deps {
   store: Store;
@@ -19,8 +20,11 @@ export interface Deps {
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
-  /** Per-source request bounds on /oauth/userinfo and /oauth/logout. On by default; `false` disables. */
-  rateLimit?: boolean | undefined;
+  /**
+   * Per-source request bound on /oauth/userinfo and /oauth/logout, in requests per 60s.
+   * `false` disables it; a positive integer overrides the default ({@link BOUNDED_REQUESTS_PER_SOURCE}).
+   */
+  rateLimit?: boolean | number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces; absent disables them. */
   dpopNonce?: OAuthDeps['dpopNonce'] | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
@@ -89,7 +93,12 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   if (deps.metrics) app.get('/metrics', async (_req, reply) => reply.type('text/plain; version=0.0.4').send(deps.metrics!.render()));
 
-  registerOAuthRoutes(app, deps);
+  // Per-source bound on the bounded OAuth routes: false disables, a positive integer overrides the
+  // default, undefined uses the default. buildServer passes the resolved value through.
+  const rateLimitEnabled = deps.rateLimit !== false;
+  const rateLimitMax = typeof deps.rateLimit === 'number' ? deps.rateLimit : BOUNDED_REQUESTS_PER_SOURCE;
+
+  registerOAuthRoutes(app, { ...deps, rateLimitMax });
 
   registerExtensionRoutes(app, {
     store: deps.store,
@@ -100,7 +109,8 @@ export function buildServer(deps: Deps): FastifyInstance {
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
     registrationPolicy: deps.registrationPolicy,
-    rateLimit: deps.rateLimit,
+    rateLimitEnabled,
+    rateLimitMax,
   });
 
   registerAdminTrustedIssuerRoutes(app, {
