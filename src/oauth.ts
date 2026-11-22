@@ -17,6 +17,62 @@ export const ACCESS_TOKEN_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 86_400; // 24h default
 const REAUTH_GRACE_SECONDS = 5;
 
+/**
+ * The resource-owner authorization decision for an authorization request.
+ * Return `true` only when the resource owner has approved this client and the
+ * *entire* requested scope set. `request.scope` contains the validated scopes
+ * (after client registration checks), `request.prompt` contains the parsed OIDC
+ * prompt values, and `request.fresh` is true when `prompt=consent` requires a
+ * new decision rather than a cached one.
+ *
+ * A wider scope set must be treated as a new decision; embedders may use
+ * {@link createConsentDecider} to keep an approved scope set per (subject,
+ * client). Consent is required for authorization_code in every deployment: when
+ * no hook is supplied the authorize endpoint fails closed with `access_denied`.
+ * The embedder owns any consent UI.
+ */
+export interface ConsentRequest {
+  scope: string[];
+  prompt: string[];
+  fresh: boolean;
+}
+export type ConsentHook = (subject: string, clientId: string, request: ConsentRequest) => boolean;
+
+/**
+ * Embedder/test helper: records approved scope sets per (subject, client) and
+ * answers authorization requests from them. A request is approved only when
+ * every requested scope is in the recorded set; `prompt=consent` ignores the
+ * recorded decision so the caller can obtain and record a fresh one.
+ */
+export function createConsentDecider(initial: Record<string, string[]> = {}) {
+  const decisions = new Map<string, Set<string>>();
+  for (const [key, scopes] of Object.entries(initial)) decisions.set(key, new Set(scopes));
+  const keyFor = (subject: string, clientId: string) => JSON.stringify([subject, clientId]);
+  return {
+    approve(subject: string, clientId: string, scope: string[]): void {
+      decisions.set(keyFor(subject, clientId), new Set(scope));
+    },
+    decisionsFor(subject: string, clientId: string): string[] {
+      return [...(decisions.get(keyFor(subject, clientId)) ?? [])];
+    },
+    consent(subject: string, clientId: string, request: ConsentRequest): boolean {
+      if (request.fresh) return false;
+      const approved = decisions.get(keyFor(subject, clientId));
+      return approved !== undefined && request.scope.every((s) => approved.has(s));
+    },
+  };
+}
+
+/**
+ * Test helper that approves every requested scope for a fixed subject. Does
+ * not cache decisions: each request is independently approved, including ones
+ * with `prompt=consent`. Never use in production — it is for test servers that
+ * deliberately focus on other protocol behaviour.
+ */
+export function consentAll(subject: string | null): ConsentHook {
+  return (s) => subject !== null && s === subject;
+}
+
 export interface OAuthDeps {
   store: Store;
   signer: Signer;
@@ -47,12 +103,7 @@ export interface OAuthDeps {
    * access_denied. Never set in normal operation.
    */
   loginPath?: string | undefined;
-  /**
-   * Conformance/test mode only. When set, consent is granted only if this
-   * returns true for (subject, clientId); otherwise the request fails closed
-   * with access_denied (no consent UI exists). Absent means no extra check.
-   */
-  consent?: ((subject: string, clientId: string) => boolean) | undefined;
+  consent?: ConsentHook | undefined;
   /** Epoch seconds at which the request's session authenticated; null when unknown. Feeds auth_time / max_age. */
   authTime?: ((req: FastifyRequest) => number | null) | undefined;
   /** End-user claims for a subject (OIDC Core 5.1). Absent or null means only `sub` is disclosed. */
@@ -628,7 +679,18 @@ export function registerOAuthRoutes(
       if (deps.loginPath !== undefined) return reply.status(302).header('location', deps.loginPath).send();
       return fail('access_denied');
     }
-    if (deps.consent && !deps.consent(subject, client.clientId)) return fail('access_denied');
+    // Consent is mandatory for every authorization_code request. The embedder
+    // owns the decision (and any UI); without a hook the request fails closed.
+    // prompt=consent requires a fresh decision, never a cached approval.
+    if (!deps.consent) {
+      if (prompt.includes('none')) return fail('consent_required');
+      return fail('access_denied');
+    }
+    const consentRequest = { scope: requested, prompt, fresh: prompt.includes('consent') };
+    if (!deps.consent(subject, client.clientId, consentRequest)) {
+      if (prompt.includes('none')) return fail('consent_required');
+      return fail('access_denied');
+    }
 
     // RFC 9126 §4: a request_uri is single-use; consume it only once the request is about to succeed.
     if (requestUri !== undefined) {

@@ -12,6 +12,7 @@ import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { hashClientSecret } from '../client-auth.js';
 import { cryptoRandom, systemClock } from '../runtime.js';
+import { createConsentDecider } from '../oauth.js';
 import { buildServer } from '../server.js';
 import { createJoseSigner } from '../signer.js';
 import { SqliteStore } from '../sqlite-store.js';
@@ -65,6 +66,10 @@ export async function startConformanceServer(
     clientId: CONFORMANCE_CONFIDENTIAL_CLIENT,
     clientSecretHash: await hashClientSecret(CONFORMANCE_CLIENT_SECRET),
   });
+  const decider = createConsentDecider();
+  for (const id of [CONFORMANCE_PUBLIC_CLIENT, CONFORMANCE_CONFIDENTIAL_CLIENT]) {
+    decider.approve(CONFORMANCE_SUBJECT, id, base.scopes);
+  }
   const app = buildServer({
     store,
     signer,
@@ -72,6 +77,7 @@ export async function startConformanceServer(
     random: cryptoRandom,
     issuer: `http://${HOST}:${port}`,
     authenticate: async () => CONFORMANCE_SUBJECT,
+    consent: decider.consent,
   });
   try {
     const address = await app.listen({ host: HOST, port });

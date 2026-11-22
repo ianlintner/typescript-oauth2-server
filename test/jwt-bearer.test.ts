@@ -6,6 +6,7 @@ import { SignJWT, decodeJwt, exportJWK, exportPKCS8, generateKeyPair, type Crypt
 import { hashClientSecret } from '../src/client-auth.js';
 import type { Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -37,7 +38,7 @@ async function setup() {
   });
   const state = { v: T0 };
   const clock: Clock = { now: () => state.v };
-  const server = buildServer({ store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'u' });
+  const server = buildServer({ store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'u', consent: consentAll('u') });
   const sign = (claims: Record<string, unknown> = {}, kid?: string) => {
     const body: Record<string, unknown> = { iss: EXT, sub: 'alice', aud: ISSUER, jti: randomUUID(), iat: T0, exp: T0 + 60, ...claims };
     for (const [k, v] of Object.entries(body)) if (v === undefined) delete body[k];

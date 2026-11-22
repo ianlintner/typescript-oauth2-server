@@ -12,6 +12,7 @@ import { DocumentStore, TransactionDocuments, type Documents } from '../src/docu
 import type { RefreshTokenRecord, Store } from '../src/ports.js';
 import { runRefreshCutover } from '../src/refresh-cutover.js';
 import { cryptoRandom } from '../src/runtime.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -35,7 +36,7 @@ async function setup() {
   await store.saveClient({ ...base, clientId: 'conf', clientSecretHash: await hashClientSecret(SECRET) });
   const server = buildServer({
     store, signer, clock: { now: () => NOW }, random: cryptoRandom, issuer: 'http://localhost:8080',
-    authenticate: async () => 'user-1', refreshTokenTtl: 86_400,
+    authenticate: async () => 'user-1', consent: consentAll('user-1'), refreshTokenTtl: 86_400,
   });
   const raw = () => new DatabaseSync(path);
   const cleanup = async () => { await server.close(); await store.close(); rmSync(dir, { recursive: true, force: true }); };

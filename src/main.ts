@@ -10,6 +10,7 @@ import { MongoStore } from './mongo-store.js';
 import { Metrics } from './metrics.js';
 import { startSweeper, type Sweeper } from './sweep.js';
 import type { Store } from './ports.js';
+import type { ConsentHook } from './oauth.js';
 import { assertSafeForConformance, conformanceModeFromEnv } from './sut/mode.js';
 import { applySeed, assertProvisionable, loadSeed } from './sut/seed.js';
 import { createTestRegistry, LOGIN_PATH, makeConsent, makeTestAuthenticate, makeTestAuthTime, makeTestEndSession, registerTestLoginRoutes } from './sut/routes.js';
@@ -37,14 +38,14 @@ export async function startServer(env: Record<string, string | undefined>): Prom
   const mode = conformanceModeFromEnv(env);
 
   let registry: ReturnType<typeof createTestRegistry> | undefined;
-  let consent: ((subject: string, clientId: string) => boolean) | undefined;
+  let consent: ConsentHook | undefined;
   if (mode.enabled) {
     assertSafeForConformance(env, config);
     const seed = await loadSeed(mode.seedPath!);
     assertProvisionable(seed, { issuer: config.issuer, signingKeyId: config.signingKeyId });
     await applySeed(seed, store);
     registry = createTestRegistry(seed.users, systemClock);
-    consent = makeConsent(seed.users);
+    consent = makeConsent(seed.users, seed.clients);
   }
 
   const server = buildServer({

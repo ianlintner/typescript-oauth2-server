@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { exportPKCS8, generateKeyPair } from 'jose';
 import { cryptoRandom } from '../src/runtime.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -15,7 +16,7 @@ async function setup(tokenRateLimit?: { max: number; windowSeconds: number }, tr
   await store.init();
   const server = buildServer({
     store, signer, clock: { now: () => 1_000_000 }, random: cryptoRandom, issuer: 'http://localhost:8080',
-    authenticate: async () => 'u', ...(tokenRateLimit ? { tokenRateLimit } : {}),
+    authenticate: async () => 'u', consent: consentAll('u'), ...(tokenRateLimit ? { tokenRateLimit } : {}),
     // These tests isolate the route-level request budget from the store-backed failure throttle.
     throttle: false,
     ...(trustProxy !== undefined ? { trustProxy } : {}),

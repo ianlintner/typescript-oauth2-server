@@ -8,6 +8,7 @@ import { claimsForScope } from '../src/oauth.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 
 const ISSUER = 'http://localhost:8080';
@@ -30,7 +31,7 @@ async function setup(opts: { authTime?: number | null } = {}) {
   let ended = 0;
   const server = buildServer({
     store, signer, clock, random: cryptoRandom, issuer: ISSUER,
-    authenticate: async () => 'alice',
+    authenticate: async () => 'alice', consent: consentAll('alice'),
     authTime: () => (opts.authTime === undefined ? now : opts.authTime),
     userClaims: () => ({ email: 'alice@example.com', preferred_username: 'alice' }),
     endSession: () => { ended += 1; },
