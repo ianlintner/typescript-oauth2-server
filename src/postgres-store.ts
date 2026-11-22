@@ -13,6 +13,10 @@ export class PostgresStore extends DocumentStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS oauth2_documents (
       namespace TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL,
       PRIMARY KEY (namespace, kind, id))`);
+    // Indexes for the filtered lookups; the per-request paths never read a whole kind.
+    for (const field of ['clientId', 'userCodeHash', 'family', 'grant']) {
+      await this.pool.query(`CREATE INDEX IF NOT EXISTS oauth2_documents_${field.toLowerCase()}_idx ON oauth2_documents (namespace, kind, (data->>'${field}'))`);
+    }
     this.open = true;
   }
   async close(): Promise<void> { this.open = false; await this.pool.end(); }
@@ -39,6 +43,20 @@ export class PostgresStore extends DocumentStore {
         list: async <R>(kind: string): Promise<R[]> => {
           const result = await client.query<{ data: R }>('SELECT data FROM oauth2_documents WHERE namespace=$1 AND kind=$2', [...args, kind]);
           return result.rows.map(r => r.data);
+        },
+        find: async <R>(kind: string, field: string, value: string): Promise<R[]> => {
+          const result = await client.query<{ data: R }>('SELECT data FROM oauth2_documents WHERE namespace=$1 AND kind=$2 AND data->>$3 = $4', [...args, kind, field, value]);
+          return result.rows.map(r => r.data);
+        },
+        purge: async (kind, now) => {
+          const result = await client.query("DELETE FROM oauth2_documents WHERE namespace=$1 AND kind=$2 AND (data->>'expiresAt')::numeric <= $3", [...args, kind, now]);
+          return result.rowCount ?? 0;
+        },
+        countLive: async (kind, now, field, value) => {
+          const result = field === undefined
+            ? await client.query<{ n: string }>("SELECT count(*) AS n FROM oauth2_documents WHERE namespace=$1 AND kind=$2 AND (data->>'expiresAt')::numeric > $3", [...args, kind, now])
+            : await client.query<{ n: string }>("SELECT count(*) AS n FROM oauth2_documents WHERE namespace=$1 AND kind=$2 AND (data->>'expiresAt')::numeric > $3 AND data->>$4 = $5", [...args, kind, now, field, value]);
+          return Number(result.rows[0]?.n ?? 0);
         },
       };
       const tx = new TransactionDocuments(db);

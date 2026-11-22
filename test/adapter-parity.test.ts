@@ -140,4 +140,66 @@ for (const [name, make] of factories) {
       assert.equal(await b.consumeDpopJti(proof, 3000, 2000), true);
     } finally { await a.close(); await b.close(); }
   });
+  test(`${name}: grant cascade revokes access tokens in the same transaction`, async () => {
+    const a = make();
+    await a.init();
+    const id = `client-${crypto.randomUUID()}`;
+    const grant = `g-${id}`;
+    const at = (jti: string, g: string | null) => ({ jti, clientId: id, subject: 'user', scope: 'read', expiresAt: 100_000, revokedAt: null, tokenHash: null, grant: g });
+    const rt = (jti: string, family: string) => ({ jti, clientId: id, subject: 'user', scope: 'read', expiresAt: 100_000, family, parentJti: null, revokedAt: null, revokedByReplayAt: null });
+    try {
+      await a.saveClient({ clientId: id, clientSecretHash: null, redirectUris: [], grantTypes: [], scopes: [], enabled: true });
+      await a.saveAccessToken(at(`at-${id}`, grant));
+      await a.saveAccessToken(at(`at-null-${id}`, null));
+      await a.saveAccessToken(at(`at-other-${id}`, `other-${id}`));
+      await a.saveRefreshToken(rt(`rt-${id}`, grant));
+      await a.saveRefreshToken(rt(`rt-other-${id}`, `other-${id}`));
+      // A different client never matches, so nothing is revoked.
+      assert.equal(await a.revokeGrant(grant, 1000, `not-${id}`), 0);
+      assert.ok(await a.getAccessToken(`at-${id}`, 1000));
+      await a.transaction(async tx => { assert.equal(await tx.revokeGrant(grant, 1000, id), 1); });
+      assert.equal(await a.getAccessToken(`at-${id}`, 1000), null);
+      assert.equal(await a.getRefreshToken(`rt-${id}`, 1000), null);
+      assert.ok(await a.getAccessToken(`at-null-${id}`, 1000));
+      assert.ok(await a.getAccessToken(`at-other-${id}`, 1000));
+      assert.ok(await a.getRefreshToken(`rt-other-${id}`, 1000));
+    } finally { await a.close(); }
+  });
+}
+
+for (const [name, make] of factories) {
+  test(`${name}: window counters, live counts and expiry sweep behave the same across replicas`, async () => {
+    const a = make(); const b = make();
+    await a.init(); await b.init();
+    const id = `sweep-${crypto.randomUUID()}`;
+    try {
+      await a.saveClient({ clientId: id, clientSecretHash: null, redirectUris: [], grantTypes: [], scopes: [], enabled: true });
+      // Counter: shared across replicas, concurrent hits are not lost, window resets after expiry.
+      const hits = await Promise.all(Array.from({ length: 6 }, (_, i) => (i % 2 ? a : b).recordWindowHit(`w-${id}`, 60, 1000)));
+      assert.deepEqual(hits.map(h => h.count).sort((x, y) => x - y), [1, 2, 3, 4, 5, 6]);
+      assert.deepEqual(await b.peekWindow(`w-${id}`, 1030), { count: 6, resetAt: 1060 });
+      assert.equal(await a.peekWindow(`w-${id}`, 1060), null);
+      assert.deepEqual(await a.recordWindowHit(`w-${id}`, 60, 1060), { count: 1, resetAt: 1120 });
+      // Live counts ignore expired rows and filter by client.
+      await a.savePar({ requestUriHash: `old-${id}`, clientId: id, params: {}, expiresAt: 100, consumedAt: null });
+      await a.savePar({ requestUriHash: `new-${id}`, clientId: id, params: {}, expiresAt: 900_000, consumedAt: null });
+      await a.saveDeviceCode({ deviceCodeHash: `od-${id}`, userCodeHash: `ou-${id}`, clientId: id, scope: 'x', expiresAt: 100, interval: 5, lastPolledAt: null, status: 'pending', subject: null });
+      assert.equal(await b.countLiveRecords('par', 500, id), 1);
+      assert.equal(await b.countLiveRecords('device', 500, id), 0);
+      assert.ok(await b.countLiveRecords('par', 500) >= 1);
+      // Sweep removes expired rows only, is idempotent, and leaves live data usable.
+      await a.saveAccessToken({ jti: `oa-${id}`, clientId: id, subject: 'u', scope: 'x', expiresAt: 100, revokedAt: null, tokenHash: null });
+      await a.saveAccessToken({ jti: `na-${id}`, clientId: id, subject: 'u', scope: 'x', expiresAt: 900_000, revokedAt: null, tokenHash: null });
+      await a.consumeDpopJti(`oj-${id}`, 100, 50);
+      assert.ok(await b.sweepExpired(500) >= 4);
+      assert.equal(await a.sweepExpired(500), 0);
+      assert.equal(await a.getDeviceCode(`od-${id}`), null);
+      assert.ok(await a.getPar(`new-${id}`, 500));
+      assert.ok(await a.getAccessToken(`na-${id}`, 500));
+      assert.equal(await a.consumeDpopJti(`oj-${id}`, 900, 500), true);
+      // deleteClient still cascades through the filtered lookup.
+      assert.equal(await a.deleteClient(id), true);
+      assert.equal(await b.getPar(`new-${id}`, 500), null);
+    } finally { await a.close(); await b.close(); }
+  });
 }

@@ -38,6 +38,8 @@ interface ResolvedToken {
   /** Levels of the carried `act` chain, outermost first. */
   act: Actor[];
   mayAct: unknown;
+  /** Grant that produced this token, so downstream exchanges inherit its revocation scope. */
+  grant: string | null;
   cnf: Record<string, unknown> | null;
 }
 
@@ -122,6 +124,7 @@ async function resolveToken(deps: OAuthDeps, raw: string, which: 'subject' | 'ac
     exp: payload.exp,
     act: parseActChain(payload.act, maxDepth, `${which}_token`),
     mayAct: payload.may_act,
+    grant: record.grant ?? null,
     cnf,
   };
 }
@@ -264,7 +267,7 @@ export async function tokenExchangeGrant(
   const accessToken = await deps.signer.sign(claims, { typ: ACCESS_TOKEN_TYP });
   await deps.store.saveAccessToken({
     jti, clientId: client.clientId, subject: subject.sub, scope: scope.join(' '),
-    expiresAt: exp, revokedAt: null, tokenHash: null,
+    expiresAt: exp, revokedAt: null, tokenHash: null, grant: subject.grant,
   });
 
   // RFC 8693 §2.2.1: delegation is expressed inside the issued token, not as a response member.

@@ -35,7 +35,7 @@ async function setup(opts: { authTime?: number | null } = {}) {
     userClaims: () => ({ email: 'alice@example.com', preferred_username: 'alice' }),
     endSession: () => { ended += 1; },
   });
-  return { server, signer, pair, advance: (s: number) => { now += s; }, ended: () => ended };
+  return { server, store, signer, pair, advance: (s: number) => { now += s; }, ended: () => ended };
 }
 
 const basic = { authorization: `Basic ${Buffer.from(`conf:${SECRET}`).toString('base64')}` };
@@ -161,9 +161,23 @@ test('logout rejects a hint whose audience is not a registered client, or that i
   assert.equal(s.ended(), 0);
 });
 
-test('logout without a hint still ends the session', async () => {
+test('logout without an id_token_hint does not end the session', async () => {
   const s = await setup();
-  assert.equal((await s.server.inject({ method: 'GET', url: '/oauth/logout' })).statusCode, 200);
+  const res = await s.server.inject({ method: 'GET', url: '/oauth/logout' });
+  assert.equal(res.statusCode, 400);
+  assert.equal((res.json() as { error: string }).error, 'invalid_request');
+  assert.equal(s.ended(), 0);
+});
+
+test('an access token is not accepted as id_token_hint, the id token is', async () => {
+  const s = await setup();
+  const body = await exchange(s, {});
+  const bad = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.access_token}` });
+  assert.equal(bad.statusCode, 400);
+  assert.equal((bad.json() as { error: string }).error, 'invalid_request');
+  assert.equal(s.ended(), 0);
+  const ok = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.id_token}` });
+  assert.equal(ok.statusCode, 200);
   assert.equal(s.ended(), 1);
 });
 
@@ -172,6 +186,17 @@ test('logout rejects an access token as id_token_hint', async () => {
   const body = await exchange(s, {});
   assert.equal(decodeProtectedHeader(body.access_token).typ, 'at+jwt');
   const res = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.access_token}` });
+  assert.equal(res.statusCode, 400);
+  assert.equal((res.json() as { error: string }).error, 'invalid_request');
+  assert.equal(s.ended(), 0);
+});
+
+test('an id_token_hint for a disabled client is refused', async () => {
+  const s = await setup();
+  const body = await exchange(s, {});
+  const client = (await s.store.getClient('conf'))!;
+  await s.store.saveClient({ ...client, enabled: false });
+  const res = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.id_token}` });
   assert.equal(res.statusCode, 400);
   assert.equal((res.json() as { error: string }).error, 'invalid_request');
   assert.equal(s.ended(), 0);
@@ -186,4 +211,17 @@ test('logout rejects a pre-upgrade access token (typ JWT) as id_token_hint', asy
   assert.equal(res.statusCode, 400);
   assert.equal((res.json() as { error: string }).error, 'invalid_request');
   assert.equal(s.ended(), 0);
+});
+
+test('userinfo works while the client is enabled and is refused after it is disabled', async () => {
+  const s = await setup();
+  const body = await exchange(s, {});
+  const call = () => s.server.inject({ method: 'GET', url: '/oauth/userinfo', headers: { authorization: `Bearer ${body.access_token}` } });
+  assert.equal((await call()).statusCode, 200);
+  const client = (await s.store.getClient('conf'))!;
+  await s.store.saveClient({ ...client, enabled: false });
+  const res = await call();
+  assert.equal(res.statusCode, 401);
+  assert.match(String(res.headers['www-authenticate']), /Bearer/);
+  assert.deepEqual(res.json(), { error: 'invalid_token' });
 });

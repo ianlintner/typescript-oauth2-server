@@ -16,6 +16,8 @@ async function setup(tokenRateLimit?: { max: number; windowSeconds: number }, tr
   const server = buildServer({
     store, signer, clock: { now: () => 1_000_000 }, random: cryptoRandom, issuer: 'http://localhost:8080',
     authenticate: async () => 'u', ...(tokenRateLimit ? { tokenRateLimit } : {}),
+    // These tests isolate the route-level request budget from the store-backed failure throttle.
+    throttle: false,
     ...(trustProxy !== undefined ? { trustProxy } : {}),
   });
   const post = (grant: string, opts: { peer?: string; xff?: string } = {}) => server.inject({

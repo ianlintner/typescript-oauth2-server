@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { DEFAULT_SWEEP_INTERVAL_SECONDS } from './sweep.js';
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -20,12 +21,16 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** Seconds between expired-record sweeps; 0 disables the scheduled sweep. */
+  sweepIntervalSeconds: number;
   /** RFC 8693 act-chain depth limit (levels). */
   maxDelegationDepth: number;
   /** Comma-separated proxy IPs/CIDRs whose X-Forwarded-For is trusted; undefined = trust none. */
   trustedProxies: string | undefined;
   /** RFC 9449 §8 DPoP nonces: 'off' (default) or 'required' (every proof must carry a server nonce). */
   dpopNonce: 'off' | 'required';
+  /** Per-source bound on /oauth/userinfo and /oauth/logout: 'off', 'on' (default), or a positive integer requests/60s. */
+  rateLimit: 'off' | 'on' | number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -155,6 +160,16 @@ export function loadConfig(env: Env): Config {
   const dpopNonce = env.OAUTH2_DPOP_NONCE ?? 'off';
   if (dpopNonce !== 'off' && dpopNonce !== 'required') throw new ConfigError('OAUTH2_DPOP_NONCE must be off or required');
 
+  const rateLimitRaw = env.OAUTH2_RATE_LIMIT ?? 'on';
+  let rateLimit: 'off' | 'on' | number;
+  if (rateLimitRaw === 'off' || rateLimitRaw === 'on') {
+    rateLimit = rateLimitRaw;
+  } else if (/^\d+$/.test(rateLimitRaw) && Number(rateLimitRaw) > 0) {
+    rateLimit = Number(rateLimitRaw);
+  } else {
+    throw new ConfigError('OAUTH2_RATE_LIMIT must be off, on, or a positive integer (requests per 60s)');
+  }
+
   let databasePath = env.OAUTH2_DATABASE_PATH;
   if (production && storage === 'sqlite') {
     if (databasePath === undefined || databasePath.trim() === '' || databasePath === ':memory:') {
@@ -162,6 +177,12 @@ export function loadConfig(env: Env): Config {
     }
   } else if (databasePath === undefined || databasePath.trim() === '') {
     databasePath = ':memory:';
+  }
+
+  let sweepIntervalSeconds = DEFAULT_SWEEP_INTERVAL_SECONDS;
+  if (env.OAUTH2_SWEEP_INTERVAL_SECONDS !== undefined) {
+    if (!/^\d{1,7}$/.test(env.OAUTH2_SWEEP_INTERVAL_SECONDS)) throw new ConfigError('OAUTH2_SWEEP_INTERVAL_SECONDS must be a non-negative integer');
+    sweepIntervalSeconds = Number(env.OAUTH2_SWEEP_INTERVAL_SECONDS);
   }
 
   return {
@@ -177,8 +198,10 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    sweepIntervalSeconds,
     maxDelegationDepth,
     trustedProxies,
     dpopNonce,
+    rateLimit,
   };
 }

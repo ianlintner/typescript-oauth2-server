@@ -121,6 +121,8 @@ export interface AccessTokenRecord {
   revokedAt: number | null;
   /** JWT token hash for lookup. Null for opaque tokens. */
   tokenHash: string | null;
+  /** Identifier of the authorization grant this token descends from. Absent/null for tokens issued before grants were recorded. */
+  grant?: string | null;
 }
 
 export interface RefreshTokenRecord {
@@ -140,6 +142,12 @@ export interface RefreshTokenRecord {
   dpopJkt?: string | null;
   /** RFC 8707 resource the access tokens issued from this token are addressed to; absent/null when none. */
   resource?: string | null;
+}
+
+/** State of a fixed-window counter: hits so far and the epoch second the window ends. */
+export interface WindowCount {
+  count: number;
+  resetAt: number;
 }
 
 export interface Store {
@@ -206,10 +214,13 @@ export interface Store {
   /** Mark a refresh token revoked (no-op for unknown). */
   revokeRefreshToken(jti: string, now: number): Promise<boolean>;
   /**
-   * Revoke the entire family (all tokens in the same family that are not
-   * already revoked). Call on replay detection.
+   * Revoke every live access token and refresh token of one grant. A refresh
+   * token's `family` is its grant identifier. Tokens without a recorded grant
+   * are never affected. When `clientId` is given only that client's tokens are
+   * revoked. Returns the number of refresh tokens revoked. Run it inside the
+   * same transaction as the event that triggers it.
    */
-  revokeTokenFamily(family: string, now: number): Promise<number>;
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number>;
   /**
    * Cutover support (operator-initiated only, never called on startup): count
    * refresh-token rows whose identifier is not in the current digest format
@@ -226,6 +237,21 @@ export interface Store {
    * expiresAt <= now are purged. Must be safe across processes sharing the store.
    */
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean>;
+
+  /**
+   * Atomically add one hit to the fixed-window counter `key`. A missing or expired
+   * window starts a new one of `windowSeconds`. Shared by every process using the store.
+   */
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount>;
+  /** Current counter for `key`, or null when it has no live window. Does not modify state. */
+  peekWindow(key: string, now: number): Promise<WindowCount | null>;
+  /** Number of unexpired pushed requests / device codes, optionally restricted to one client. */
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number>;
+  /**
+   * Remove every record whose expiry is at or before `now` (codes, tokens, device codes,
+   * pushed requests, DPoP proofs, counter windows). Idempotent; returns the number removed.
+   */
+  sweepExpired(now: number): Promise<number>;
 
   /** Run `fn` atomically; commits on resolve, rolls back and rethrows on reject. Not reentrant. */
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T>;

@@ -20,6 +20,12 @@ export interface Deps {
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
   refreshTokenTtl?: number | undefined;
+  /**
+   * Per-source request bound on /oauth/userinfo and /oauth/logout, in requests per 60s.
+   * `false` disables it; a positive integer overrides the default (300). Enforced by
+   * @fastify/rate-limit; also configurable in the shipped server via OAUTH2_RATE_LIMIT.
+   */
+  rateLimit?: boolean | number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces; absent disables them. */
   dpopNonce?: OAuthDeps['dpopNonce'] | undefined;
   /** Whether RFC 7591 dynamic client registration is enabled. Defaults off. */
@@ -44,11 +50,21 @@ export interface Deps {
   trustProxy?: boolean | string | undefined;
   /** Span boundary with fixed, secret-free names; caller controls exporter and sampling. */
   trace?: ((name: string) => () => void) | undefined;
+  /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
+  throttle?: OAuthDeps['throttle'] | undefined;
+  /** Maximum request body in bytes (default 64 KiB; Fastify's own default is 1 MiB). */
+  bodyLimit?: number | undefined;
 }
+
+const DEFAULT_BODY_LIMIT = 64 * 1024;
 
 export function buildServer(deps: Deps): FastifyInstance {
   // Forwarding headers are only honored when the operator names the trusted proxy hop(s).
-  const app = Fastify({ logger: false, ...(deps.trustProxy !== undefined ? { trustProxy: deps.trustProxy } : {}) });
+  const app = Fastify({
+    logger: false,
+    bodyLimit: deps.bodyLimit ?? DEFAULT_BODY_LIMIT,
+    ...(deps.trustProxy !== undefined ? { trustProxy: deps.trustProxy } : {}),
+  });
 
   if (deps.metrics || deps.trace) {
     const starts = new WeakMap<object, { time: number; finish: (() => void) | undefined }>();
@@ -103,15 +119,23 @@ export function buildServer(deps: Deps): FastifyInstance {
 
   if (deps.metrics) app.get('/metrics', async (_req, reply) => reply.type('text/plain; version=0.0.4').send(deps.metrics!.render()));
 
-  // Per-route opt-in budget: the token endpoint authenticates clients and mints tokens, so it is the
-  // brute-force / abuse surface. Keyed by client address; in-memory (per process).
+  // All three bounded routes are enforced by @fastify/rate-limit. OAUTH2_RATE_LIMIT controls the
+  // userinfo/logout budget; tokenRateLimit controls /oauth/token. Both are keyed by client address.
+  const boundedMax = typeof deps.rateLimit === 'number' ? deps.rateLimit : 300;
+  const bounded = deps.rateLimit === false
+    ? false
+    : { rateLimit: { max: boundedMax, timeWindow: 60_000 } };
+
   const limit = deps.tokenRateLimit ?? { max: 120, windowSeconds: 60 };
   void app.register(rateLimit, {
     global: false,
     errorResponseBuilder: (_req, ctx) => Object.assign(new Error('rate limited'), { statusCode: 429, retryAfter: Math.ceil(ctx.ttl / 1000) }),
   });
   // after(): routes must be added once the plugin's onRoute hook is live, in the same (unscoped) context.
-  app.after(() => registerOAuthRoutes(app, deps, { rateLimit: { max: limit.max, timeWindow: limit.windowSeconds * 1000 } }));
+  app.after(() => registerOAuthRoutes(app, deps, {
+    token: { rateLimit: { max: limit.max, timeWindow: limit.windowSeconds * 1000 } },
+    bounded,
+  }));
 
   registerExtensionRoutes(app, {
     store: deps.store,
@@ -121,6 +145,7 @@ export function buildServer(deps: Deps): FastifyInstance {
     issuer: deps.issuer,
     authenticate: deps.authenticate,
     dynamicRegistration: deps.dynamicRegistration,
+    throttle: deps.throttle,
     registrationPolicy: deps.registrationPolicy,
   });
 

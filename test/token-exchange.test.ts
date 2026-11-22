@@ -61,6 +61,30 @@ async function setup(opts: { maxDelegationDepth?: number; clients?: Partial<Clie
   return { store, server, signer: signer as Signer, state, post, cc, mint, exchange };
 }
 
+test('exchanged access token inherits the subject grant and is revoked by its cascade', async () => {
+  const c = await setup();
+  const grant = `grant-${randomUUID()}`;
+  const jti = `subject-${randomUUID()}`;
+  const subjectToken = await c.signer.sign({
+    iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read',
+    iat: T0, exp: T0 + 3600, jti,
+  }, { typ: ACCESS_TOKEN_TYP });
+  await c.store.saveAccessToken({
+    jti, clientId: 'a', subject: 'a', scope: 'read',
+    expiresAt: T0 + 3600, revokedAt: null, tokenHash: null, grant,
+  });
+  const res = await c.exchange('a', { subject_token: subjectToken, scope: 'read' });
+  assert.equal(res.statusCode, 200, res.body);
+  const exchangedJti = String(decodeJwt(res.json().access_token)!.jti);
+  const before = await c.store.getAccessToken(exchangedJti, T0);
+  assert.ok(before);
+  assert.equal(before!.grant, grant);
+  await c.store.revokeGrant(grant, T0);
+  assert.equal(await c.store.getAccessToken(exchangedJti, T0), null);
+  await c.server.close();
+  await c.store.close();
+});
+
 // ---- positive paths ----
 
 test('same-client exchange narrows scope and returns RFC 8693 response members', async () => {
