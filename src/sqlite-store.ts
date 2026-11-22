@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS rate_windows (
 );
 CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires ON authorization_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_access_tokens_expires ON access_tokens(expires_at);
-CREATE INDEX IF NOT EXISTS idx_access_tokens_grant ON access_tokens(grant_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family);
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes(expires_at);
@@ -745,6 +744,8 @@ export class SqliteStore implements Store {
     // Databases created before grant linking lack the access-token grant column.
     const atCols = db.prepare('PRAGMA table_info(access_tokens)').all() as unknown as Array<{ name: string }>;
     if (!atCols.some((c) => c.name === 'grant_id')) db.exec('ALTER TABLE access_tokens ADD COLUMN grant_id TEXT');
+    // Indexed after the migration: an older database has no grant_id when SCHEMA runs.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_access_tokens_grant ON access_tokens(grant_id);');
     this.#db = db;
   }
 
