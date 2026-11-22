@@ -2,7 +2,6 @@ import { createHash, randomInt } from 'node:crypto';
 import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
-import { registerRouteBounds, RouteBounds } from './rate-limit.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord } from './ports.js';
@@ -77,12 +76,6 @@ export interface ExtDeps {
   dynamicRegistration?: boolean | undefined;
   /** Allow-lists and optional initial access token for dynamic registration. */
   registrationPolicy?: RegistrationPolicy | undefined;
-  /**
-   * Whether the per-source bound on /oauth/userinfo and /oauth/logout is enabled, and its
-   * effective max (requests per 60s). Resolved by buildServer from Deps.rateLimit.
-   */
-  rateLimitEnabled?: boolean | undefined;
-  rateLimitMax?: number | undefined;
 }
 
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -106,10 +99,6 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
   const iatDigest = deps.registrationPolicy?.initialAccessToken
     ? sha256(deps.registrationPolicy.initialAccessToken) : undefined;
   const guessState = new Map<string, { count: number; windowStart: number }>();
-  // Per-source bound on the core OAuth routes (userinfo, logout). The hook is added to the same
-  // root instance that owns those routes; Fastify finalises onRequest hooks at ready(), so it
-  // applies even though registerOAuthRoutes ran earlier. It acts only on the declared paths.
-  if (deps.rateLimitEnabled !== false) registerRouteBounds(app, new RouteBounds(), deps.clock, deps.rateLimitMax);
   // -- RFC 8628 device authorization endpoint --
   // POST /oauth/device_authorization  (also /oauth/device for the reference admin path)
   const deviceAuth = async (req: FastifyRequest, reply: FastifyReply) => {
