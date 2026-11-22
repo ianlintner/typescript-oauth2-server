@@ -30,6 +30,11 @@ export interface ClientRecord {
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
   jwksUri?: string | null | undefined;
+  /**
+   * RFC 8693 delegation allow-list: client_ids permitted to exchange tokens issued to this client
+   * or to act for its subjects. Operator-provisioned only; never settable via dynamic registration.
+   */
+  allowedActors?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }

@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -18,6 +20,10 @@ export interface Config {
   signingKeyPem: string;
   signingKeyId: string;
   adminToken: string | undefined;
+  /** RFC 8693 act-chain depth limit (levels). */
+  maxDelegationDepth: number;
+  /** Comma-separated proxy IPs/CIDRs whose X-Forwarded-For is trusted; undefined = trust none. */
+  trustedProxies: string | undefined;
   /** RFC 9449 §8 DPoP nonces: 'off' (default) or 'required' (every proof must carry a server nonce). */
   dpopNonce: 'off' | 'required';
 }
@@ -118,6 +124,34 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  let maxDelegationDepth = 4;
+  if (env.OAUTH2_MAX_DELEGATION_DEPTH !== undefined && env.OAUTH2_MAX_DELEGATION_DEPTH.trim() !== '') {
+    const raw = env.OAUTH2_MAX_DELEGATION_DEPTH.trim();
+    maxDelegationDepth = /^\d+$/.test(raw) ? Number(raw) : 0;
+    if (maxDelegationDepth < 1 || maxDelegationDepth > 32) {
+      throw new ConfigError('OAUTH2_MAX_DELEGATION_DEPTH must be an integer between 1 and 32');
+    }
+  }
+
+  // Explicit proxy allow-list only (IP or CIDR); a blanket "trust everything" value is refused
+  // because it would let any caller spoof X-Forwarded-For past the token-endpoint rate limiter.
+  let trustedProxies: string | undefined;
+  const rawProxies = env.OAUTH2_TRUSTED_PROXIES?.trim();
+  if (rawProxies) {
+    const entries = rawProxies.split(',').map((e) => e.trim());
+    for (const e of entries) {
+      const [addr = '', prefix, extra] = e.split('/');
+      const family = isIP(addr);
+      const maxPrefix = family === 4 ? 32 : 128;
+      const prefixOk = prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) <= maxPrefix);
+      const wildcard = prefix !== undefined && Number(prefix) === 0;
+      if (family === 0 || extra !== undefined || !prefixOk || wildcard) {
+        throw new ConfigError('OAUTH2_TRUSTED_PROXIES must be a comma-separated list of proxy IPs or CIDRs (not /0)');
+      }
+    }
+    trustedProxies = entries.join(',');
+  }
+
   const dpopNonce = env.OAUTH2_DPOP_NONCE ?? 'off';
   if (dpopNonce !== 'off' && dpopNonce !== 'required') throw new ConfigError('OAUTH2_DPOP_NONCE must be off or required');
 
@@ -143,6 +177,8 @@ export function loadConfig(env: Env): Config {
     signingKeyPem,
     signingKeyId,
     adminToken,
+    maxDelegationDepth,
+    trustedProxies,
     dpopNonce,
   };
 }
