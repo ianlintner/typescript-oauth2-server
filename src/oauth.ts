@@ -605,13 +605,22 @@ export function registerOAuthRoutes(
       throw new OAuthError('invalid_request', 'request object is required for this client');
     }
 
-    const authorizationDetails = parseAuthorizationDetails(
-      single(params, 'authorization_details'),
-      client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? [],
-    );
-
     const state = single(params, 'state');
     const fail = (error: string) => redirectTo(reply, effectiveRedirectUri, { error, state, iss: deps.issuer });
+
+    // RFC 9396 §5: the client's redirect_uri is already validated above, so
+    // report invalid authorization_details through the redirect rather than a
+    // bare JSON error.
+    let authorizationDetails: ReturnType<typeof parseAuthorizationDetails>;
+    try {
+      authorizationDetails = parseAuthorizationDetails(
+        single(params, 'authorization_details'),
+        client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? [],
+      );
+    } catch (err) {
+      if (err instanceof OAuthError && err.code === 'invalid_authorization_details') return fail('invalid_authorization_details');
+      throw err;
+    }
 
     // RFC 6749 §4.1.2.1: a missing response_type is invalid_request; a present but unsupported
     // value (e.g. the implicit `token`) is unsupported_response_type.
@@ -755,6 +764,7 @@ export function registerOAuthRoutes(
         token_type: jkt ? 'DPoP' : 'Bearer',
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         ...(scopes !== '' ? { scope: scopes } : {}),
+        ...(record.authorizationDetails ? { authorization_details: record.authorizationDetails } : {}),
       };
 
       // ID token for openid
@@ -781,6 +791,7 @@ export function registerOAuthRoutes(
           scope: scopes, expiresAt: iat + refreshTtl,
           family: rtId, // each auth code creates a new family (digest of its first token)
           parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+          authorizationDetails: record.authorizationDetails,
         });
         body.refresh_token = rtValue;
       }
@@ -881,6 +892,7 @@ export function registerOAuthRoutes(
         family: consumed.family,
         parentJti: consumed.jti,
         revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        authorizationDetails: consumed.authorizationDetails,
       });
 
       // Rotation vs. replay race: a concurrent replay may revoke the family after this request
@@ -904,6 +916,7 @@ export function registerOAuthRoutes(
       };
       if (allowedScope) claims.scope = allowedScope;
       if (jkt) claims.cnf = { jkt };
+      if (consumed.authorizationDetails) claims.authorization_details = consumed.authorizationDetails;
       const accessToken = await deps.signer.sign(claims);
 
       await deps.store.saveAccessToken({
@@ -917,6 +930,7 @@ export function registerOAuthRoutes(
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         refresh_token: newRtValue,
         ...(allowedScope ? { scope: allowedScope } : {}),
+        ...(consumed.authorizationDetails ? { authorization_details: consumed.authorizationDetails } : {}),
       };
 
       if (includesOpenid) {

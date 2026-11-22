@@ -141,6 +141,8 @@ export interface RefreshTokenRecord {
   revokedAt: number | null;
   /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
   dpopJkt?: string | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
 }
 
 /** State of a fixed-window counter: hits so far and the epoch second the window ends. */

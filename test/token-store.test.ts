@@ -218,12 +218,15 @@ test('legacy refresh_tokens table gains dpop_jkt on init; save, rotate and repea
       assert.equal(old.dpopJkt ?? null, null);
 
       // New tokens (bound) can be saved, then rotated.
-      await s.saveRefreshToken({ ...rt, jti: 'rt-bound', family: 'fam-new', dpopJkt: 'thumb-1' });
+      const rar = [{ type: 'payment', actions: ['read'] }];
+      await s.saveRefreshToken({ ...rt, jti: 'rt-bound', family: 'fam-new', dpopJkt: 'thumb-1', authorizationDetails: rar });
       const consumed = await s.consumeRefreshToken('rt-bound', 1000);
       assert.ok(consumed);
       assert.equal(consumed.dpopJkt, 'thumb-1');
-      await s.saveRefreshToken({ ...rt, jti: 'rt-bound-2', family: 'fam-new', parentJti: 'rt-bound', dpopJkt: 'thumb-1' });
+      assert.deepEqual(consumed.authorizationDetails, rar);
+      await s.saveRefreshToken({ ...rt, jti: 'rt-bound-2', family: 'fam-new', parentJti: 'rt-bound', dpopJkt: 'thumb-1', authorizationDetails: rar });
       assert.equal((await s.getRefreshToken('rt-bound-2', 1000))?.dpopJkt, 'thumb-1');
+      assert.deepEqual((await s.getRefreshToken('rt-bound-2', 1000))?.authorizationDetails, rar);
       assert.ok(await s.consumeRefreshToken('rt-old', 1000));
     } finally {
       await s.close();

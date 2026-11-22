@@ -29,7 +29,7 @@ async function setup(opts: SetupOpts = {}) {
   const store = new SqliteStore(':memory:');
   await store.init();
   const base: Omit<ClientRecord, 'clientId' | 'clientSecretHash'> = {
-    redirectUris: [CB], grantTypes: ['authorization_code'], scopes: ['read', 'write'], enabled: true,
+    redirectUris: [CB], grantTypes: ['authorization_code', 'refresh_token'], scopes: ['read', 'write'], enabled: true,
   };
   await store.saveClient({ ...base, clientId: 'pub', clientSecretHash: null,
     requireSignedRequestObject: opts.clientRequireSignedRequestObject });
@@ -71,6 +71,12 @@ async function hsJar(claims: Record<string, unknown>, secret = SECRET): Promise<
     .sign(new TextEncoder().encode(secret));
 }
 
+async function esJar(claims: Record<string, unknown>, kid: string, key: Parameters<SignJWT['sign']>[0]): Promise<string> {
+  return new SignJWT(claims).setProtectedHeader({ alg: 'ES256', kid })
+    .setIssuedAt().setExpirationTime('5m').setIssuer('conf').setAudience(`${ISSUER}/oauth/authorize`)
+    .sign(key);
+}
+
 async function rsJar(claims: Record<string, unknown>, kid: string, key: Parameters<SignJWT['sign']>[0]): Promise<string> {
   return new SignJWT(claims).setProtectedHeader({ alg: 'RS256', kid })
     .setIssuedAt().setExpirationTime('5m').setIssuer('conf').setAudience(`${ISSUER}/oauth/authorize`)
@@ -93,6 +99,76 @@ test('JAR unsigned request object from public client overrides query claims', as
   const loc = new URL(res.headers.location as string);
   assert.equal(res.statusCode, 302, res.body);
   assert.equal(loc.searchParams.get('state'), 'jar-state');
+  await done(s);
+});
+
+test('JAR request object is the sole source of authorization parameters (RFC 9101 §6.3)', async () => {
+  const s = await setup({ authorizationDetailsTypesSupported: ['payment'] });
+  const jar = await unsignedJar({ iss: 'pub', aud: `${ISSUER}/oauth/authorize`, exp: 2_000_000,
+    response_type: 'code', client_id: 'pub', redirect_uri: CB, state: 'jar-state', scope: 'read',
+    code_challenge: CHALLENGE, code_challenge_method: 'S256',
+    authorization_details: JSON.stringify(RAR) });
+  // The outer URL keeps the trusted client_id/redirect_uri needed to select the
+  // client, but every authorization parameter below comes only from the query.
+  // A signed JAR must not inherit them: otherwise anyone who can edit the URL
+  // can substitute PKCE, escalate scope or inject authorization_details.
+  const res = await authorize(s.server, {
+    request: jar, state: 'query-state', scope: 'write',
+    code_challenge: createHash('sha256').update('x'.repeat(43)).digest('base64url'),
+    code_challenge_method: 'S256',
+    authorization_details: JSON.stringify([{ type: 'payment', actions: ['write'] }]),
+    nonce: 'query-nonce', login_hint: 'attacker@example.test',
+  });
+  assert.equal(res.statusCode, 302, res.body);
+  const loc = new URL(res.headers.location as string);
+  assert.equal(loc.searchParams.get('state'), 'jar-state', 'unsigned state must not override the JAR');
+  const code = loc.searchParams.get('code');
+  assert.ok(code);
+  const record = await s.store.consumeAuthorizationCode(
+    createHash('sha256').update(code).digest('hex'), 1_000_000 + 1);
+  assert.equal(record?.scope, 'read', 'unsigned query scope must not be merged');
+  assert.equal(record?.nonce, null, 'unsigned query nonce must not be merged');
+  assert.deepEqual(record?.authorizationDetails, RAR, 'unsigned query RAR must not be merged');
+  await done(s);
+});
+
+test('JAR signed request object still succeeds when query adds unsigned extras', async () => {
+  const s = await setup({ authorizationDetailsTypesSupported: ['payment'] });
+  const jar = await unsignedJar({ iss: 'pub', aud: `${ISSUER}/oauth/authorize`, exp: 2_000_000,
+    response_type: 'code', client_id: 'pub', redirect_uri: CB, state: 'jar-state', scope: 'read',
+    code_challenge: CHALLENGE, code_challenge_method: 'S256',
+    authorization_details: JSON.stringify(RAR), nonce: 'jar-nonce' });
+  const res = await authorize(s.server, { request: jar, prompt: 'login', max_age: '0',
+    login_hint: 'attacker@example.test' });
+  assert.equal(res.statusCode, 302, res.body);
+  const loc = new URL(res.headers.location as string);
+  assert.equal(loc.searchParams.get('state'), 'jar-state');
+  const code = loc.searchParams.get('code');
+  assert.ok(code);
+  const record = await s.store.consumeAuthorizationCode(
+    createHash('sha256').update(code).digest('hex'), 1_000_000 + 1);
+  assert.deepEqual(record?.authorizationDetails, RAR);
+  assert.equal(record?.nonce, 'jar-nonce');
+  await done(s);
+});
+
+test('RAR authorization_details are returned in the token response and survive refresh', async () => {
+  const s = await setup({ authorizationDetailsTypesSupported: ['payment'] });
+  const res = await authorize(s.server, { client_id: 'conf', scope: 'read', authorization_details: JSON.stringify(RAR) });
+  const code = await codeFrom(res);
+  const basic = `Basic ${Buffer.from(`conf:${SECRET}`).toString('base64')}`;
+  const exchanged = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'authorization_code', code,
+      redirect_uri: CB, code_verifier: VERIFIER }).toString() });
+  assert.equal(exchanged.statusCode, 200, exchanged.body);
+  assert.deepEqual(exchanged.json().authorization_details, RAR);
+  const refresh = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'refresh_token',
+      refresh_token: exchanged.json().refresh_token }).toString() });
+  assert.equal(refresh.statusCode, 200, refresh.body);
+  assert.deepEqual(refresh.json().authorization_details, RAR);
   await done(s);
 });
 
@@ -171,12 +247,12 @@ test('RAR authorization_details survive authorize to tokens and introspection', 
   await done(s);
 });
 
-test('RAR rejects unknown type, malformed JSON and non-array details at authorize', async () => {
+test('RAR rejects unknown type, malformed JSON and non-array details at authorize by redirect', async () => {
   const s = await setup({ authorizationDetailsTypesSupported: ['payment'] });
   for (const value of [JSON.stringify([{ type: 'unknown' }]), 'not-json', '{}', JSON.stringify([{ actions: ['read'] }])]) {
     const res = await authorize(s.server, { authorization_details: value });
-    assert.equal(res.statusCode, 400, `${value} ${res.body}`);
-    assert.equal(res.json().error, 'invalid_authorization_details');
+    assert.equal(res.statusCode, 302, `${value} ${res.body}`);
+    assert.equal(new URL(res.headers.location as string).searchParams.get('error'), 'invalid_authorization_details');
   }
   await done(s);
 });
@@ -251,3 +327,59 @@ async function exportJwkPublic(key: unknown): Promise<JWK> {
   const { exportJWK } = await import('jose');
   return exportJWK(key as Parameters<typeof exportJWK>[0]) as Promise<JWK>;
 }
+
+test('JAR accepts an ES256 signed request object with a registered EC key', async () => {
+  const { privateKey, publicKey } = await generateKeyPair('ES256', { extractable: true });
+  const jwk = await exportJwkPublic(publicKey);
+  const s = await setup({ authMethod: 'private_key_jwt', jwks: { keys: [{ ...jwk, kid: 'ec-1', use: 'sig' }] } });
+  const jar = await esJar({ response_type: 'code', redirect_uri: CB, state: 'es' }, 'ec-1', privateKey);
+  const res = await authorize(s.server, { client_id: 'conf', request: jar });
+  assert.equal(res.statusCode, 302, res.body);
+  assert.equal(new URL(res.headers.location as string).searchParams.get('state'), 'es');
+  await done(s);
+});
+
+test('JAR rejects a signed request object with a client_id mismatch', async () => {
+  const { privateKey, publicKey } = await generateKeyPair('RS256', { extractable: true });
+  const jwk = await exportJwkPublic(publicKey);
+  const s = await setup({ authMethod: 'private_key_jwt', jwks: { keys: [{ ...jwk, kid: 'rs-1', use: 'sig' }] } });
+  const jar = await rsJar({ response_type: 'code', redirect_uri: CB, client_id: 'pub', state: 'x' }, 'rs-1', privateKey);
+  const res = await authorize(s.server, { client_id: 'conf', request: jar });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+  await done(s);
+});
+
+test('JAR rejects a signed request object with an unregistered redirect_uri', async () => {
+  const { privateKey, publicKey } = await generateKeyPair('RS256', { extractable: true });
+  const jwk = await exportJwkPublic(publicKey);
+  const s = await setup({ authMethod: 'private_key_jwt', jwks: { keys: [{ ...jwk, kid: 'rs-1', use: 'sig' }] } });
+  const jar = await rsJar({ response_type: 'code', redirect_uri: 'https://attacker.example/cb' }, 'rs-1', privateKey);
+  const res = await authorize(s.server, { client_id: 'conf', request: jar });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+  await done(s);
+});
+
+test('JAR rejects a signed request object addressed to another audience', async () => {
+  const { privateKey, publicKey } = await generateKeyPair('RS256', { extractable: true });
+  const jwk = await exportJwkPublic(publicKey);
+  const s = await setup({ authMethod: 'private_key_jwt', jwks: { keys: [{ ...jwk, kid: 'rs-1', use: 'sig' }] } });
+  const jar = await new SignJWT({ response_type: 'code', redirect_uri: CB })
+    .setProtectedHeader({ alg: 'RS256', kid: 'rs-1' }).setIssuedAt().setExpirationTime('5m')
+    .setIssuer('conf').setAudience(`${ISSUER}/oauth/token`).sign(privateKey);
+  const res = await authorize(s.server, { client_id: 'conf', request: jar });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+  await done(s);
+});
+
+test('JAR rejects an unsigned request object with the wrong audience', async () => {
+  const s = await setup();
+  const jar = await unsignedJar({ iss: 'pub', aud: `${ISSUER}/oauth/token`, exp: 2_000_000,
+    response_type: 'code', client_id: 'pub', redirect_uri: CB });
+  const res = await authorize(s.server, { request: jar });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
+  await done(s);
+});

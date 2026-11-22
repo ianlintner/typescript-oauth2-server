@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   consumed_at INTEGER,
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER,
-  dpop_jkt TEXT
+  dpop_jkt TEXT,
+  authorization_details TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT PRIMARY KEY,
@@ -220,6 +221,7 @@ interface RefreshTokenRow {
   revoked_at: number | null;
   revoked_by_replay_at: number | null;
   dpop_jkt: string | null;
+  authorization_details: string | null;
 }
 
 function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
@@ -246,6 +248,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     revokedByReplayAt: r.revoked_by_replay_at,
     revokedAt: r.revoked_at,
     dpopJkt: r.dpop_jkt,
+    authorizationDetails: r.authorization_details === null ? undefined : JSON.parse(r.authorization_details) as unknown[],
   };
 }
 
@@ -452,9 +455,10 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null);
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, authorization_details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null,
+      t.authorizationDetails === undefined || t.authorizationDetails === null ? null : JSON.stringify(t.authorizationDetails));
   },
 
   // INSERT OR IGNORE on the primary key: the database decides the winner across connections and processes.
@@ -751,6 +755,8 @@ export class SqliteStore implements Store {
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
+    // Databases created before RFC 9396 support lack the RAR refresh-token column.
+    if (!rtCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT');
     this.#db = db;
   }
 

@@ -35,7 +35,8 @@ function decodeJar(request: string): { header: Record<string, unknown>; claims: 
 }
 
 const JAR_CLAIM_KEYS = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'nonce',
-  'code_challenge', 'code_challenge_method', 'authorization_details', 'claims', 'acr_values', 'resource'] as const;
+  'code_challenge', 'code_challenge_method', 'authorization_details', 'claims', 'acr_values', 'resource',
+  'prompt', 'max_age', 'login_hint'] as const;
 
 /**
  * RFC 9101 §4: verify the request object and return its authorization parameters.
@@ -54,6 +55,13 @@ export async function verifyJar(request: string, client: ClientRecord, authoriza
   const exp = claims.exp;
   if (typeof exp !== 'number' || exp <= now) {
     throw new OAuthError('invalid_request', "JAR 'exp' claim is missing or expired");
+  }
+  // RFC 9101 §4.2: aud must identify the authorization endpoint, for every alg
+  // (including alg=none, where no signature otherwise constrains the claims).
+  const aud = claims.aud;
+  const audiences = typeof aud === 'string' ? [aud] : Array.isArray(aud) ? aud : [];
+  if (!audiences.includes(authorizationEndpoint)) {
+    throw new OAuthError('invalid_request', "JAR 'aud' claim must be the authorization endpoint");
   }
 
   if (alg === 'none') {
@@ -92,15 +100,39 @@ export async function verifyJar(request: string, client: ClientRecord, authoriza
   return merged;
 }
 
-/** JAR claim values take precedence over the query, and outer client_id/redirect_uri must agree. */
+/**
+ * RFC 9101 §6.3: when a request object is used, the signed claims are the sole
+ * source of authorization parameters. Only the outer client_id/redirect_uri
+ * (needed to locate and validate the client) are carried over, and both must
+ * agree with the signed values. Copying unsigned query parameters here would
+ * let an attacker substitute PKCE challenges, escalate scope or inject RAR.
+ */
 export function mergeJarParams(params: URLSearchParams, jarClaims: Record<string, string>, client: ClientRecord): URLSearchParams {
   if (jarClaims.client_id !== undefined && jarClaims.client_id !== client.clientId) {
     throw new OAuthError('invalid_request', "JAR 'iss' claim must equal client_id");
   }
+  const outerClientId = singleParam(params, 'client_id');
+  if (outerClientId !== undefined && outerClientId !== client.clientId) {
+    throw new OAuthError('invalid_request', 'JAR client_id does not match the outer request');
+  }
   if (jarClaims.redirect_uri !== undefined && !client.redirectUris.includes(jarClaims.redirect_uri)) {
     throw new OAuthError('invalid_request', 'JAR redirect_uri is not registered for this client');
   }
-  const merged = new URLSearchParams(params);
+  const outerRedirect = singleParam(params, 'redirect_uri');
+  if (outerRedirect !== undefined && jarClaims.redirect_uri !== undefined && outerRedirect !== jarClaims.redirect_uri) {
+    throw new OAuthError('invalid_request', 'JAR redirect_uri does not match the outer request');
+  }
+  const merged = new URLSearchParams();
+  // client_id is always required by the caller; take it from the signed claim
+  // when present so the value used downstream is the authenticated one.
+  merged.set('client_id', jarClaims.client_id ?? outerClientId ?? client.clientId);
+  if (jarClaims.redirect_uri !== undefined) merged.set('redirect_uri', jarClaims.redirect_uri);
+  else if (outerRedirect !== undefined) merged.set('redirect_uri', outerRedirect);
   for (const [key, value] of Object.entries(jarClaims)) merged.set(key, value);
   return merged;
+}
+
+function singleParam(params: URLSearchParams, key: string): string | undefined {
+  const values = params.getAll(key);
+  return values.length === 1 ? values[0] : undefined;
 }
