@@ -7,7 +7,7 @@ import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceCon
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { redirectUriMatches } from './redirect-uri.js';
-import { routeBoundConfig } from './rate-limit.js';
+import { BOUNDED_REQUESTS_PER_SOURCE, BOUNDED_WINDOW_SECONDS } from './rate-limit.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 
 export const CODE_TTL_SECONDS = 60;
@@ -1003,7 +1003,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- UserInfo --
-  app.get('/oauth/userinfo', routeBoundConfig, async (req, reply) => {
+  app.get('/oauth/userinfo', { config: { rateLimit: { max: BOUNDED_REQUESTS_PER_SOURCE, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
     const presented = presentedToken(req);
     if (!presented) {
       return reply.status(401).header('www-authenticate', 'Bearer').send({ error: 'invalid_token' });
@@ -1048,7 +1048,7 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthDeps): void
   });
 
   // -- RP-initiated logout (OIDC RP-Initiated Logout 1.0 §2) --
-  app.get('/oauth/logout', routeBoundConfig, async (req, reply) => {
+  app.get('/oauth/logout', { config: { rateLimit: { max: BOUNDED_REQUESTS_PER_SOURCE, timeWindow: BOUNDED_WINDOW_SECONDS * 1000 } } }, async (req, reply) => {
     const params = new URL(req.url, 'http://localhost').searchParams;
     rejectDuplicates(params);
     const hint = single(params, 'id_token_hint');

@@ -60,19 +60,6 @@ export const retryAfterSeconds = (window: Window, now: number): number =>
   Math.max(1, window.windowStart + BOUNDED_WINDOW_SECONDS - now);
 
 /**
- * Route context bound applied to the two expensive routes. The onRequest hook installed by
- * {@link registerRouteBounds} reads this config, so the limit is declared next to each route.
- */
-export const routeBoundConfig = Object.freeze({
-  config: {
-    rateLimit: {
-      max: BOUNDED_REQUESTS_PER_SOURCE,
-      timeWindow: BOUNDED_WINDOW_SECONDS * 1000,
-    },
-  },
-});
-
-/**
  * Refuses a request whose source has used up the route's budget for the current window, with an
  * RFC 6749 §5.2 `temporarily_unavailable` and Retry-After. Runs as onRequest, before routing handlers,
  * so no JWT verification, store lookup or session change happens for a refused request.
