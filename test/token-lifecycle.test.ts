@@ -795,6 +795,28 @@ test('concurrent authorization code redemption leaves no live token from a repla
   await done(s);
 });
 
+test('wrong-client authorization code replay does not revoke the issuing client tokens', async () => {
+  const s = await setup();
+  const otherSecret = 'another-confidential-secret-value';
+  await s.store.saveClient({
+    clientId: 'conf-2', clientSecretHash: await hashClientSecret(otherSecret),
+    redirectUris: [CB], grantTypes: ['authorization_code', 'refresh_token'],
+    scopes: ['openid', 'read', 'write'], enabled: true,
+  });
+  const code = await authorizeCode(s.server, 'conf');
+  const first = await redeemCode(s.server, code);
+  assert.equal(first.statusCode, 200);
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 200, active: true });
+
+  const wrongClient = await token(s.server, {
+    grant_type: 'authorization_code', code, redirect_uri: CB, code_verifier: VERIFIER,
+    client_id: 'conf-2', client_secret: otherSecret,
+  });
+  assert.equal(wrongClient.statusCode, 400);
+  assert.deepEqual(await accessTokenState(s, first.json().access_token), { userinfo: 200, active: true });
+  await done(s);
+});
+
 test('concurrent refresh rotation leaves no live token once the grant is revoked', async () => {
   const s = await setup();
   const first = await exchangeCode(s.server, { client_id: 'conf', scope: 'read' }, confAuth);

@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS rate_windows (
 );
 CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires ON authorization_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_access_tokens_expires ON access_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_access_tokens_grant ON access_tokens(grant_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family);
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_device_codes_client ON device_codes(client_id);
 CREATE INDEX IF NOT EXISTS idx_par_requests_expires ON par_requests(expires_at);

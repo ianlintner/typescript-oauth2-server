@@ -755,7 +755,7 @@ export function registerOAuthRoutes(
           });
           body.refresh_token = rtValue;
         }
-      return { body };
+        return { body };
       });
       if ('error' in outcome) throw outcome.error;
       return reply.header('pragma', 'no-cache').send(outcome.body);

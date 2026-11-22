@@ -119,12 +119,15 @@ export abstract class DocumentStore implements Store {
     return true;
   }); }
   revokeGrant(grant: string, now: number, clientId?: string): Promise<number> { return this.run(async db => {
-    for (const a of await db.list<AccessTokenRecord>('access')) if (a.grant === grant && a.revokedAt === null && (clientId === undefined || a.clientId === clientId)) {
-      await db.put('access', a.jti, { ...a, revokedAt: now });
+    const filter = (r: { clientId: string }) => clientId === undefined || r.clientId === clientId;
+    for (const a of await db.find<AccessTokenRecord>('access', 'grant', grant)) {
+      if (a.revokedAt === null && filter(a)) await db.put('access', a.jti, { ...a, revokedAt: now });
     }
     let count = 0;
-    for (const r of await db.list<RefreshTokenRecord>('refresh')) if (r.family === grant && r.revokedAt === null && r.revokedByReplayAt === null && (clientId === undefined || r.clientId === clientId)) {
-      await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
+    for (const r of await db.find<RefreshTokenRecord>('refresh', 'family', grant)) {
+      if (r.revokedAt === null && r.revokedByReplayAt === null && filter(r)) {
+        await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
+      }
     }
     return count;
   }); }
