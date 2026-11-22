@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS access_tokens (
   scope TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   revoked_at INTEGER,
-  token_hash TEXT
+  token_hash TEXT,
+  grant_id TEXT
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   jti TEXT PRIMARY KEY,
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS rate_windows (
 CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires ON authorization_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_access_tokens_expires ON access_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family);
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_device_codes_client ON device_codes(client_id);
 CREATE INDEX IF NOT EXISTS idx_par_requests_expires ON par_requests(expires_at);
@@ -207,6 +209,7 @@ interface AccessTokenRow {
   expires_at: number;
   revoked_at: number | null;
   token_hash: string | null;
+  grant_id: string | null;
 }
 
 interface RefreshTokenRow {
@@ -233,6 +236,7 @@ function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
     expiresAt: r.expires_at,
     revokedAt: r.revoked_at,
     tokenHash: r.token_hash,
+    grant: r.grant_id,
   };
 }
 
@@ -432,9 +436,9 @@ const ops = {
 
   saveAccessToken(db: DatabaseSync, t: AccessTokenRecord): void {
     db.prepare(
-      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash);
+      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash, grant_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash, t.grant ?? null);
   },
 
   getAccessToken(db: DatabaseSync, jti: string, now: number): AccessTokenRecord | null {
@@ -552,11 +556,16 @@ const ops = {
     return res.changes > 0;
   },
 
-  revokeTokenFamily(db: DatabaseSync, family: string, now: number): number {
+  revokeGrant(db: DatabaseSync, grant: string, now: number, clientId?: string): number {
+    const client = clientId === undefined ? '' : ' AND client_id = ?';
+    const extra = clientId === undefined ? [] : [clientId];
+    db.prepare(
+      `UPDATE access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     const res = db.prepare(
       `UPDATE refresh_tokens SET revoked_at = ?
-       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL`,
-    ).run(now, family);
+       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     return Number(res.changes);
   },
 
@@ -682,6 +691,9 @@ class TxStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#use((db) => ops.revokeGrant(db, grant, now, clientId));
+  }
   recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
     return this.#use((db) => ops.recordWindowHit(db, key, windowSeconds, now));
   }
@@ -693,9 +705,6 @@ class TxStore implements Store {
   }
   sweepExpired(now: number): Promise<number> {
     return this.#use((db) => ops.sweepExpired(db, now));
-  }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#use((db) => ops.revokeTokenFamily(db, family, now));
   }
   countLegacyRefreshTokens(): Promise<number> {
     return this.#use((db) => ops.countLegacyRefreshTokens(db));
@@ -757,6 +766,11 @@ export class SqliteStore implements Store {
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
     // Databases created before RFC 9396 support lack the RAR refresh-token column.
     if (!rtCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT');
+    // Databases created before grant linking lack the access-token grant column.
+    const atCols = db.prepare('PRAGMA table_info(access_tokens)').all() as unknown as Array<{ name: string }>;
+    if (!atCols.some((c) => c.name === 'grant_id')) db.exec('ALTER TABLE access_tokens ADD COLUMN grant_id TEXT');
+    // Indexed after the migration: an older database has no grant_id when SCHEMA runs.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_access_tokens_grant ON access_tokens(grant_id);');
     this.#db = db;
   }
 
@@ -846,6 +860,9 @@ export class SqliteStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#enqueue((db) => ops.revokeGrant(db, grant, now, clientId));
+  }
   recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
     return this.#enqueue((db) => ops.recordWindowHit(db, key, windowSeconds, now));
   }
@@ -857,9 +874,6 @@ export class SqliteStore implements Store {
   }
   sweepExpired(now: number): Promise<number> {
     return this.#enqueue((db) => ops.sweepExpired(db, now));
-  }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
   }
   countLegacyRefreshTokens(): Promise<number> {
     return this.#enqueue((db) => ops.countLegacyRefreshTokens(db));

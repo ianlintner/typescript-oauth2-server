@@ -118,10 +118,16 @@ export abstract class DocumentStore implements Store {
     await db.put('refresh', id, { ...r, revokedAt: now });
     return true;
   }); }
-  revokeTokenFamily(family: string, now: number): Promise<number> { return this.run(async db => {
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> { return this.run(async db => {
+    const filter = (r: { clientId: string }) => clientId === undefined || r.clientId === clientId;
+    for (const a of await db.find<AccessTokenRecord>('access', 'grant', grant)) {
+      if (a.revokedAt === null && filter(a)) await db.put('access', a.jti, { ...a, revokedAt: now });
+    }
     let count = 0;
-    for (const r of await db.find<RefreshTokenRecord>('refresh', 'family', family)) if (r.revokedAt === null && r.revokedByReplayAt === null) {
-      await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
+    for (const r of await db.find<RefreshTokenRecord>('refresh', 'family', grant)) {
+      if (r.revokedAt === null && r.revokedByReplayAt === null && filter(r)) {
+        await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
+      }
     }
     return count;
   }); }

@@ -172,6 +172,34 @@ test('RAR authorization_details are returned in the token response and survive r
   await done(s);
 });
 
+test('RAR refresh rotation is revoked when the grant is revoked by a replayed parent', async () => {
+  const s = await setup({ authorizationDetailsTypesSupported: ['payment'] });
+  const res = await authorize(s.server, { client_id: 'conf', scope: 'read', authorization_details: JSON.stringify(RAR) });
+  const code = await codeFrom(res);
+  const basic = `Basic ${Buffer.from(`conf:${SECRET}`).toString('base64')}`;
+  const exchange = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'authorization_code', code,
+      redirect_uri: CB, code_verifier: VERIFIER }).toString() });
+  assert.equal(exchange.statusCode, 200, exchange.body);
+  const originalRt = exchange.json().refresh_token;
+  const rotated = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: originalRt }).toString() });
+  assert.equal(rotated.statusCode, 200, rotated.body);
+  assert.deepEqual(rotated.json().authorization_details, RAR);
+  // A replay of the consumed parent revokes the grant, including the already-issued successor.
+  const replay = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: originalRt }).toString() });
+  assert.equal(replay.statusCode, 400, replay.body);
+  const successor = await s.server.inject({ method: 'POST', url: '/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic },
+    payload: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rotated.json().refresh_token }).toString() });
+  assert.equal(successor.statusCode, 400, successor.body);
+  await done(s);
+});
+
 test('JAR rejects tampered unsigned request object and wrong client issuer', async () => {
   const s = await setup();
   const bad = await unsignedJar({ iss: 'pub', aud: `${ISSUER}/oauth/authorize`, exp: 2_000_000, response_type: 'code', redirect_uri: CB });

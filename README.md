@@ -26,7 +26,9 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
 
-Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. A replay racing the rotation that consumed the token also revokes the replacement, which is never returned to the client.
+Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. Rotation consumes the presented token and issues its successors in one store transaction, so a replay racing a rotation is serialized against it: the family is revoked and no usable token is left in it.
+
+Every access and refresh token records the grant it descends from. Revoking a refresh token at `/oauth/revoke`, presenting an already-used refresh token, or presenting an already-used authorization code also revokes the access tokens and refresh tokens of that same grant, so `/oauth/userinfo` and introspection stop accepting them immediately. Tokens from other grants (other devices or sessions) and tokens issued before grants were recorded are not affected.
 
 ### Dynamic client registration policy
 

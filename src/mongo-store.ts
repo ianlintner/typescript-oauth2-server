@@ -24,8 +24,8 @@ export class MongoStore extends DocumentStore {
     if (!hello.setName) { await this.client.close(); throw new Error('MongoDB replica set required for atomic transactions'); }
     this.collection = this.client.db(this.database).collection<Row>('oauth2_documents');
     await this.collection.createIndex({ namespace: 1, kind: 1, id: 1 }, { unique: true });
-    // Filtered lookups (client cascade, user-code and refresh-family) use these instead of scanning a kind.
-    for (const field of ['clientId', 'userCodeHash', 'family']) {
+    // Filtered lookups (client cascade, user-code, refresh-family and access-grant) use these instead of scanning a kind.
+    for (const field of ['clientId', 'userCodeHash', 'family', 'grant']) {
       await this.collection.createIndex({ namespace: 1, kind: 1, [`data.${field}`]: 1 });
     }
   }

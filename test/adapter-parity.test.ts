@@ -140,6 +140,31 @@ for (const [name, make] of factories) {
       assert.equal(await b.consumeDpopJti(proof, 3000, 2000), true);
     } finally { await a.close(); await b.close(); }
   });
+  test(`${name}: grant cascade revokes access tokens in the same transaction`, async () => {
+    const a = make();
+    await a.init();
+    const id = `client-${crypto.randomUUID()}`;
+    const grant = `g-${id}`;
+    const at = (jti: string, g: string | null) => ({ jti, clientId: id, subject: 'user', scope: 'read', expiresAt: 100_000, revokedAt: null, tokenHash: null, grant: g });
+    const rt = (jti: string, family: string) => ({ jti, clientId: id, subject: 'user', scope: 'read', expiresAt: 100_000, family, parentJti: null, revokedAt: null, revokedByReplayAt: null });
+    try {
+      await a.saveClient({ clientId: id, clientSecretHash: null, redirectUris: [], grantTypes: [], scopes: [], enabled: true });
+      await a.saveAccessToken(at(`at-${id}`, grant));
+      await a.saveAccessToken(at(`at-null-${id}`, null));
+      await a.saveAccessToken(at(`at-other-${id}`, `other-${id}`));
+      await a.saveRefreshToken(rt(`rt-${id}`, grant));
+      await a.saveRefreshToken(rt(`rt-other-${id}`, `other-${id}`));
+      // A different client never matches, so nothing is revoked.
+      assert.equal(await a.revokeGrant(grant, 1000, `not-${id}`), 0);
+      assert.ok(await a.getAccessToken(`at-${id}`, 1000));
+      await a.transaction(async tx => { assert.equal(await tx.revokeGrant(grant, 1000, id), 1); });
+      assert.equal(await a.getAccessToken(`at-${id}`, 1000), null);
+      assert.equal(await a.getRefreshToken(`rt-${id}`, 1000), null);
+      assert.ok(await a.getAccessToken(`at-null-${id}`, 1000));
+      assert.ok(await a.getAccessToken(`at-other-${id}`, 1000));
+      assert.ok(await a.getRefreshToken(`rt-other-${id}`, 1000));
+    } finally { await a.close(); }
+  });
 }
 
 for (const [name, make] of factories) {
