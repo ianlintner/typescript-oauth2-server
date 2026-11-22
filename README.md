@@ -41,6 +41,17 @@ Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a
 
 Embedders that enabled registration without a policy now get these defaults; list any previously accepted grant types, scopes or schemes explicitly to keep them.
 
+## Token exchange (RFC 8693)
+
+`grant_type=urn:ietf:params:oauth:grant-type:token-exchange` is advertised in discovery and available to confidential clients registered with that grant type.
+
+- **Subject/actor tokens.** `subject_token_type` and `actor_token_type` may be `urn:ietf:params:oauth:token-type:access_token` or `...:jwt`. Only access tokens this server issued are accepted, and each must still be on record, unrevoked and unexpired. Refresh tokens, ID tokens, SAML and foreign-issuer tokens are `invalid_request`. A subject or actor token bound to a DPoP key (`cnf.jkt`) can only be exchanged with a matching proof at the endpoint.
+- **Rate limiting.** `POST /oauth/token` is limited to 120 requests per 60 s per client address (429 `temporarily_unavailable` + `Retry-After`). The address is the TCP peer unless `OAUTH2_TRUSTED_PROXIES` (comma-separated proxy IPs/CIDRs, never `/0`) names the reverse proxy hop(s) whose `X-Forwarded-For` should be believed; forwarding headers from any other peer are ignored.
+- **Result.** The issued token belongs to the exchanging client, keeps the subject's `sub`, and is narrowed in scope (requested ⊆ subject ⊆ client registration), audience (`resource`/`audience` must be within the subject token's audience; an audience-unrestricted subject accepts no target, since no resource registry exists in this port: `invalid_target`) and lifetime (never beyond the subject's `exp`). `issued_token_type` echoes `requested_token_type` (default access_token). `authorization_details` is not supported.
+- **Delegation.** An `actor_token` (which must have been issued to the exchanging client) is recorded as the `act` claim (`{sub, iss, sub_profile}`, nested over any existing chain) only when the subject token's `may_act` names that actor, or the subject's client lists the exchanging client in its `allowedActors` registration. Without an actor, exchanging a token issued to another client requires that client's `allowedActors`. Chain depth is limited by `OAUTH2_MAX_DELEGATION_DEPTH` (default 4, range 1-32).
+- **Errors.** Invalid or policy-unacceptable subject/actor tokens, depth overruns and missing parameters are `invalid_request` (RFC 8693 §2.2.2); scope overruns are `invalid_scope`; unfulfillable targets are `invalid_target`.
+- **`allowedActors`** is operator-provisioned (conformance seed key `allowed_actors`, or the store directly); dynamic registration never sets it.
+
 ## Remote key retrieval
 
 Trusted-issuer `jwks_uri` documents are fetched only from public addresses. A literal non-public address is rejected at registration, and every hostname is resolved at fetch time and refused if any resolved address is loopback, private, link-local, carrier-grade NAT, multicast, reserved or unspecified. Forced refreshes (used when a key rotates) are limited to one per URI every 10 seconds; within that window the cached document is used. Tests that serve keys from a local listener use the `setJwksNetGuard` test seam (`src/jwks.ts`); it is not configurable from the environment.
