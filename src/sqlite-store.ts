@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, DeviceCodeStatus, ParRecord, RefreshTokenRecord, Store,
-  TrustedIssuerRecord,
+  TrustedIssuerRecord, WindowCount,
 } from './ports.js';
 import { REFRESH_ID_PREFIX } from './token-digest.js';
 
@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS dpop_proofs (
   key TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rate_windows (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires ON authorization_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_access_tokens_expires ON access_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_codes_client ON device_codes(client_id);
+CREATE INDEX IF NOT EXISTS idx_par_requests_expires ON par_requests(expires_at);
+CREATE INDEX IF NOT EXISTS idx_par_requests_client ON par_requests(client_id);
+CREATE INDEX IF NOT EXISTS idx_dpop_proofs_expires ON dpop_proofs(expires_at);
+CREATE INDEX IF NOT EXISTS idx_rate_windows_expires ON rate_windows(expires_at);
 CREATE TABLE IF NOT EXISTS trusted_issuers (
   id TEXT PRIMARY KEY,
   issuer TEXT NOT NULL UNIQUE,
@@ -449,6 +463,40 @@ const ops = {
     return Number(db.prepare('INSERT OR IGNORE INTO dpop_proofs (key, expires_at) VALUES (?, ?)').run(key, expiresAt).changes) === 1;
   },
 
+  // One upsert: the database serializes concurrent hits, so no increment is lost across processes.
+  recordWindowHit(db: DatabaseSync, key: string, windowSeconds: number, now: number): WindowCount {
+    const r = db.prepare(
+      `INSERT INTO rate_windows (key, count, expires_at) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         count = CASE WHEN rate_windows.expires_at <= ? THEN 1 ELSE rate_windows.count + 1 END,
+         expires_at = CASE WHEN rate_windows.expires_at <= ? THEN excluded.expires_at ELSE rate_windows.expires_at END
+       RETURNING count, expires_at`,
+    ).get(key, now + windowSeconds, now, now) as unknown as { count: number; expires_at: number };
+    return { count: Number(r.count), resetAt: Number(r.expires_at) };
+  },
+
+  peekWindow(db: DatabaseSync, key: string, now: number): WindowCount | null {
+    const r = db.prepare('SELECT count, expires_at FROM rate_windows WHERE key = ? AND expires_at > ?')
+      .get(key, now) as unknown as { count: number; expires_at: number } | undefined;
+    return r ? { count: Number(r.count), resetAt: Number(r.expires_at) } : null;
+  },
+
+  countLiveRecords(db: DatabaseSync, kind: 'par' | 'device', now: number, clientId?: string): number {
+    const table = kind === 'par' ? 'par_requests' : 'device_codes';
+    const r = (clientId === undefined
+      ? db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE expires_at > ?`).get(now)
+      : db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE expires_at > ? AND client_id = ?`).get(now, clientId)) as unknown as { n: number };
+    return Number(r.n);
+  },
+
+  sweepExpired(db: DatabaseSync, now: number): number {
+    let removed = 0;
+    for (const table of ['authorization_codes', 'access_tokens', 'refresh_tokens', 'device_codes', 'par_requests', 'dpop_proofs', 'rate_windows']) {
+      removed += Number(db.prepare(`DELETE FROM ${table} WHERE expires_at <= ?`).run(now).changes);
+    }
+    return removed;
+  },
+
   consumeRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
     // First, check if this token exists and its state (without marking).
     const existing = db.prepare(
@@ -630,6 +678,18 @@ class TxStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
+    return this.#use((db) => ops.recordWindowHit(db, key, windowSeconds, now));
+  }
+  peekWindow(key: string, now: number): Promise<WindowCount | null> {
+    return this.#use((db) => ops.peekWindow(db, key, now));
+  }
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number> {
+    return this.#use((db) => ops.countLiveRecords(db, kind, now, clientId));
+  }
+  sweepExpired(now: number): Promise<number> {
+    return this.#use((db) => ops.sweepExpired(db, now));
+  }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#use((db) => ops.revokeTokenFamily(db, family, now));
   }
@@ -779,6 +839,18 @@ export class SqliteStore implements Store {
   }
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
+  }
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
+    return this.#enqueue((db) => ops.recordWindowHit(db, key, windowSeconds, now));
+  }
+  peekWindow(key: string, now: number): Promise<WindowCount | null> {
+    return this.#enqueue((db) => ops.peekWindow(db, key, now));
+  }
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number> {
+    return this.#enqueue((db) => ops.countLiveRecords(db, kind, now, clientId));
+  }
+  sweepExpired(now: number): Promise<number> {
+    return this.#enqueue((db) => ops.sweepExpired(db, now));
   }
   revokeTokenFamily(family: string, now: number): Promise<number> {
     return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));

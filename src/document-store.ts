@@ -1,4 +1,4 @@
-import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, ParRecord, RefreshTokenRecord, Store, TrustedIssuerRecord } from './ports.js';
+import type { AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, ParRecord, RefreshTokenRecord, Store, TrustedIssuerRecord, WindowCount } from './ports.js';
 import { isDigestRefreshId } from './token-digest.js';
 
 /** Database-specific primitives; callers hold a real backend transaction. */
@@ -8,6 +8,12 @@ export interface Documents {
   put<T>(kind: string, id: string, value: T): Promise<void>;
   remove(kind: string, id: string): Promise<void>;
   list<T>(kind: string): Promise<T[]>;
+  /** Documents of `kind` whose top-level `field` equals `value`; backends index the fields used here. */
+  find<T>(kind: string, field: string, value: string): Promise<T[]>;
+  /** Remove documents of `kind` whose numeric `expiresAt` is at or before `now`; returns the count. */
+  purge(kind: string, now: number): Promise<number>;
+  /** Count documents of `kind` whose `expiresAt` is after `now`, optionally with `field` equal to `value`. */
+  countLive(kind: string, now: number, field?: string, value?: string): Promise<number>;
   health(): Promise<void>;
 }
 
@@ -23,8 +29,8 @@ export abstract class DocumentStore implements Store {
   deleteClient(id: string): Promise<boolean> { return this.run(async db => {
     if (!await db.get('client', id)) return false;
     for (const kind of ['code', 'access', 'refresh', 'device', 'par']) {
-      const records = await db.list<Record<string, unknown>>(kind);
-      for (const r of records) if (r.clientId === id) await db.remove(kind, String(r.codeHash ?? r.jti ?? r.deviceCodeHash ?? r.requestUriHash));
+      const records = await db.find<Record<string, unknown>>(kind, 'clientId', id);
+      for (const r of records) await db.remove(kind, String(r.codeHash ?? r.jti ?? r.deviceCodeHash ?? r.requestUriHash));
     }
     await db.remove('client', id);
     return true;
@@ -38,7 +44,7 @@ export abstract class DocumentStore implements Store {
     return matches.length > 0;
   }); }
   saveDeviceCode(d: DeviceCodeRecord): Promise<void> { return this.run(async db => {
-    if ((await db.list<DeviceCodeRecord>('device')).some(x => x.userCodeHash === d.userCodeHash)) throw new Error('duplicate user code');
+    if ((await db.find<DeviceCodeRecord>('device', 'userCodeHash', d.userCodeHash)).length > 0) throw new Error('duplicate user code');
     await db.insert('device', d.deviceCodeHash, d);
   }); }
   getDeviceCode(h: string): Promise<DeviceCodeRecord | null> { return this.run(db => db.get('device', h)); }
@@ -47,7 +53,7 @@ export abstract class DocumentStore implements Store {
     if (r) await db.put('device', h, { ...r, lastPolledAt: now, interval });
   }); }
   resolveDeviceCode(user: string, status: 'approved' | 'denied', subject: string, now: number): Promise<boolean> { return this.run(async db => {
-    const r = (await db.list<DeviceCodeRecord>('device')).find(x => x.userCodeHash === user && x.status === 'pending' && x.expiresAt > now);
+    const r = (await db.find<DeviceCodeRecord>('device', 'userCodeHash', user)).find(x => x.status === 'pending' && x.expiresAt > now);
     if (!r) return false;
     await db.put('device', r.deviceCodeHash, { ...r, status, subject });
     return true;
@@ -100,7 +106,7 @@ export abstract class DocumentStore implements Store {
   consumeRefreshToken(id: string, now: number): Promise<RefreshTokenRecord | null> { return this.run(async db => {
     const r = await db.get<RefreshTokenRecord & { consumedAt: number | null }>('refresh', id);
     if (!r || r.expiresAt <= now || r.revokedAt !== null || r.revokedByReplayAt !== null) return null;
-    const family = (await db.list<RefreshTokenRecord & { consumedAt: number | null }>('refresh')).filter(x => x.family === r.family);
+    const family = await db.find<RefreshTokenRecord & { consumedAt: number | null }>('refresh', 'family', r.family);
     const revoke = async () => { for (const item of family) if (item.revokedAt === null && item.revokedByReplayAt === null) await db.put('refresh', item.jti, { ...item, revokedByReplayAt: now }); };
     if (r.consumedAt !== null) { await revoke(); return null; }
     await db.put('refresh', id, { ...r, consumedAt: now });
@@ -114,10 +120,30 @@ export abstract class DocumentStore implements Store {
   }); }
   revokeTokenFamily(family: string, now: number): Promise<number> { return this.run(async db => {
     let count = 0;
-    for (const r of await db.list<RefreshTokenRecord>('refresh')) if (r.family === family && r.revokedAt === null && r.revokedByReplayAt === null) {
+    for (const r of await db.find<RefreshTokenRecord>('refresh', 'family', family)) if (r.revokedAt === null && r.revokedByReplayAt === null) {
       await db.put('refresh', r.jti, { ...r, revokedAt: now }); count++;
     }
     return count;
+  }); }
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> { return this.run(async db => {
+    const current = await db.get<{ count: number; expiresAt: number }>('window', key);
+    const next = current && current.expiresAt > now
+      ? { count: current.count + 1, expiresAt: current.expiresAt }
+      : { count: 1, expiresAt: now + windowSeconds };
+    await db.put('window', key, next);
+    return { count: next.count, resetAt: next.expiresAt };
+  }); }
+  peekWindow(key: string, now: number): Promise<WindowCount | null> { return this.run(async db => {
+    const current = await db.get<{ count: number; expiresAt: number }>('window', key);
+    return current && current.expiresAt > now ? { count: current.count, resetAt: current.expiresAt } : null;
+  }); }
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number> {
+    return this.run(db => clientId === undefined ? db.countLive(kind, now) : db.countLive(kind, now, 'clientId', clientId));
+  }
+  sweepExpired(now: number): Promise<number> { return this.run(async db => {
+    let removed = 0;
+    for (const kind of ['code', 'access', 'refresh', 'device', 'par', 'proof', 'window']) removed += await db.purge(kind, now);
+    return removed;
   }); }
   countLegacyRefreshTokens(): Promise<number> { return this.run(async db =>
     (await db.list<RefreshTokenRecord>('refresh')).filter(r => !isDigestRefreshId(r.jti)).length); }
