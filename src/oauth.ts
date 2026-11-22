@@ -16,6 +16,8 @@ export const ACCESS_TOKEN_TTL_SECONDS = 3600;
 /** Unset unless the caller passes a value. */
 const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 86_400; // 24h default
 const REAUTH_GRACE_SECONDS = 5;
+/** Literal route bounds: CodeQL recognizes only literal `config.rateLimit` objects. */
+const AUTHORIZE_RATE_LIMIT = { max: 120, timeWindow: 60_000 };
 
 export interface OAuthDeps {
   store: Store;
@@ -486,7 +488,7 @@ export function registerOAuthRoutes(
     };
   };
 
-  app.get('/oauth/authorize', async (req, reply) => {
+  app.get('/oauth/authorize', { config: { rateLimit: AUTHORIZE_RATE_LIMIT } }, async (req, reply) => {
     let params = new URL(req.url, 'http://localhost').searchParams;
     // Until client and redirect_uri are trusted, errors are shown to the user agent and never redirected.
     rejectDuplicates(params);
