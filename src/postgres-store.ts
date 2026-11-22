@@ -14,7 +14,7 @@ export class PostgresStore extends DocumentStore {
       namespace TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL,
       PRIMARY KEY (namespace, kind, id))`);
     // Indexes for the filtered lookups; the per-request paths never read a whole kind.
-    for (const field of ['clientId', 'userCodeHash', 'family']) {
+    for (const field of ['clientId', 'userCodeHash', 'family', 'grant']) {
       await this.pool.query(`CREATE INDEX IF NOT EXISTS oauth2_documents_${field.toLowerCase()}_idx ON oauth2_documents (namespace, kind, (data->>'${field}'))`);
     }
     this.open = true;

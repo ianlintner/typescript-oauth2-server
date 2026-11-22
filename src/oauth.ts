@@ -336,9 +336,10 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
   if (scopes !== '') claims.scope = scopes;
   const accessToken = await deps.signer.sign(claims);
 
+  const grant = deps.random.token(24);
   await deps.store.saveAccessToken({
     jti: atJti, clientId: client.clientId, subject, scope: scopes,
-    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+    expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant,
   });
 
   const body: Record<string, unknown> = {
@@ -359,7 +360,7 @@ async function deviceCodeGrant(deps: OAuthDeps, client: ClientRecord, hash: stri
     const rtId = refreshTokenId(rtValue);
     await deps.store.saveRefreshToken({
       jti: rtId, clientId: client.clientId, subject, scope: scopes, expiresAt: iat + (deps.refreshTokenTtl ?? 86_400),
-      family: rtId, parentJti: null, revokedByReplayAt: null, revokedAt: null,
+      family: grant, parentJti: null, revokedByReplayAt: null, revokedAt: null,
     });
     body.refresh_token = rtValue;
   }
@@ -531,7 +532,7 @@ export function registerOAuthRoutes(
 
     await deps.store.saveAccessToken({
       jti: atJti, clientId: client.clientId, subject, scope,
-      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+      expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
     });
 
     return {
@@ -687,84 +688,91 @@ export function registerOAuthRoutes(
       if (!code) throw new OAuthError('invalid_request', 'code is required');
       if (!redirectUri) throw new OAuthError('invalid_request', 'redirect_uri is required');
 
-      // Consume atomically; a code presented by the wrong client is rolled back so it cannot be burned by others.
-      const record = await deps.store.transaction(async (tx) => {
-        const consumed = await tx.consumeAuthorizationCode(sha256Hex(code), deps.clock.now());
-        if (!consumed) return null;
-        if (consumed.clientId !== client.clientId) throw new OAuthError('invalid_grant');
-        return consumed;
-      });
-      if (!record) throw new OAuthError('invalid_grant', 'authorization code is invalid, expired or already used');
-      if (record.redirectUri !== redirectUri) throw new OAuthError('invalid_grant', 'redirect_uri mismatch');
-      // RFC 7636 §4.3: a challenge was bound at authorization, so an exchange without a
-      // verifier fails verification (invalid_grant); the code is already consumed above.
-      if (
-        !verifier || !VERIFIER_RE.test(verifier)
-        || !safeEqual(createHash('sha256').update(verifier).digest('base64url'), record.codeChallenge)
-      ) {
-        throw new OAuthError('invalid_grant', 'PKCE verification failed');
-      }
+      // Consumption, validation and issuance share one transaction so a concurrent replay
+      // (which revokes the grant) is ordered either before the code is spent or after every
+      // descendant token exists. Validation failures after consumption still burn the code.
+      const outcome = await deps.store.transaction(async (tx): Promise<{ error: OAuthError } | { body: Record<string, unknown> }> => {
+        const record = await tx.consumeAuthorizationCode(sha256Hex(code), deps.clock.now());
+        if (!record) {
+          // A code that cannot be redeemed again also withdraws whatever its earlier redemption issued.
+          await tx.revokeGrant(sha256Hex(code), deps.clock.now(), client.clientId);
+          return { error: new OAuthError('invalid_grant', 'authorization code is invalid, expired or already used') };
+        }
+        // A code presented by the wrong client is rolled back so it cannot be burned by others.
+        if (record.clientId !== client.clientId) throw new OAuthError('invalid_grant');
+        if (record.redirectUri !== redirectUri) return { error: new OAuthError('invalid_grant', 'redirect_uri mismatch') };
+        // RFC 7636 §4.3: a challenge was bound at authorization, so an exchange without a
+        // verifier fails verification (invalid_grant); the code is already consumed above.
+        if (
+          !verifier || !VERIFIER_RE.test(verifier)
+          || !safeEqual(createHash('sha256').update(verifier).digest('base64url'), record.codeChallenge)
+        ) {
+          return { error: new OAuthError('invalid_grant', 'PKCE verification failed') };
+        }
 
-      const iat = deps.clock.now();
-      const scopes = record.scope;
-      const scopesList = scopes ? scopes.split(' ') : [];
-      const includesOpenid = scopesList.includes('openid');
+        const iat = deps.clock.now();
+        const scopes = record.scope;
+        const scopesList = scopes ? scopes.split(' ') : [];
+        const includesOpenid = scopesList.includes('openid');
 
-      const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: record.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (scopes !== '') claims.scope = scopes;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
-
-      await deps.store.saveAccessToken({
-        jti: atJti, clientId: client.clientId, subject: record.subject,
-        scope: scopes, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-      });
-
-      const body: Record<string, unknown> = {
-        access_token: accessToken,
-        token_type: jkt ? 'DPoP' : 'Bearer',
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        ...(scopes !== '' ? { scope: scopes } : {}),
-      };
-
-      // ID token for openid
-      if (includesOpenid) {
-        const idClaims: Record<string, unknown> = {
+        const atJti = deps.random.token(16);
+        const claims: Record<string, unknown> = {
           iss: deps.issuer,
           sub: record.subject,
           aud: client.clientId,
+          client_id: client.clientId,
           iat,
           exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-          jti: deps.random.token(16),
+          jti: atJti,
         };
-        if (record.nonce) idClaims.nonce = record.nonce;
-        if (record.authTime !== null) idClaims.auth_time = record.authTime;
-        body.id_token = await deps.signer.sign(idClaims);
-      }
+        if (scopes !== '') claims.scope = scopes;
+        if (jkt) claims.cnf = { jkt };
+        const accessToken = await deps.signer.sign(claims);
 
-      // Refresh token
-      if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
-        const rtValue = deps.random.token(24);
-        const rtId = refreshTokenId(rtValue);
-        await deps.store.saveRefreshToken({
-          jti: rtId, clientId: client.clientId, subject: record.subject,
-          scope: scopes, expiresAt: iat + refreshTtl,
-          family: rtId, // each auth code creates a new family (digest of its first token)
-          parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        await tx.saveAccessToken({
+          jti: atJti, clientId: client.clientId, subject: record.subject,
+          scope: scopes, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+          grant: record.codeHash,
         });
-        body.refresh_token = rtValue;
-      }
 
-      return reply.header('pragma', 'no-cache').send(body);
+        const body: Record<string, unknown> = {
+          access_token: accessToken,
+          token_type: jkt ? 'DPoP' : 'Bearer',
+          expires_in: ACCESS_TOKEN_TTL_SECONDS,
+          ...(scopes !== '' ? { scope: scopes } : {}),
+        };
+
+        // ID token for openid
+        if (includesOpenid) {
+          const idClaims: Record<string, unknown> = {
+            iss: deps.issuer,
+            sub: record.subject,
+            aud: client.clientId,
+            iat,
+            exp: iat + ACCESS_TOKEN_TTL_SECONDS,
+            jti: deps.random.token(16),
+          };
+          if (record.nonce) idClaims.nonce = record.nonce;
+          if (record.authTime !== null) idClaims.auth_time = record.authTime;
+          body.id_token = await deps.signer.sign(idClaims);
+        }
+
+        // Refresh token
+        if (client.grantTypes.includes('refresh_token') && scopesList.length > 0) {
+          const rtValue = deps.random.token(24);
+          const rtId = refreshTokenId(rtValue);
+          await tx.saveRefreshToken({
+            jti: rtId, clientId: client.clientId, subject: record.subject,
+            scope: scopes, expiresAt: iat + refreshTtl,
+            family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
+            parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+          });
+          body.refresh_token = rtValue;
+        }
+        return { body };
+      });
+      if ('error' in outcome) throw outcome.error;
+      return reply.header('pragma', 'no-cache').send(outcome.body);
     }
 
     // -- client_credentials --
@@ -796,7 +804,7 @@ export function registerOAuthRoutes(
 
       await deps.store.saveAccessToken({
         jti: atJti, clientId: client.clientId, subject: client.clientId,
-        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+        scope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null, grant: atJti,
       });
 
       return reply.header('pragma', 'no-cache').send({
@@ -828,85 +836,82 @@ export function registerOAuthRoutes(
       }
       const jkt = proofJkt;
 
-      const consumed = await deps.store.consumeRefreshToken(presentedId, deps.clock.now());
-      if (!consumed) {
-        // The token passed the lookup but could not be consumed: another request already used it.
-        await deps.store.revokeTokenFamily(lookedUp.family, deps.clock.now());
-        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
-      }
+      // Rotation (consume + new tokens) is one transaction, so a concurrent replay's grant
+      // revocation is ordered before the token is spent or after its successors exist.
+      const outcome = await deps.store.transaction(async (tx): Promise<{ error: OAuthError } | { body: Record<string, unknown> }> => {
+        const consumed = await tx.consumeRefreshToken(presentedId, deps.clock.now());
+        if (!consumed) {
+          // The token passed the lookup but could not be consumed: another request already used it.
+          await tx.revokeGrant(lookedUp.family, deps.clock.now(), client.clientId);
+          return { error: new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used') };
+        }
 
-      // Check replay: if the family was revoked by replay, fail.
-      if (consumed.revokedByReplayAt !== null) throw new OAuthError('invalid_grant');
+        // Check replay: if the family was revoked by replay, fail.
+        if (consumed.revokedByReplayAt !== null) return { error: new OAuthError('invalid_grant') };
 
-      let allowedScope = consumed.scope;
-      const requestedScope = single(form, 'scope');
-      if (requestedScope !== undefined) {
-        const requested = requestedScope.split(' ').filter((s) => s !== '');
-        // Cannot escalate
-        const originalScopes = new Set(consumed.scope.split(' '));
-        if (requested.some((s) => !originalScopes.has(s))) throw new OAuthError('invalid_scope');
-        allowedScope = requested.join(' ');
-      }
+        let allowedScope = consumed.scope;
+        const requestedScope = single(form, 'scope');
+        if (requestedScope !== undefined) {
+          const requested = requestedScope.split(' ').filter((s) => s !== '');
+          // Cannot escalate
+          const originalScopes = new Set(consumed.scope.split(' '));
+          if (requested.some((s) => !originalScopes.has(s))) return { error: new OAuthError('invalid_scope') };
+          allowedScope = requested.join(' ');
+        }
 
-      const iat = deps.clock.now();
-      const scopesList = allowedScope ? allowedScope.split(' ') : [];
-      const includesOpenid = scopesList.includes('openid');
+        const iat = deps.clock.now();
+        const scopesList = allowedScope ? allowedScope.split(' ') : [];
+        const includesOpenid = scopesList.includes('openid');
 
-      const newRtValue = deps.random.token(24);
-      const newRtId = refreshTokenId(newRtValue);
-      await deps.store.saveRefreshToken({
-        jti: newRtId, clientId: client.clientId, subject: consumed.subject,
-        scope: allowedScope, expiresAt: iat + refreshTtl,
-        family: consumed.family,
-        parentJti: consumed.jti,
-        revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
-      });
-
-      // Rotation vs. replay race: a concurrent replay may revoke the family after this request
-      // consumed the parent but before the replacement above existed, so the revocation missed it.
-      // Revocation always marks the (consumed) parent, so a revoked parent here means we lost the
-      // race: kill the replacement and fail closed without issuing any token.
-      if (!(await deps.store.getRefreshToken(consumed.jti, deps.clock.now()))) {
-        await deps.store.revokeRefreshToken(newRtId, deps.clock.now());
-        throw new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used');
-      }
-
-      const atJti = deps.random.token(16);
-      const claims: Record<string, unknown> = {
-        iss: deps.issuer,
-        sub: consumed.subject,
-        aud: client.clientId,
-        client_id: client.clientId,
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL_SECONDS,
-        jti: atJti,
-      };
-      if (allowedScope) claims.scope = allowedScope;
-      if (jkt) claims.cnf = { jkt };
-      const accessToken = await deps.signer.sign(claims);
-
-      await deps.store.saveAccessToken({
-        jti: atJti, clientId: client.clientId, subject: consumed.subject,
-        scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-      });
-
-      const body: Record<string, unknown> = {
-        access_token: accessToken,
-        token_type: jkt ? 'DPoP' : 'Bearer',
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        refresh_token: newRtValue,
-        ...(allowedScope ? { scope: allowedScope } : {}),
-      };
-
-      if (includesOpenid) {
-        const idClaims: Record<string, unknown> = {
-          iss: deps.issuer, sub: consumed.subject, aud: client.clientId,
-          iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
+        const atJti = deps.random.token(16);
+        const claims: Record<string, unknown> = {
+          iss: deps.issuer,
+          sub: consumed.subject,
+          aud: client.clientId,
+          client_id: client.clientId,
+          iat,
+          exp: iat + ACCESS_TOKEN_TTL_SECONDS,
+          jti: atJti,
         };
-        body.id_token = await deps.signer.sign(idClaims);
-      }
+        if (allowedScope) claims.scope = allowedScope;
+        if (jkt) claims.cnf = { jkt };
+        const accessToken = await deps.signer.sign(claims);
 
-      return reply.header('pragma', 'no-cache').send(body);
+        await tx.saveAccessToken({
+          jti: atJti, clientId: client.clientId, subject: consumed.subject,
+          scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+          grant: consumed.family,
+        });
+
+        const newRtValue = deps.random.token(24);
+        const newRtId = refreshTokenId(newRtValue);
+        await tx.saveRefreshToken({
+          jti: newRtId, clientId: client.clientId, subject: consumed.subject,
+          scope: allowedScope, expiresAt: iat + refreshTtl,
+          family: consumed.family,
+          parentJti: consumed.jti,
+          revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+        });
+
+        const body: Record<string, unknown> = {
+          access_token: accessToken,
+          token_type: jkt ? 'DPoP' : 'Bearer',
+          expires_in: ACCESS_TOKEN_TTL_SECONDS,
+          refresh_token: newRtValue,
+          ...(allowedScope ? { scope: allowedScope } : {}),
+        };
+
+        if (includesOpenid) {
+          const idClaims: Record<string, unknown> = {
+            iss: deps.issuer, sub: consumed.subject, aud: client.clientId,
+            iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
+          };
+          body.id_token = await deps.signer.sign(idClaims);
+        }
+        return { body };
+      });
+      if ('error' in outcome) throw outcome.error;
+      return reply.header('pragma', 'no-cache').send(outcome.body);
     }
 
     // -- device_code (RFC 8628 §3.4) --
@@ -979,7 +984,10 @@ export function registerOAuthRoutes(
       const id = refreshTokenId(token);
       const rt = await deps.store.getRefreshToken(id, now);
       if (!rt || rt.clientId !== client.clientId) return false;
-      await deps.store.revokeRefreshToken(id, now);
+      await deps.store.transaction(async (tx) => {
+        await tx.revokeRefreshToken(id, now);
+        await tx.revokeGrant(rt.family, now, client.clientId);
+      });
       return true;
     };
     if (hint === 'refresh_token') {
