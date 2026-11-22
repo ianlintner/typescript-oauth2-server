@@ -9,6 +9,7 @@ import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from '.
 import { redirectUriMatches } from './redirect-uri.js';
 import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Jwks, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
+import { failureKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
 
 export const CODE_TTL_SECONDS = 60;
 export const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -23,6 +24,8 @@ export interface OAuthDeps {
   random: Random;
   issuer: string;
   refreshTokenTtl?: number | undefined;
+  /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
+  throttle?: Partial<ThrottleConfig> | false | undefined;
   /** RFC 8693 act-chain depth limit (levels); defaults to 4. */
   maxDelegationDepth?: number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
@@ -178,7 +181,49 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   return client;
 }
 
+/** Client id the request presents (form or Basic header), without validating anything. */
+function presentedClientId(req: FastifyRequest, form: URLSearchParams): string | undefined {
+  const fromForm = form.getAll('client_id')[0];
+  const m = /^Basic ([A-Za-z0-9+/=]+)$/i.exec(req.headers.authorization ?? '');
+  if (!m) return fromForm;
+  const decoded = Buffer.from(m[1]!, 'base64').toString('utf8');
+  const sep = decoded.indexOf(':');
+  return sep < 0 ? fromForm : formDecode(decoded.slice(0, sep));
+}
+
+/**
+ * Client authentication with bounded failures: once a client id or a source address has used up its
+ * failures for the current window the request is refused with 429 before any credential work runs.
+ */
 export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams): Promise<ClientRecord> {
+  const limits = resolveThrottle(deps);
+  if (!limits) return authenticateClientUnthrottled(deps, req, form);
+  const now = deps.clock.now();
+  const id = presentedClientId(req, form);
+  const sourceKey = failureKey.source(req);
+  const source = await deps.store.peekWindow(sourceKey, now);
+  if (source && source.count >= limits.maxFailuresPerSource) throw tooManyRequests(source.resetAt, now);
+  const client = id ? await deps.store.peekWindow(failureKey.client(id), now) : null;
+  if (client && client.count >= limits.maxFailuresPerClient) throw tooManyRequests(client.resetAt, now);
+  const lookup: ClientLookup = { registered: false };
+  try {
+    return await authenticateClientUnthrottled(deps, req, form, lookup);
+  } catch (err) {
+    if (err instanceof OAuthError && err.code === 'invalid_client') {
+      await deps.store.recordWindowHit(sourceKey, limits.windowSeconds, now);
+      // Only registered ids get their own counter, so rotating random ids cannot grow storage.
+      if (id !== undefined && lookup.registered) await deps.store.recordWindowHit(failureKey.client(id), limits.windowSeconds, now);
+    }
+    throw err;
+  }
+}
+
+let dummySecretHash: Promise<string> | undefined;
+
+/** Filled in by the credential check: whether the presented id resolved to a stored client. */
+interface ClientLookup { registered: boolean }
+
+async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyRequest, form: URLSearchParams, lookup: ClientLookup = { registered: false }): Promise<ClientRecord> {
   let id = single(form, 'client_id');
   let secret = single(form, 'client_secret');
   const assertionType = single(form, 'client_assertion_type');
@@ -205,9 +250,11 @@ export async function authenticateClient(deps: OAuthDeps, req: FastifyRequest, f
   const invalid = new OAuthError('invalid_client', 'client authentication failed');
   if (!id) throw invalid;
   const client = await deps.store.getClient(id);
+  lookup.registered = client !== null;
   if (!client || !client.enabled) {
     // Equalise work so response timing does not reveal which client ids exist.
-    if (secret) await verifyClientSecret(secret, await hashClientSecret('dummy-secret'));
+    dummySecretHash ??= hashClientSecret('dummy-secret');
+    await verifyClientSecret(secret ?? '', await dummySecretHash);
     throw invalid;
   }
   if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion

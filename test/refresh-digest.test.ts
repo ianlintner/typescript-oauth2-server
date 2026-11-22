@@ -169,6 +169,20 @@ class MemoryDocuments implements Documents {
   async put<T>(kind: string, id: string, v: T) { this.data.set(`${kind}\0${id}`, v); }
   async remove(kind: string, id: string) { this.data.delete(`${kind}\0${id}`); }
   async list<T>(kind: string) { return [...this.data].filter(([k]) => k.startsWith(`${kind}\0`)).map(([, v]) => v as T); }
+  async find<T>(kind: string, field: string, value: string) {
+    return (await this.list<Record<string, unknown>>(kind)).filter((v) => v[field] === value) as T[];
+  }
+  async purge(kind: string, now: number) {
+    let removed = 0;
+    for (const [k, v] of [...this.data]) {
+      if (k.startsWith(`${kind}\0`) && (v as { expiresAt?: number }).expiresAt !== undefined && (v as { expiresAt: number }).expiresAt <= now) { this.data.delete(k); removed++; }
+    }
+    return removed;
+  }
+  async countLive(kind: string, now: number, field?: string, value?: string) {
+    return (await this.list<Record<string, unknown>>(kind))
+      .filter((v) => typeof v.expiresAt === 'number' && v.expiresAt > now && (field === undefined || v[field] === value)).length;
+  }
   async health() { /* ok */ }
 }
 class MemoryStore extends DocumentStore {

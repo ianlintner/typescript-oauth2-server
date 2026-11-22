@@ -8,6 +8,7 @@ import { SqliteStore } from './sqlite-store.js';
 import { PostgresStore } from './postgres-store.js';
 import { MongoStore } from './mongo-store.js';
 import { Metrics } from './metrics.js';
+import { startSweeper, type Sweeper } from './sweep.js';
 import type { Store } from './ports.js';
 import { assertSafeForConformance, conformanceModeFromEnv } from './sut/mode.js';
 import { applySeed, assertProvisionable, loadSeed } from './sut/seed.js';
@@ -63,16 +64,23 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     authTime: registry ? makeTestAuthTime(registry) : undefined,
     userClaims: registry ? (sub) => registry!.claimsFor(sub) : undefined,
     endSession: registry ? makeTestEndSession(registry) : undefined,
+    // Conformance mode is loopback-only with an in-memory store, so every scenario shares one source
+    // address; per-source limits would lock later scenarios out after the runner's repeated-failure cases.
+    throttle: mode.enabled ? false : undefined,
   });
   if (registry) registerTestLoginRoutes(server, registry);
 
-  return listen(server, store, config);
+  const sweeper = startSweeper(store, systemClock, config.sweepIntervalSeconds, () => {
+    process.stderr.write('expired-record sweep failed\n');
+  });
+  return listen(server, store, config, sweeper);
 }
 
 async function listen(
   server: import('fastify').FastifyInstance,
   store: Store,
   config: { host: string; port: number },
+  sweeper: Sweeper,
 ): Promise<RunningServer> {
   try {
     const address = await server.listen({ host: config.host, port: config.port });
@@ -80,10 +88,12 @@ async function listen(
       address,
       close: async () => {
         await server.close();
+        await sweeper.stop();
         await store.close();
       },
     };
   } catch (err) {
+    await sweeper.stop();
     await store.close();
     throw err;
   }
