@@ -35,6 +35,10 @@ export interface ClientRecord {
    * or to act for its subjects. Operator-provisioned only; never settable via dynamic registration.
    */
   allowedActors?: string[] | undefined;
+  /** RFC 9101: when true, authorization requests must carry a signed request object. */
+  requireSignedRequestObject?: boolean | undefined;
+  /** RFC 9396: authorization_details types this client may request; absent means none. */
+  authorizationDetailsTypesSupported?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }
@@ -107,6 +111,8 @@ export interface AuthorizationCodeRecord {
   nonce: string | null;
   /** Epoch seconds the end-user authenticated, recorded when max_age was requested (OIDC auth_time). */
   authTime: number | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
 }
 
 export interface AccessTokenRecord {

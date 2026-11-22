@@ -2,6 +2,7 @@ import { createHash, randomInt } from 'node:crypto';
 import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
+import { parseAuthorizationDetails } from './jar-rar.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord } from './ports.js';
@@ -76,6 +77,7 @@ export interface ExtDeps {
   dynamicRegistration?: boolean | undefined;
   /** Allow-lists and optional initial access token for dynamic registration. */
   registrationPolicy?: RegistrationPolicy | undefined;
+  authorizationDetailsTypesSupported?: OAuthDeps['authorizationDetailsTypesSupported'] | undefined;
 }
 
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -207,6 +209,9 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     if (params.redirect_uri !== undefined && !redirectUriMatches(client.redirectUris, params.redirect_uri)) {
       throw new OAuthError('invalid_request', 'redirect_uri is not registered for this client');
     }
+    // RFC 9396 §2: validate at push time as the authorization endpoint would.
+    parseAuthorizationDetails(params.authorization_details,
+      client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? []);
 
     const now = deps.clock.now();
     const requestUri = `urn:ietf:params:oauth:request_uri:${deps.random.token(32)}`;

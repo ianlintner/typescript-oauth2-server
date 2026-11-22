@@ -17,6 +17,7 @@ export type OAuthErrorCode =
   | 'slow_down'
   | 'expired_token'
   | 'invalid_request_uri'
+  | 'invalid_authorization_details'
   | 'unsupported_response_type';
 
 const STATUS: Record<OAuthErrorCode, number> = {
@@ -38,6 +39,7 @@ const STATUS: Record<OAuthErrorCode, number> = {
   slow_down: 400,
   expired_token: 400,
   invalid_request_uri: 400,
+  invalid_authorization_details: 400,
   unsupported_response_type: 400,
 };
 
