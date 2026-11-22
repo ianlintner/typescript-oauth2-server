@@ -60,6 +60,19 @@ export const retryAfterSeconds = (window: Window, now: number): number =>
   Math.max(1, window.windowStart + BOUNDED_WINDOW_SECONDS - now);
 
 /**
+ * Route context bound applied to the two expensive routes. The onRequest hook installed by
+ * {@link registerRouteBounds} reads this config, so the limit is declared next to each route.
+ */
+export const routeBoundConfig = Object.freeze({
+  config: {
+    rateLimit: {
+      max: BOUNDED_REQUESTS_PER_SOURCE,
+      timeWindow: BOUNDED_WINDOW_SECONDS * 1000,
+    },
+  },
+});
+
+/**
  * Refuses a request whose source has used up the route's budget for the current window, with an
  * RFC 6749 §5.2 `temporarily_unavailable` and Retry-After. Runs as onRequest, before routing handlers,
  * so no JWT verification, store lookup or session change happens for a refused request.
@@ -67,8 +80,10 @@ export const retryAfterSeconds = (window: Window, now: number): number =>
 export function registerRouteBounds(app: FastifyInstance, bounds: RouteBounds, clock: { now(): number }): void {
   app.addHook('onRequest', (req, reply, done) => {
     const path = req.routeOptions.url;
+    const limit = (req.routeOptions.config as { rateLimit?: { max?: number } } | undefined)?.rateLimit?.max;
+    const max = typeof limit === 'number' ? limit : BOUNDED_REQUESTS_PER_SOURCE;
     const window = path === undefined ? null : bounds.hit(req.method, path, req.ip, clock.now());
-    if (!window || window.count <= BOUNDED_REQUESTS_PER_SOURCE) return done();
+    if (!window || window.count <= max) return done();
     const retryAfter = retryAfterSeconds(window, clock.now());
     const err = new OAuthError('temporarily_unavailable', `too many requests, retry after ${retryAfter} seconds`);
     const r = errorResponse(err);
