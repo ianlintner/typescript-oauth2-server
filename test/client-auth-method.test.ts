@@ -80,6 +80,26 @@ test('a client_secret_post client is refused when the secret is sent in the Basi
   await close(s);
 });
 
+test('a client recorded as `none` with a stored secret cannot authenticate on client_id alone', async () => {
+  const s = await setup();
+  await s.store.saveClient({
+    redirectUris: [CB], grantTypes: ['client_credentials'], scopes: ['read'], enabled: true,
+    clientId: 'inconsistent', clientSecretHash: await hashClientSecret('s9'),
+    tokenEndpointAuthMethod: 'none',
+  });
+  // No secret: must not authenticate as a public client.
+  const noSecret = await post(s.server, { grant_type: 'client_credentials', client_id: 'inconsistent' });
+  assert.equal(noSecret.statusCode, 401);
+  assert.equal(noSecret.json().error, 'invalid_client');
+  // A presented secret must not resurrect it either: `none` forbids credentials.
+  const withSecret = await post(s.server, {
+    grant_type: 'client_credentials', client_id: 'inconsistent', client_secret: 's9',
+  });
+  assert.equal(withSecret.statusCode, 401);
+  assert.equal(withSecret.json().error, 'invalid_client');
+  await close(s);
+});
+
 test('a client with no registered method still accepts Basic and body', async () => {
   const s = await setup();
   assert.equal((await post(s.server, { grant_type: 'client_credentials' }, basicHeader('legacy', 's3'))).statusCode, 200);

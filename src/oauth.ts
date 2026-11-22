@@ -267,8 +267,12 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
       : effectiveMethod === 'client_secret_post' ? mechanism === 'post'
         : effectiveMethod === 'none' ? mechanism === 'none'
           : false; // private_key_jwt authenticates by assertion, handled above
+  // RFC 7591 §2 / RFC 9700 §2.3: `none` is only coherent for a public client. A record
+  // with method `none` but a stored secret hash is inconsistent (embedders can write
+  // ClientRecords straight to the store); never let it authenticate on client_id alone.
+  const noneMethodValid = client?.clientSecretHash === null;
   const usable = client !== null && client.enabled && methodOk
-    && (effectiveMethod === 'none' || (client.clientSecretHash !== null
+    && (effectiveMethod === 'none' ? noneMethodValid : (client.clientSecretHash !== null
       && client.tokenEndpointAuthMethod !== 'private_key_jwt'));
   // Public clients registered as `none` authenticate by client_id alone; they still pay the
   // same single derivation against the dummy hash as every other request shape.
