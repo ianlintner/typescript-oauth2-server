@@ -6,6 +6,7 @@ import { hashClientSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceConfig } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
+import { parseAuthorizationDetails, mergeJarParams, REQUEST_OBJECT_SIGNING_ALGS, verifyJar } from './jar-rar.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
@@ -16,6 +17,8 @@ export const ACCESS_TOKEN_TTL_SECONDS = 3600;
 /** Unset unless the caller passes a value. */
 const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 86_400; // 24h default
 const REAUTH_GRACE_SECONDS = 5;
+/** Literal route bounds: CodeQL recognizes only literal `config.rateLimit` objects. */
+const AUTHORIZE_RATE_LIMIT = { max: 120, timeWindow: 60_000 };
 
 export interface OAuthDeps {
   store: Store;
@@ -35,6 +38,10 @@ export interface OAuthDeps {
   maxDelegationDepth?: number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
   dpopNonce?: DpopNonceConfig | undefined;
+  /** RFC 9396 authorization_details types accepted globally; a client-level list overrides this. */
+  authorizationDetailsTypesSupported?: string[] | undefined;
+  /** RFC 9101: require a signed request object on every authorize request. */
+  requireSignedRequestObject?: boolean | undefined;
   /**
    * Resolves the authenticated resource owner for an authorization request.
    * Login/consent UI is out of scope for this slice; when absent or when it
@@ -313,6 +320,7 @@ function requestedResource(client: ClientRecord, form: URLSearchParams): string 
  */
 async function signAccessToken(deps: OAuthDeps, client: ClientRecord, t: {
   subject: string; iat: number; jti: string; scope: string; jkt?: string | null | undefined; resource?: string | null | undefined;
+  authorizationDetails?: unknown[] | null | undefined;
 }): Promise<string> {
   const claims: Record<string, unknown> = {
     iss: deps.issuer, sub: t.subject, aud: t.resource ?? client.clientId, client_id: client.clientId,
@@ -320,6 +328,7 @@ async function signAccessToken(deps: OAuthDeps, client: ClientRecord, t: {
   };
   if (t.scope !== '') claims.scope = t.scope;
   if (t.jkt) claims.cnf = { jkt: t.jkt };
+  if (t.authorizationDetails) claims.authorization_details = t.authorizationDetails;
   return deps.signer.sign(claims, { typ: ACCESS_TOKEN_TYP });
 }
 
@@ -563,7 +572,7 @@ export function registerOAuthRoutes(
     };
   };
 
-  app.get('/oauth/authorize', async (req, reply) => {
+  app.get('/oauth/authorize', { config: { rateLimit: AUTHORIZE_RATE_LIMIT } }, async (req, reply) => {
     let params = new URL(req.url, 'http://localhost').searchParams;
     // Until client and redirect_uri are trusted, errors are shown to the user agent and never redirected.
     rejectDuplicates(params);
@@ -612,8 +621,43 @@ export function registerOAuthRoutes(
       throw new OAuthError('invalid_request', 'unknown client or unregistered redirect_uri');
     }
 
+    // RFC 9101: resolve the request object before trusting any authorization parameter.
+    const requestObject = single(params, 'request');
+    const requiredSigned = deps.requireSignedRequestObject === true || client.requireSignedRequestObject === true;
+    if (requestObject !== undefined && requiredSigned) {
+      let alg: string | undefined;
+      try { alg = decodeProtectedHeader(requestObject).alg; } catch { alg = undefined; }
+      if (alg !== 'RS256' && alg !== 'ES256') throw new OAuthError('invalid_request', 'a signed request object is required');
+    }
+    let effectiveRedirectUri = redirectUri;
+    if (requestObject !== undefined) {
+      const claims = await verifyJar(requestObject, client, `${deps.issuer}/oauth/authorize`, deps.clock.now());
+      params = mergeJarParams(params, claims, client);
+      const effectiveRedirect = single(params, 'redirect_uri');
+      if (effectiveRedirect !== undefined && !redirectUriMatches(client.redirectUris, effectiveRedirect)) {
+        throw new OAuthError('invalid_request', 'JAR redirect_uri is not registered for this client');
+      }
+      if (effectiveRedirect !== undefined) effectiveRedirectUri = effectiveRedirect;
+    } else if (requiredSigned) {
+      throw new OAuthError('invalid_request', 'request object is required for this client');
+    }
+
     const state = single(params, 'state');
-    const fail = (error: string) => redirectTo(reply, redirectUri, { error, state, iss: deps.issuer });
+    const fail = (error: string) => redirectTo(reply, effectiveRedirectUri, { error, state, iss: deps.issuer });
+
+    // RFC 9396 §5: the client's redirect_uri is already validated above, so
+    // report invalid authorization_details through the redirect rather than a
+    // bare JSON error.
+    let authorizationDetails: ReturnType<typeof parseAuthorizationDetails>;
+    try {
+      authorizationDetails = parseAuthorizationDetails(
+        single(params, 'authorization_details'),
+        client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? [],
+      );
+    } catch (err) {
+      if (err instanceof OAuthError && err.code === 'invalid_authorization_details') return fail('invalid_authorization_details');
+      throw err;
+    }
 
     // RFC 6749 §4.1.2.1: a missing response_type is invalid_request; a present but unsupported
     // value (e.g. the implicit `token`) is unsupported_response_type.
@@ -661,7 +705,7 @@ export function registerOAuthRoutes(
     await deps.store.saveAuthorizationCode({
       codeHash: sha256Hex(code),
       clientId: client.clientId,
-      redirectUri,
+      redirectUri: effectiveRedirectUri,
       subject,
       scope: requested.join(' '),
       codeChallenge: challenge,
@@ -670,8 +714,9 @@ export function registerOAuthRoutes(
       nonce,
       // auth_time is claimed when max_age was requested (OIDC Core 2).
       authTime: maxAge !== null ? authTime : null,
+      authorizationDetails,
     });
-    return redirectTo(reply, redirectUri, { code, state, iss: deps.issuer });
+    return redirectTo(reply, effectiveRedirectUri, { code, state, iss: deps.issuer });
   });
 
   // RFC 9449 §8.2: hand the client the current nonce on every successful DPoP response so it can stay ahead of rotation.
@@ -737,7 +782,10 @@ export function registerOAuthRoutes(
         const includesOpenid = scopesList.includes('openid');
 
         const atJti = deps.random.token(16);
-        const accessToken = await signAccessToken(deps, client, { subject: record.subject, iat, jti: atJti, scope: scopes, jkt, resource });
+        const accessToken = await signAccessToken(deps, client, {
+          subject: record.subject, iat, jti: atJti, scope: scopes, jkt, resource,
+          authorizationDetails: record.authorizationDetails,
+        });
 
         await tx.saveAccessToken({
           jti: atJti, clientId: client.clientId, subject: record.subject,
@@ -750,6 +798,7 @@ export function registerOAuthRoutes(
           token_type: jkt ? 'DPoP' : 'Bearer',
           expires_in: ACCESS_TOKEN_TTL_SECONDS,
           ...(scopes !== '' ? { scope: scopes } : {}),
+          ...(record.authorizationDetails ? { authorization_details: record.authorizationDetails } : {}),
         };
 
         // ID token for openid
@@ -776,6 +825,7 @@ export function registerOAuthRoutes(
             scope: scopes, expiresAt: iat + refreshTtl,
             family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
             parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt, resource: resource ?? null,
+            authorizationDetails: record.authorizationDetails,
           });
           body.refresh_token = rtValue;
         }
@@ -873,15 +923,6 @@ export function registerOAuthRoutes(
         const scopesList = allowedScope ? allowedScope.split(' ') : [];
         const includesOpenid = scopesList.includes('openid');
 
-        const atJti = deps.random.token(16);
-        const accessToken = await signAccessToken(deps, client, { subject: consumed.subject, iat, jti: atJti, scope: allowedScope, jkt, resource });
-
-        await tx.saveAccessToken({
-          jti: atJti, clientId: client.clientId, subject: consumed.subject,
-          scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
-          grant: consumed.family,
-        });
-
         const newRtValue = deps.random.token(24);
         const newRtId = refreshTokenId(newRtValue);
         await tx.saveRefreshToken({
@@ -889,7 +930,30 @@ export function registerOAuthRoutes(
           scope: allowedScope, expiresAt: iat + refreshTtl,
           family: consumed.family,
           parentJti: consumed.jti,
-          revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt, resource: resource ?? null,
+          revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
+          resource: resource ?? null,
+          authorizationDetails: consumed.authorizationDetails,
+        });
+
+        // Rotation vs. replay race: a concurrent replay may revoke the family after the parent
+        // was consumed but before its replacement existed, missing it in the cascade. Revocation
+        // always marks the consumed parent, so a revoked parent here means we lost the race:
+        // kill the replacement and fail closed without issuing any token.
+        if (!(await tx.getRefreshToken(consumed.jti, deps.clock.now()))) {
+          await tx.revokeRefreshToken(newRtId, deps.clock.now());
+          return { error: new OAuthError('invalid_grant', 'refresh token is invalid, expired or already used') };
+        }
+
+        const atJti = deps.random.token(16);
+        const accessToken = await signAccessToken(deps, client, {
+          subject: consumed.subject, iat, jti: atJti, scope: allowedScope, jkt, resource,
+          authorizationDetails: consumed.authorizationDetails,
+        });
+
+        await tx.saveAccessToken({
+          jti: atJti, clientId: client.clientId, subject: consumed.subject,
+          scope: allowedScope, expiresAt: iat + ACCESS_TOKEN_TTL_SECONDS, revokedAt: null, tokenHash: null,
+          grant: consumed.family,
         });
 
         const body: Record<string, unknown> = {
@@ -898,6 +962,7 @@ export function registerOAuthRoutes(
           expires_in: ACCESS_TOKEN_TTL_SECONDS,
           refresh_token: newRtValue,
           ...(allowedScope ? { scope: allowedScope } : {}),
+          ...(consumed.authorizationDetails ? { authorization_details: consumed.authorizationDetails } : {}),
         };
 
         if (includesOpenid) {
@@ -1041,6 +1106,7 @@ export function registerOAuthRoutes(
             iat: typeof decoded.iat === 'number' ? decoded.iat : undefined,
             jti: stored.jti,
             sub: stored.subject,
+            ...(decoded.authorization_details !== undefined ? { authorization_details: decoded.authorization_details } : {}),
           };
         }
       }
@@ -1073,6 +1139,11 @@ export function registerOAuthRoutes(
     grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', TOKEN_EXCHANGE_GRANT_TYPE],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
     token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
+    request_parameter_supported: true,
+    request_object_signing_alg_values_supported: [...REQUEST_OBJECT_SIGNING_ALGS],
+    request_uri_parameter_supported: true,
+    require_signed_request_object: deps.requireSignedRequestObject === true,
+    authorization_details_types_supported: [...(deps.authorizationDetailsTypesSupported ?? [])],
     code_challenge_methods_supported: ['S256'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['ES256'],
