@@ -23,7 +23,7 @@ function rejects(mutate: (s: Record<string, unknown>) => void, needle: RegExp) {
 test('the pinned contract example seed parses', () => {
   const seed = parseSeed(EXAMPLE);
   assert.equal(seed.issuer, 'http://localhost:8080');
-  assert.equal(seed.clients.length, 8);
+  assert.equal(seed.clients.length, 10);
   assert.equal(seed.users[0]?.username, 'alice');
   const pub = seed.clients.find((c) => c.clientId === 'client-public');
   assert.equal(pub?.clientSecret, null);
@@ -62,7 +62,7 @@ test('schema violations are rejected', () => {
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.redirect_uris = ['https://a.example/cb#f']), /fragment/);
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.grant_types = ['implicit']), /grant type/);
   rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.scopes = ['a b']), /scope/);
-  rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.token_endpoint_auth_method = 'private_key_jwt'), /token_endpoint_auth_method/);
+  rejects((s) => ((s.clients as Array<Record<string, unknown>>)[0]!.token_endpoint_auth_method = 'private_key_jwt'), /private_key_jwt/);
   rejects((s) => ((s.users as Array<Record<string, unknown>>)[0]!.password = ''), /password/);
   rejects((s) => ((s.users as Array<Record<string, unknown>>)[0]!.email = 'x'), /email/);
 });
@@ -106,7 +106,7 @@ test('loadSeed aborts for a missing or unreadable file', async () => {
   await assert.rejects(loadSeed('/nonexistent/seed.yaml'), (e) => e instanceof SeedError && /cannot read/.test(e.message));
   await assert.rejects(loadSeed(new URL('./data', import.meta.url).pathname), SeedError);
   const seed = await loadSeed(SEED_PATH);
-  assert.equal(seed.clients.length, 8);
+  assert.equal(seed.clients.length, 10);
 });
 
 test('applySeed stores clients with hashed secrets and never the plaintext', async () => {
@@ -134,6 +134,52 @@ test('applySeed aborts on pre-existing conflicting state rather than overwriting
   await assert.rejects(applySeed(parseSeed(EXAMPLE), store), /already exists/);
   assert.equal((await store.getClient('client-a'))?.redirectUris[0], 'https://x.example/');
   await store.close();
+});
+
+test('a private_key_jwt seed client keeps its public jwks and needs no secret', async () => {
+  const seed = parseSeed(EXAMPLE);
+  const jwt = seed.clients.find((c) => c.clientId === 'client-jwt');
+  assert.equal(jwt?.clientSecret, null);
+  const store = new SqliteStore(':memory:');
+  await store.init();
+  await applySeed(seed, store);
+  const stored = await store.getClient('client-jwt');
+  assert.equal(stored?.clientSecretHash, null);
+  assert.equal(stored?.tokenEndpointAuthMethod, 'private_key_jwt');
+  assert.equal(stored?.jwks?.keys[0]?.kid, 'client-assertion');
+  await store.close();
+});
+
+test('private_key_jwt jwks entries must be public verification keys', () => {
+  const pkj = (keys: unknown[]) => ({ client_id: 'k', token_endpoint_auth_method: 'private_key_jwt', redirect_uris: ['https://a.example/cb'], jwks: { keys } });
+  const ec = { kty: 'EC', kid: 'k1', crv: 'P-256', x: 'MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4', y: '4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM', alg: 'ES256' };
+  const rsa = { kty: 'RSA', kid: 'k2', n: 'sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS8exSZEy_c4gs_7svlJJQ4H9_NxsiIoLwAEk7-Q3UXERGYw_75IDrGA84-lA_-Ct4eTlXHBIY2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU7-VTdL1VbC2tejvcI2BlMkEpk1BzBZI0KQB0GaDWFLN-aEAw3vRw', e: 'AQAB', alg: 'RS256' };
+  const ok = parseSeed(JSON.stringify({ issuer: 'http://localhost:8080', clients: [pkj([ec, rsa])], users: [{ username: 'u', password: 'p' }] }));
+  assert.equal(ok.clients[0]?.jwks?.keys.length, 2);
+  // Private (EC/RSA `d`, symmetric `k`) key material must never be persisted as client metadata.
+  rejects((s) => { s.clients = [pkj([{ ...ec, d: '0oRkRvQSYW09dVQpXUOrYcXVdZea3p1s4XDsC2Y0Yd8' }])]; }, /private|secret|must not/i);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, d: 'dGVzdA' }])]; }, /private|secret|must not/i);
+  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k3', k: 'c2VjcmV0' }])]; }, /symmetric|oct|must not|kty/i);
+  // Malformed verification keys could never verify an assertion: reject at startup, not at first client auth.
+  rejects((s) => { s.clients = [pkj([{}])]; }, /unsupported kty undefined/);
+  rejects((s) => { s.clients = [pkj([{ kid: 'nokty' }])]; }, /unsupported kty undefined/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'bad', crv: 'P-256', x: 'not-base64', y: 'also-not' }])]; }, /EC key needs base64url x and y/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'nomaterial' }])]; }, /EC key needs crv/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'oct', kid: 'k4' }])]; }, /symmetric key cannot be/);
+  // Structurally plausible but cryptographically unusable keys are refused by a real import.
+  rejects((s) => { s.clients = [pkj([{ kty: 'EC', kid: 'short', crv: 'P-256', x: 'AA', y: 'AA' }])]; }, /EC P-256 x and y must be 32 bytes/);
+  rejects((s) => { s.clients = [pkj([{ ...ec, y: ec.x.replace(/.$/, 'A') }])]; }, /not a valid public key \(cannot be imported\)/);
+  rejects((s) => { s.clients = [pkj([{ kty: 'RSA', kid: 'junk', n: 'A'.repeat(342), e: 'AQAB' }])]; }, /RSA n must be an odd modulus/);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, n: rsa.n.replace(/.$/, 'A') }])]; }, /RSA n must be an odd modulus/);
+  rejects((s) => { s.clients = [pkj([{ ...rsa, e: 'AQ' }])]; }, /RSA e must be an odd exponent/);
+});
+
+test('private_key_jwt seed clients require a nonempty jwks and jwks is rejected elsewhere', () => {
+  const pkj = { client_id: 'k', token_endpoint_auth_method: 'private_key_jwt', redirect_uris: ['https://a.example/cb'] };
+  rejects((s) => { s.clients = [pkj]; }, /jwks/);
+  rejects((s) => { s.clients = [{ ...pkj, jwks: { keys: [] } }]; }, /jwks/);
+  rejects((s) => { s.clients = [{ ...pkj, client_secret: 's', jwks: { keys: [{ kty: 'EC' }] } }]; }, /secret/);
+  rejects((s) => { s.clients = [{ client_id: 'p', public: true, token_endpoint_auth_method: 'none', redirect_uris: ['https://a.example/cb'], jwks: { keys: [{ kty: 'EC' }] } }]; }, /jwks/);
 });
 
 test('allowed_actors (RFC 8693) is parsed, validated and stored on the client', async () => {
