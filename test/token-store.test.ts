@@ -122,7 +122,7 @@ test('revoke an entire token family', () =>
   withStore(async (s) => {
     await s.saveRefreshToken(rt);
     await s.saveRefreshToken({ ...rt, jti: 'rt-002', parentJti: 'rt-001' });
-    const count = await s.revokeTokenFamily('fam-001', 5000);
+    const count = await s.revokeGrant('fam-001', 5000);
     assert.equal(count, 2);
     assert.equal(await s.consumeRefreshToken('rt-001', 1000), null);
     assert.equal(await s.consumeRefreshToken('rt-002', 1000), null);

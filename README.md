@@ -26,7 +26,9 @@ Behavior is verified by in-process tests (`test/oauth-flow.test.ts`, `test/clien
 
 Run with `pnpm start` after exporting the variables above. Signing keys are supplied by the operator and are not generated or rotated by the server.
 
-Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. A replay racing the rotation that consumed the token also revokes the replacement, which is never returned to the client.
+Refresh tokens rotate on every use. Presenting a refresh token that was already used (consumed) while it is still within its lifetime revokes every token in its family, however many rotations have happened since, so a client that retries a refresh after a timeout must re-authorize (RFC 9700 §4.14.2). An expired token is rejected at lookup, before replay handling, so presenting an expired ancestor does not revoke a still-live descendant. Rotation consumes the presented token and issues its successors in one store transaction, so a replay racing a rotation is serialized against it: the family is revoked and no usable token is left in it.
+
+Every access and refresh token records the grant it descends from. Revoking a refresh token at `/oauth/revoke`, presenting an already-used refresh token, or presenting an already-used authorization code also revokes the access tokens and refresh tokens of that same grant, so `/oauth/userinfo` and introspection stop accepting them immediately. Tokens from other grants (other devices or sessions) and tokens issued before grants were recorded are not affected.
 
 ### Client authentication method
 
@@ -42,6 +44,12 @@ Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a
 - `initialAccessToken`: when set, `POST /connect/register` requires it as a Bearer token. Reading, updating and deleting a client continue to use that client's registration access token.
 
 Embedders that enabled registration without a policy now get these defaults; list any previously accepted grant types, scopes or schemes explicitly to keep them.
+
+## End-session and userinfo checks
+
+`GET /oauth/logout` requires an `id_token_hint`. A request without one is refused with `400 invalid_request` and does not call `endSession`. The hint must be an ID token issued by this server: access tokens (which carry a `client_id` claim) are rejected, every audience must name an existing enabled client, and expired hints remain acceptable. The route has no session-subject hook, so the hint's `sub` is not compared with a current session; embedders that need per-session confirmation must add that separately. `GET /oauth/userinfo` re-reads the issuing client on every request and refuses tokens whose client is missing or disabled with the existing `401 invalid_token`.
+
+`GET /oauth/userinfo` and `GET /oauth/logout` are limited to 300 requests per 60 s per client address with `@fastify/rate-limit` (429 `temporarily_unavailable` + `Retry-After`). `OAUTH2_RATE_LIMIT=off` disables the bound and a positive integer changes the max; library embedders can set `Deps.rateLimit` to the same values. The client address is the TCP peer unless `OAUTH2_TRUSTED_PROXIES` names the reverse-proxy hops whose `X-Forwarded-For` should be trusted. Limits are per-process, not shared across replicas.
 
 ## Token exchange (RFC 8693)
 

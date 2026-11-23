@@ -46,6 +46,13 @@ test('valid production config loads', () => {
   assert.equal(c.issuer, 'https://auth.example.com');
 });
 
+test('rate limit setting defaults on and accepts off or a positive integer', () => {
+  assert.equal(loadConfig(dev).rateLimit, 'on');
+  assert.equal(loadConfig({ ...dev, OAUTH2_RATE_LIMIT: 'off' }).rateLimit, 'off');
+  assert.equal(loadConfig({ ...dev, OAUTH2_RATE_LIMIT: '600' }).rateLimit, 600);
+  for (const bad of ['0', '-1', 'abc', '1.5']) rejects({ ...dev, OAUTH2_RATE_LIMIT: bad }, /OAUTH2_RATE_LIMIT/);
+});
+
 test('missing issuer fails closed', () => {
   rejects({ ...dev, OAUTH2_ISSUER: undefined }, /OAUTH2_ISSUER/);
   rejects({ ...dev, OAUTH2_ISSUER: '  ' }, /OAUTH2_ISSUER/);
