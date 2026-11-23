@@ -30,6 +30,15 @@ export interface ClientRecord {
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
   jwksUri?: string | null | undefined;
+  /**
+   * RFC 8693 delegation allow-list: client_ids permitted to exchange tokens issued to this client
+   * or to act for its subjects. Operator-provisioned only; never settable via dynamic registration.
+   */
+  allowedActors?: string[] | undefined;
+  /** RFC 9101: when true, authorization requests must carry a signed request object. */
+  requireSignedRequestObject?: boolean | undefined;
+  /** RFC 9396: authorization_details types this client may request; absent means none. */
+  authorizationDetailsTypesSupported?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }
@@ -102,6 +111,8 @@ export interface AuthorizationCodeRecord {
   nonce: string | null;
   /** Epoch seconds the end-user authenticated, recorded when max_age was requested (OIDC auth_time). */
   authTime: number | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
 }
 
 export interface AccessTokenRecord {
@@ -113,6 +124,8 @@ export interface AccessTokenRecord {
   revokedAt: number | null;
   /** JWT token hash for lookup. Null for opaque tokens. */
   tokenHash: string | null;
+  /** Identifier of the authorization grant this token descends from. Absent/null for tokens issued before grants were recorded. */
+  grant?: string | null;
 }
 
 export interface RefreshTokenRecord {
@@ -130,6 +143,14 @@ export interface RefreshTokenRecord {
   revokedAt: number | null;
   /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
   dpopJkt?: string | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
+}
+
+/** State of a fixed-window counter: hits so far and the epoch second the window ends. */
+export interface WindowCount {
+  count: number;
+  resetAt: number;
 }
 
 export interface Store {
@@ -196,10 +217,13 @@ export interface Store {
   /** Mark a refresh token revoked (no-op for unknown). */
   revokeRefreshToken(jti: string, now: number): Promise<boolean>;
   /**
-   * Revoke the entire family (all tokens in the same family that are not
-   * already revoked). Call on replay detection.
+   * Revoke every live access token and refresh token of one grant. A refresh
+   * token's `family` is its grant identifier. Tokens without a recorded grant
+   * are never affected. When `clientId` is given only that client's tokens are
+   * revoked. Returns the number of refresh tokens revoked. Run it inside the
+   * same transaction as the event that triggers it.
    */
-  revokeTokenFamily(family: string, now: number): Promise<number>;
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number>;
   /**
    * Cutover support (operator-initiated only, never called on startup): count
    * refresh-token rows whose identifier is not in the current digest format
@@ -216,6 +240,21 @@ export interface Store {
    * expiresAt <= now are purged. Must be safe across processes sharing the store.
    */
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean>;
+
+  /**
+   * Atomically add one hit to the fixed-window counter `key`. A missing or expired
+   * window starts a new one of `windowSeconds`. Shared by every process using the store.
+   */
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount>;
+  /** Current counter for `key`, or null when it has no live window. Does not modify state. */
+  peekWindow(key: string, now: number): Promise<WindowCount | null>;
+  /** Number of unexpired pushed requests / device codes, optionally restricted to one client. */
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number>;
+  /**
+   * Remove every record whose expiry is at or before `now` (codes, tokens, device codes,
+   * pushed requests, DPoP proofs, counter windows). Idempotent; returns the number removed.
+   */
+  sweepExpired(now: number): Promise<number>;
 
   /** Run `fn` atomically; commits on resolve, rolls back and rethrows on reject. Not reentrant. */
   transaction<T>(fn: (tx: Store) => Promise<T>): Promise<T>;

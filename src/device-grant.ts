@@ -3,9 +3,11 @@ import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
 import { CHALLENGE_RE } from './oauth.js';
+import { parseAuthorizationDetails } from './jar-rar.js';
 import { redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, verifyClientSecret } from './client-auth.js';
-import type { ClientRecord } from './ports.js';
+import type { ClientRecord, Store } from './ports.js';
+import { creationKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
 // Reuse the core module's shared helpers and client auth so slice semantics stay identical.
 import {
   authenticateClient, bearerToken, rejectDuplicates, safeEqual, single,
@@ -75,8 +77,32 @@ export interface ExtDeps {
   authenticate?: ((req: FastifyRequest) => Promise<string | null>) | undefined;
   /** Whether dynamic client registration (RFC 7591) is enabled. Defaults off. */
   dynamicRegistration?: boolean | undefined;
+  /** Bounds on failed client authentication and anonymous record creation. Defaults apply; `false` disables. */
+  throttle?: Partial<ThrottleConfig> | false | undefined;
   /** Allow-lists and optional initial access token for dynamic registration. */
   registrationPolicy?: RegistrationPolicy | undefined;
+  authorizationDetailsTypesSupported?: OAuthDeps['authorizationDetailsTypesSupported'] | undefined;
+}
+
+/**
+ * Bound anonymous growth of device codes and pushed requests: a per-source creation rate, plus caps on
+ * unexpired records per client and overall. The cap check and the insert share one transaction.
+ */
+async function admitRecord(
+  deps: ExtDeps, req: FastifyRequest, kind: 'par' | 'device', clientId: string, save: (store: Store) => Promise<void>,
+): Promise<void> {
+  const limits = resolveThrottle(deps);
+  if (!limits) return save(deps.store);
+  const now = deps.clock.now();
+  const hit = await deps.store.recordWindowHit(creationKey(kind, req), limits.windowSeconds, now);
+  if (hit.count > limits.maxCreationsPerSource) throw tooManyRequests(hit.resetAt, now);
+  await deps.store.transaction(async (tx) => {
+    if (await tx.countLiveRecords(kind, now, clientId) >= limits.maxLiveRecordsPerClient
+      || await tx.countLiveRecords(kind, now) >= limits.maxLiveRecords) {
+      throw tooManyRequests(now + limits.windowSeconds, now);
+    }
+    await save(tx);
+  });
 }
 
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -123,7 +149,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     const deviceCodeHash = sha256(deviceCode);
     const userCodeHash = sha256(normalizeUserCode(userCode));
 
-    await deps.store.saveDeviceCode({
+    await admitRecord(deps, req, 'device', client.clientId, (store) => store.saveDeviceCode({
       deviceCodeHash,
       userCodeHash,
       clientId: client.clientId,
@@ -133,7 +159,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       lastPolledAt: null,
       status: 'pending',
       subject: null,
-    });
+    }));
 
     const verificationUri = `${deps.issuer}/oauth/device/verify`;
     return reply.header('cache-control', 'no-store').send({
@@ -222,16 +248,19 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     ) {
       throw new OAuthError('invalid_request', 'code_challenge with code_challenge_method=S256 is required');
     }
+    // RFC 9396 §2: validate at push time as the authorization endpoint would.
+    parseAuthorizationDetails(params.authorization_details,
+      client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? []);
 
     const now = deps.clock.now();
     const requestUri = `urn:ietf:params:oauth:request_uri:${deps.random.token(32)}`;
-    await deps.store.savePar({
+    await admitRecord(deps, req, 'par', client.clientId, (store) => store.savePar({
       requestUriHash: sha256(requestUri),
       clientId: client.clientId,
       params,
       expiresAt: now + PAR_TTL_SECONDS,
       consumedAt: null,
-    });
+    }));
 
     return reply.status(201).header('cache-control', 'no-store').send({
       request_uri: requestUri,

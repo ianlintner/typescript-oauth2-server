@@ -89,7 +89,8 @@ test('issued refresh value is never stored; id, family and parent are digests', 
     assert.equal(rows.length, 2);
     for (const r of rows) {
       assert.ok(isDigestRefreshId(r.jti!), 'jti is digest');
-      assert.ok(isDigestRefreshId(r.family!), 'family is digest');
+      // The family doubles as the grant id (a digest of the authorization code), not a refresh-token digest.
+      assert.ok(r.family && r.family.length > 0, 'family is set');
       assert.ok(r.parent_jti == null || isDigestRefreshId(r.parent_jti), 'parent is digest');
       for (const v of Object.values(r)) assert.ok(typeof v !== 'string' || (!v.includes(rt1) && !v.includes(rt2)), 'no raw value in any column');
     }
@@ -97,7 +98,7 @@ test('issued refresh value is never stored; id, family and parent are digests', 
     const second = rows.find((r) => r.jti === refreshTokenId(rt2))!;
     assert.ok(first && second);
     assert.equal(first.parent_jti, null);
-    assert.equal(first.family, first.jti);
+    assert.notEqual(first.family, first.jti);
     assert.equal(second.parent_jti, first.jti);
     assert.equal(second.family, first.family);
   } finally { await s.cleanup(); }
@@ -169,6 +170,20 @@ class MemoryDocuments implements Documents {
   async put<T>(kind: string, id: string, v: T) { this.data.set(`${kind}\0${id}`, v); }
   async remove(kind: string, id: string) { this.data.delete(`${kind}\0${id}`); }
   async list<T>(kind: string) { return [...this.data].filter(([k]) => k.startsWith(`${kind}\0`)).map(([, v]) => v as T); }
+  async find<T>(kind: string, field: string, value: string) {
+    return (await this.list<Record<string, unknown>>(kind)).filter((v) => v[field] === value) as T[];
+  }
+  async purge(kind: string, now: number) {
+    let removed = 0;
+    for (const [k, v] of [...this.data]) {
+      if (k.startsWith(`${kind}\0`) && (v as { expiresAt?: number }).expiresAt !== undefined && (v as { expiresAt: number }).expiresAt <= now) { this.data.delete(k); removed++; }
+    }
+    return removed;
+  }
+  async countLive(kind: string, now: number, field?: string, value?: string) {
+    return (await this.list<Record<string, unknown>>(kind))
+      .filter((v) => typeof v.expiresAt === 'number' && v.expiresAt > now && (field === undefined || v[field] === value)).length;
+  }
   async health() { /* ok */ }
 }
 class MemoryStore extends DocumentStore {
@@ -202,4 +217,22 @@ test('document store: rotation lineage, replay, revoke and legacy purge on diges
   assert.equal(await store.purgeLegacyRefreshTokens(), 1);
   assert.equal(await store.countLegacyRefreshTokens(), 0);
   assert.equal((await store.docs.list('refresh')).length, 3); // a, b, c remain
+});
+
+test('concurrent rotation and replay of one token leaves no usable token in the family', async () => {
+  const s = await setup();
+  try {
+    const rt1 = await issue(s.server);
+    // Rotation is one store transaction, so the replay is serialized after it: it sees the
+    // consumed parent and revokes the whole grant, including the replacement just issued.
+    const [a, b] = await Promise.all([refresh(s.server, rt1), refresh(s.server, rt1)]);
+    const statuses = [a.statusCode, b.statusCode].sort();
+    assert.deepEqual(statuses, [200, 400], 'exactly one presentation wins the rotation');
+    const db = s.raw();
+    const live = db.prepare('SELECT COUNT(*) AS n FROM refresh_tokens WHERE revoked_at IS NULL AND revoked_by_replay_at IS NULL').get() as unknown as { n: number };
+    db.close();
+    assert.equal(live.n, 0, 'no usable refresh token remains in the family');
+    const winner = a.statusCode === 200 ? a : b;
+    assert.equal((await refresh(s.server, winner.json().refresh_token as string)).statusCode, 400, 'replacement is unusable');
+  } finally { await s.cleanup(); }
 });

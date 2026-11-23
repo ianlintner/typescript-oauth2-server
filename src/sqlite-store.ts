@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AccessTokenRecord, AuthorizationCodeRecord, ClientRecord, DeviceCodeRecord, DeviceCodeStatus, ParRecord, RefreshTokenRecord, Store,
-  TrustedIssuerRecord,
+  TrustedIssuerRecord, WindowCount,
 } from './ports.js';
 import { REFRESH_ID_PREFIX } from './token-digest.js';
 
@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS clients (
   registration TEXT,
   token_endpoint_auth_method TEXT,
   jwks TEXT,
-  jwks_uri TEXT
+  jwks_uri TEXT,
+  allowed_actors TEXT,
+  require_signed_request_object INTEGER,
+  authorization_details_types TEXT
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -28,7 +31,8 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
   expires_at INTEGER NOT NULL,
   consumed_at INTEGER,
   nonce TEXT,
-  auth_time INTEGER
+  auth_time INTEGER,
+  authorization_details TEXT
 );
 CREATE TABLE IF NOT EXISTS access_tokens (
   jti TEXT PRIMARY KEY,
@@ -37,7 +41,8 @@ CREATE TABLE IF NOT EXISTS access_tokens (
   scope TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   revoked_at INTEGER,
-  token_hash TEXT
+  token_hash TEXT,
+  grant_id TEXT
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   jti TEXT PRIMARY KEY,
@@ -50,7 +55,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   consumed_at INTEGER,
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER,
-  dpop_jkt TEXT
+  dpop_jkt TEXT,
+  authorization_details TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT PRIMARY KEY,
@@ -74,6 +80,21 @@ CREATE TABLE IF NOT EXISTS dpop_proofs (
   key TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rate_windows (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires ON authorization_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_access_tokens_expires ON access_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family);
+CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_codes_client ON device_codes(client_id);
+CREATE INDEX IF NOT EXISTS idx_par_requests_expires ON par_requests(expires_at);
+CREATE INDEX IF NOT EXISTS idx_par_requests_client ON par_requests(client_id);
+CREATE INDEX IF NOT EXISTS idx_dpop_proofs_expires ON dpop_proofs(expires_at);
+CREATE INDEX IF NOT EXISTS idx_rate_windows_expires ON rate_windows(expires_at);
 CREATE TABLE IF NOT EXISTS trusted_issuers (
   id TEXT PRIMARY KEY,
   issuer TEXT NOT NULL UNIQUE,
@@ -98,6 +119,9 @@ interface ClientRow {
   token_endpoint_auth_method: string | null;
   jwks: string | null;
   jwks_uri: string | null;
+  allowed_actors: string | null;
+  require_signed_request_object: number | null;
+  authorization_details_types: string | null;
 }
 
 interface DeviceRow {
@@ -174,6 +198,7 @@ interface CodeRow {
   consumed_at: number | null;
   nonce: string | null;
   auth_time: number | null;
+  authorization_details: string | null;
 }
 
 interface AccessTokenRow {
@@ -184,6 +209,7 @@ interface AccessTokenRow {
   expires_at: number;
   revoked_at: number | null;
   token_hash: string | null;
+  grant_id: string | null;
 }
 
 interface RefreshTokenRow {
@@ -198,6 +224,7 @@ interface RefreshTokenRow {
   revoked_at: number | null;
   revoked_by_replay_at: number | null;
   dpop_jkt: string | null;
+  authorization_details: string | null;
 }
 
 function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
@@ -209,6 +236,7 @@ function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
     expiresAt: r.expires_at,
     revokedAt: r.revoked_at,
     tokenHash: r.token_hash,
+    grant: r.grant_id,
   };
 }
 
@@ -224,6 +252,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     revokedByReplayAt: r.revoked_by_replay_at,
     revokedAt: r.revoked_at,
     dpopJkt: r.dpop_jkt,
+    authorizationDetails: r.authorization_details === null ? undefined : JSON.parse(r.authorization_details) as unknown[],
   };
 }
 
@@ -235,16 +264,21 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, allowed_actors, require_signed_request_object, authorization_details_types)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
-         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri`,
+         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
+         allowed_actors=excluded.allowed_actors, require_signed_request_object=excluded.require_signed_request_object,
+         authorization_details_types=excluded.authorization_details_types`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
       c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
+      c.allowedActors ? JSON.stringify(c.allowedActors) : null,
+      c.requireSignedRequestObject === undefined ? null : (c.requireSignedRequestObject ? 1 : 0),
+      c.authorizationDetailsTypesSupported ? JSON.stringify(c.authorizationDetailsTypesSupported) : null,
     );
   },
 
@@ -326,6 +360,9 @@ const ops = {
       ...(r.token_endpoint_auth_method ? { tokenEndpointAuthMethod: r.token_endpoint_auth_method } : {}),
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
+      ...(r.allowed_actors ? { allowedActors: JSON.parse(r.allowed_actors) as string[] } : {}),
+      ...(r.require_signed_request_object === 1 ? { requireSignedRequestObject: true } : {}),
+      ...(r.authorization_details_types ? { authorizationDetailsTypesSupported: JSON.parse(r.authorization_details_types) as string[] } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
     };
   },
@@ -363,9 +400,11 @@ const ops = {
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
     db.prepare(
-      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce, auth_time)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt, c.consumedAt, c.nonce ?? null, c.authTime ?? null);
+      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce, auth_time, authorization_details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt,
+      c.consumedAt, c.nonce ?? null, c.authTime ?? null,
+      c.authorizationDetails === undefined || c.authorizationDetails === null ? null : JSON.stringify(c.authorizationDetails));
   },
 
   // Single conditional UPDATE ... RETURNING: the database decides the winner of a race.
@@ -389,6 +428,7 @@ const ops = {
       consumedAt: r.consumed_at,
       nonce: r.nonce,
       authTime: r.auth_time,
+      ...(r.authorization_details ? { authorizationDetails: JSON.parse(r.authorization_details) as unknown[] } : {}),
     };
   },
 
@@ -396,9 +436,9 @@ const ops = {
 
   saveAccessToken(db: DatabaseSync, t: AccessTokenRecord): void {
     db.prepare(
-      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash);
+      `INSERT INTO access_tokens (jti, client_id, subject, scope, expires_at, revoked_at, token_hash, grant_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.revokedAt, t.tokenHash, t.grant ?? null);
   },
 
   getAccessToken(db: DatabaseSync, jti: string, now: number): AccessTokenRecord | null {
@@ -419,15 +459,50 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null);
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, authorization_details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+    ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null,
+      t.authorizationDetails === undefined || t.authorizationDetails === null ? null : JSON.stringify(t.authorizationDetails));
   },
 
   // INSERT OR IGNORE on the primary key: the database decides the winner across connections and processes.
   consumeDpopJti(db: DatabaseSync, key: string, expiresAt: number, now: number): boolean {
     db.prepare('DELETE FROM dpop_proofs WHERE expires_at <= ?').run(now);
     return Number(db.prepare('INSERT OR IGNORE INTO dpop_proofs (key, expires_at) VALUES (?, ?)').run(key, expiresAt).changes) === 1;
+  },
+
+  // One upsert: the database serializes concurrent hits, so no increment is lost across processes.
+  recordWindowHit(db: DatabaseSync, key: string, windowSeconds: number, now: number): WindowCount {
+    const r = db.prepare(
+      `INSERT INTO rate_windows (key, count, expires_at) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         count = CASE WHEN rate_windows.expires_at <= ? THEN 1 ELSE rate_windows.count + 1 END,
+         expires_at = CASE WHEN rate_windows.expires_at <= ? THEN excluded.expires_at ELSE rate_windows.expires_at END
+       RETURNING count, expires_at`,
+    ).get(key, now + windowSeconds, now, now) as unknown as { count: number; expires_at: number };
+    return { count: Number(r.count), resetAt: Number(r.expires_at) };
+  },
+
+  peekWindow(db: DatabaseSync, key: string, now: number): WindowCount | null {
+    const r = db.prepare('SELECT count, expires_at FROM rate_windows WHERE key = ? AND expires_at > ?')
+      .get(key, now) as unknown as { count: number; expires_at: number } | undefined;
+    return r ? { count: Number(r.count), resetAt: Number(r.expires_at) } : null;
+  },
+
+  countLiveRecords(db: DatabaseSync, kind: 'par' | 'device', now: number, clientId?: string): number {
+    const table = kind === 'par' ? 'par_requests' : 'device_codes';
+    const r = (clientId === undefined
+      ? db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE expires_at > ?`).get(now)
+      : db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE expires_at > ? AND client_id = ?`).get(now, clientId)) as unknown as { n: number };
+    return Number(r.n);
+  },
+
+  sweepExpired(db: DatabaseSync, now: number): number {
+    let removed = 0;
+    for (const table of ['authorization_codes', 'access_tokens', 'refresh_tokens', 'device_codes', 'par_requests', 'dpop_proofs', 'rate_windows']) {
+      removed += Number(db.prepare(`DELETE FROM ${table} WHERE expires_at <= ?`).run(now).changes);
+    }
+    return removed;
   },
 
   consumeRefreshToken(db: DatabaseSync, jti: string, now: number): RefreshTokenRecord | null {
@@ -460,26 +535,8 @@ const ops = {
     ).get(now, jti, now) as unknown as RefreshTokenRow | undefined;
     if (!r) return null;
 
-    // Check for sibling replay: if another token in this family was already consumed
-    // that is NOT the direct parent (parent consumption is legitimate — it happened
-    // during the prior rotation), this is a replay attack by a stale bearer.
-    const parentJti = r.parent_jti;
-    const sibling = db.prepare(
-      `SELECT jti FROM refresh_tokens
-       WHERE family = ? AND jti != ? AND consumed_at IS NOT NULL
-         AND (? IS NULL OR jti != ?)
-         AND revoked_at IS NULL AND revoked_by_replay_at IS NULL
-       LIMIT 1`,
-    ).get(r.family, r.jti, parentJti, parentJti) as { jti: string } | undefined;
-
-    if (sibling) {
-      // Replay attack: revoke the entire family.
-      db.prepare(
-        `UPDATE refresh_tokens SET revoked_by_replay_at = ?
-         WHERE family = ? AND revoked_by_replay_at IS NULL AND revoked_at IS NULL`,
-      ).run(now, r.family);
-    }
-
+    // Ancestors of a rotated token are always consumed, so only the presented
+    // token's own consumed state signals a replay (handled above).
     return rowToRefreshToken(r);
   },
 
@@ -499,11 +556,16 @@ const ops = {
     return res.changes > 0;
   },
 
-  revokeTokenFamily(db: DatabaseSync, family: string, now: number): number {
+  revokeGrant(db: DatabaseSync, grant: string, now: number, clientId?: string): number {
+    const client = clientId === undefined ? '' : ' AND client_id = ?';
+    const extra = clientId === undefined ? [] : [clientId];
+    db.prepare(
+      `UPDATE access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     const res = db.prepare(
       `UPDATE refresh_tokens SET revoked_at = ?
-       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL`,
-    ).run(now, family);
+       WHERE family = ? AND revoked_at IS NULL AND revoked_by_replay_at IS NULL${client}`,
+    ).run(now, grant, ...extra);
     return Number(res.changes);
   },
 
@@ -629,8 +691,20 @@ class TxStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#use((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#use((db) => ops.revokeTokenFamily(db, family, now));
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#use((db) => ops.revokeGrant(db, grant, now, clientId));
+  }
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
+    return this.#use((db) => ops.recordWindowHit(db, key, windowSeconds, now));
+  }
+  peekWindow(key: string, now: number): Promise<WindowCount | null> {
+    return this.#use((db) => ops.peekWindow(db, key, now));
+  }
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number> {
+    return this.#use((db) => ops.countLiveRecords(db, kind, now, clientId));
+  }
+  sweepExpired(now: number): Promise<number> {
+    return this.#use((db) => ops.sweepExpired(db, now));
   }
   countLegacyRefreshTokens(): Promise<number> {
     return this.#use((db) => ops.countLegacyRefreshTokens(db));
@@ -680,9 +754,23 @@ export class SqliteStore implements Store {
     for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
+    // Databases created before RFC 8693 token exchange lack the delegation allow-list column.
+    if (!cols.some((c) => c.name === 'allowed_actors')) db.exec('ALTER TABLE clients ADD COLUMN allowed_actors TEXT');
+    // Databases created before RFC 9101/9396 lack the JAR/RAR client columns.
+    if (!cols.some((c) => c.name === 'require_signed_request_object')) db.exec('ALTER TABLE clients ADD COLUMN require_signed_request_object INTEGER');
+    if (!cols.some((c) => c.name === 'authorization_details_types')) db.exec('ALTER TABLE clients ADD COLUMN authorization_details_types TEXT');
+    const codeCols = db.prepare('PRAGMA table_info(authorization_codes)').all() as unknown as Array<{ name: string }>;
+    if (!codeCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE authorization_codes ADD COLUMN authorization_details TEXT');
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
+    // Databases created before RFC 9396 support lack the RAR refresh-token column.
+    if (!rtCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT');
+    // Databases created before grant linking lack the access-token grant column.
+    const atCols = db.prepare('PRAGMA table_info(access_tokens)').all() as unknown as Array<{ name: string }>;
+    if (!atCols.some((c) => c.name === 'grant_id')) db.exec('ALTER TABLE access_tokens ADD COLUMN grant_id TEXT');
+    // Indexed after the migration: an older database has no grant_id when SCHEMA runs.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_access_tokens_grant ON access_tokens(grant_id);');
     this.#db = db;
   }
 
@@ -772,8 +860,20 @@ export class SqliteStore implements Store {
   consumeDpopJti(key: string, expiresAt: number, now: number): Promise<boolean> {
     return this.#enqueue((db) => ops.consumeDpopJti(db, key, expiresAt, now));
   }
-  revokeTokenFamily(family: string, now: number): Promise<number> {
-    return this.#enqueue((db) => ops.revokeTokenFamily(db, family, now));
+  revokeGrant(grant: string, now: number, clientId?: string): Promise<number> {
+    return this.#enqueue((db) => ops.revokeGrant(db, grant, now, clientId));
+  }
+  recordWindowHit(key: string, windowSeconds: number, now: number): Promise<WindowCount> {
+    return this.#enqueue((db) => ops.recordWindowHit(db, key, windowSeconds, now));
+  }
+  peekWindow(key: string, now: number): Promise<WindowCount | null> {
+    return this.#enqueue((db) => ops.peekWindow(db, key, now));
+  }
+  countLiveRecords(kind: 'par' | 'device', now: number, clientId?: string): Promise<number> {
+    return this.#enqueue((db) => ops.countLiveRecords(db, kind, now, clientId));
+  }
+  sweepExpired(now: number): Promise<number> {
+    return this.#enqueue((db) => ops.sweepExpired(db, now));
   }
   countLegacyRefreshTokens(): Promise<number> {
     return this.#enqueue((db) => ops.countLegacyRefreshTokens(db));

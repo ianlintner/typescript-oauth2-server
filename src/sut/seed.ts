@@ -1,16 +1,21 @@
+import { createPublicKey, type webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { hashClientSecret } from '../client-auth.js';
-import type { ClientRecord, Store } from '../ports.js';
+import type { ClientRecord, Jwks, Store } from '../ports.js';
 
 /** Validated, normalized conformance seed (contract/sut-interface.md §2, schemas/seed.schema.json). */
 export interface SeedClient {
   clientId: string;
   /** Plaintext only until applySeed hashes it; null for public clients. */
   clientSecret: string | null;
+  /** private_key_jwt only: the client's public JWKS (RFC 7523 §2.2). */
+  jwks?: Jwks | undefined;
   redirectUris: string[];
   grantTypes: string[];
   scopes: string[];
+  /** RFC 8693 delegation allow-list (client_ids). */
+  allowedActors?: string[];
 }
 export interface SeedUser {
   username: string;
@@ -45,8 +50,9 @@ const GRANT_TYPES = new Set([
   'client_credentials',
   'urn:ietf:params:oauth:grant-type:device_code',
   'urn:ietf:params:oauth:grant-type:jwt-bearer',
+  'urn:ietf:params:oauth:grant-type:token-exchange',
 ]);
-const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post']);
+const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post', 'private_key_jwt']);
 const ALG_RE = /^(RS|ES|PS|HS)[0-9]{3}$/;
 /** The only signing algorithm this server can provision (see signer.ts). */
 const PROVISIONABLE_ALG = 'ES256';
@@ -90,10 +96,75 @@ function strArray(o: Obj, key: string, where: string, opts: { min?: number } = {
   return v as string[];
 }
 
+/**
+ * A seed jwks entry is persisted as client metadata and later handed to the
+ * verifier, so it must be a complete *public* verification key:
+ *  - no private or symmetric material (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`, `k`),
+ *  - a public asymmetric kty (never `oct`),
+ *  - the public parameters the verifier needs (RFC 7518 §6.2 EC / §6.3 RSA).
+ * Anything else would either leak a secret into storage or pass startup and then
+ * silently fail every client assertion, so both cases fail here.
+ */
+const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'] as const;
+const PUBLIC_JWK_MEMBERS = ['kty', 'kid', 'use', 'alg', 'key_ops', 'x5c', 'x5t', 'x5t#S256', 'x5u', 'crv', 'x', 'y', 'n', 'e'];
+const EC_COORDINATE_BYTES: Record<string, number> = { 'P-256': 32, 'P-384': 48, 'P-521': 66 };
+const EC_CURVES = new Set(Object.keys(EC_COORDINATE_BYTES));
+const MIN_RSA_MODULUS_BYTES = 256; // RFC 7518 §3.3: RSA keys of at least 2048 bits
+
+function isBase64Url(v: unknown, minBytes = 1): boolean {
+  if (typeof v !== 'string' || v === '' || !/^[A-Za-z0-9_-]+$/.test(v)) return false;
+  const decoded = Buffer.from(v, 'base64url');
+  return decoded.byteLength >= minBytes && decoded.toString('base64url').replace(/=+$/, '') === v.replace(/=+$/, '');
+}
+
+function checkVerificationKey(k: Obj, where: string): Obj {
+  for (const member of PRIVATE_JWK_MEMBERS) {
+    if (k[member] !== undefined) {
+      fail(`${where}: must carry public key material only (${JSON.stringify(member)} is private or symmetric)`);
+    }
+  }
+  for (const member of Object.keys(k)) {
+    if (!PUBLIC_JWK_MEMBERS.includes(member)) fail(`${where}: unknown property ${JSON.stringify(member)}`);
+  }
+  const kty = k.kty;
+  if (kty === 'oct') fail(`${where}: a symmetric key cannot be a client assertion verification key`);
+  if (kty === 'EC') {
+    if (typeof k.crv !== 'string' || !EC_CURVES.has(k.crv)) fail(`${where}: EC key needs crv P-256, P-384 or P-521`);
+    // The reference accepts RS/ES/PS for assertions; these are the EC curves we can actually verify against.
+    if (!isBase64Url(k.x, 1) || !isBase64Url(k.y, 1)) fail(`${where}: EC key needs base64url x and y`);
+    // RFC 7518 §6.2.1.2/3: coordinates are the full curve field size, zero-padded.
+    const size = EC_COORDINATE_BYTES[k.crv] as number;
+    if (Buffer.from(k.x as string, 'base64url').byteLength !== size || Buffer.from(k.y as string, 'base64url').byteLength !== size) {
+      fail(`${where}: EC ${k.crv} x and y must be ${size} bytes`);
+    }
+  } else if (kty === 'RSA') {
+    if (!isBase64Url(k.n, MIN_RSA_MODULUS_BYTES)) fail(`${where}: RSA key needs n of at least 2048 bits`);
+    if (!isBase64Url(k.e)) fail(`${where}: RSA key needs base64url e`);
+    // Node's JWK import does not validate RSA parameters: reject a zero/even modulus or an unusable exponent here.
+    const n = Buffer.from(k.n as string, 'base64url');
+    const e = Buffer.from(k.e as string, 'base64url');
+    if (n[0] === 0 || (n[n.length - 1]! & 1) === 0) fail(`${where}: RSA n must be an odd modulus with no leading zero bytes`);
+    if (e.every((b) => b === 0) || (e[e.length - 1]! & 1) === 0 || (e.length === 1 && e[0] === 1)) fail(`${where}: RSA e must be an odd exponent of at least 3`);
+  } else {
+    fail(`${where}: unsupported kty ${JSON.stringify(kty)} (only EC and RSA are verification keys)`);
+  }
+  // A real import catches what the shape checks cannot (off-curve points, unusable RSA parameters):
+  // such a key would pass startup and then silently fail every assertion.
+  try {
+    createPublicKey({ key: k as unknown as webcrypto.JsonWebKey, format: 'jwk' });
+  } catch {
+    fail(`${where}: not a valid public key (cannot be imported)`);
+  }
+  if (k.alg !== undefined && (typeof k.alg !== 'string' || !ALG_RE.test(k.alg))) fail(`${where}: alg is not a recognized JWS algorithm`);
+  if (k.use !== undefined && k.use !== 'sig') fail(`${where}: use must be "sig"`);
+  if (k.kid !== undefined && (typeof k.kid !== 'string' || k.kid === '')) fail(`${where}: kid must be a nonempty string`);
+  return k;
+}
+
 function parseClient(raw: unknown, index: number): SeedClient {
   const at = `clients[${index}]`;
   const c = obj(raw, at);
-  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types'], at);
+  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types', 'jwks', 'allowed_actors'], at);
   const clientId = str(c, 'client_id', at);
   const where = `client ${JSON.stringify(clientId)}`;
   optStr(c, 'name', where);
@@ -103,7 +174,18 @@ function parseClient(raw: unknown, index: number): SeedClient {
   if (c.public !== undefined && typeof c.public !== 'boolean') fail(`${where}: public must be a boolean`);
   const isPublic = c.public === true;
 
-  if (isPublic) {
+  let jwks: Jwks | undefined;
+  if (method === 'private_key_jwt') {
+    if (isPublic) fail(`${where}: a public client cannot use private_key_jwt`);
+    if (secret !== null) fail(`${where}: a private_key_jwt client must not carry a client_secret`);
+    const raw = c.jwks;
+    if (!isObj(raw) || !Array.isArray(raw.keys) || raw.keys.length === 0 || !raw.keys.every(isObj)) {
+      fail(`${where}: private_key_jwt needs jwks with at least one key`);
+    }
+    jwks = { keys: raw.keys.map((key, i) => checkVerificationKey(obj(key, `${where}: jwks.keys[${i}]`), `${where}: jwks.keys[${i}]`)) };
+  } else if (c.jwks !== undefined) {
+    fail(`${where}: jwks is only valid with token_endpoint_auth_method private_key_jwt`);
+  } else if (isPublic) {
     if (secret !== null) fail(`${where}: a public client must not carry a secret`);
     if (method !== undefined && method !== 'none') fail(`${where}: a public client must use method none`);
   } else {
@@ -131,7 +213,9 @@ function parseClient(raw: unknown, index: number): SeedClient {
   for (const grant of grantTypes) {
     if (!GRANT_TYPES.has(grant)) fail(`${where}: unsupported grant type ${JSON.stringify(grant)}`);
   }
-  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes };
+  const allowedActors = c.allowed_actors === undefined ? undefined : strArray(c, 'allowed_actors', where);
+  if (allowedActors?.some((a) => a === '')) fail(`${where}: allowed_actors entries must be nonempty`);
+  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}), ...(allowedActors ? { allowedActors } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -249,6 +333,8 @@ export async function applySeed(seed: Seed, store: Store): Promise<void> {
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
+      ...(c.jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks: c.jwks } : {}),
+      ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
     });
   }
   await store.transaction(async (tx) => {
