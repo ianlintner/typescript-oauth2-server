@@ -2,8 +2,9 @@ import { createHash, randomInt } from 'node:crypto';
 import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
+import { parseAuthorizationDetails } from './jar-rar.js';
 import { redirectUriMatches } from './redirect-uri.js';
-import { hashClientSecret, verifyClientSecret } from './client-auth.js';
+import { hashClientSecret, sealClientHmacSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord, Store } from './ports.js';
 import { creationKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
 // Reuse the core module's shared helpers and client auth so slice semantics stay identical.
@@ -70,6 +71,8 @@ export interface ExtDeps {
   random: OAuthDeps['random'];
   clock: OAuthDeps['clock'];
   issuer: OAuthDeps['issuer'];
+  /** Server key-encryption key for newly registered client_secret_jwt clients. */
+  hmacKey?: OAuthDeps['hmacKey'] | undefined;
   /** Device verification UI; when set, POST /oauth/device/verify approves/denies a code. */
   deviceLoginPath?: string | undefined;
   authenticate?: ((req: FastifyRequest) => Promise<string | null>) | undefined;
@@ -79,6 +82,7 @@ export interface ExtDeps {
   throttle?: Partial<ThrottleConfig> | false | undefined;
   /** Allow-lists and optional initial access token for dynamic registration. */
   registrationPolicy?: RegistrationPolicy | undefined;
+  authorizationDetailsTypesSupported?: OAuthDeps['authorizationDetailsTypesSupported'] | undefined;
 }
 
 /**
@@ -231,6 +235,9 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     if (params.redirect_uri !== undefined && !redirectUriMatches(client.redirectUris, params.redirect_uri)) {
       throw new OAuthError('invalid_request', 'redirect_uri is not registered for this client');
     }
+    // RFC 9396 §2: validate at push time as the authorization endpoint would.
+    parseAuthorizationDetails(params.authorization_details,
+      client.authorizationDetailsTypesSupported ?? deps.authorizationDetailsTypesSupported ?? []);
 
     const now = deps.clock.now();
     const requestUri = `urn:ietf:params:oauth:request_uri:${deps.random.token(32)}`;
@@ -279,6 +286,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     const clientSecret = authMethod === 'none' || jwks ? null : deps.random.token(32);
     const regToken = deps.random.token(32);
     const clientSecretHash = clientSecret === null ? null : await hashClientSecret(clientSecret);
+    const clientSecretKey = clientSecret !== null && authMethod === 'client_secret_jwt' && deps.hmacKey
+      ? await sealClientHmacSecret(clientSecret, clientId, deps.hmacKey) : null;
 
     const metadata: Record<string, unknown> = {
       client_name: typeof meta.client_name === 'string' ? meta.client_name : clientId,
@@ -301,7 +310,8 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       scopes: scope.split(' ').filter((s) => s !== ''),
       enabled: true,
       tokenEndpointAuthMethod: authMethod,
-      ...(jwks ? { jwks } : {}),
+      ...(jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks } : {}),
+      ...(authMethod === 'client_secret_jwt' ? { tokenEndpointAuthMethod: authMethod, clientSecretKey: clientSecretKey ?? undefined } : {}),
       registration: { tokenHash: sha256(regToken), issuedAt: now, metadata },
     };
     await deps.store.saveClient(client);
@@ -340,12 +350,13 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       ? String(record.registration?.metadata.token_endpoint_auth_method ?? 'client_secret_basic')
       : normalizeAuthMethod(meta.token_endpoint_auth_method);
     // Switching public<->confidential would need a new secret; not supported on update.
-    const wasKey = record.tokenEndpointAuthMethod === 'private_key_jwt';
-    if ((authMethod === 'private_key_jwt') !== wasKey) {
-      throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch to or from private_key_jwt on update');
+    const wasJwtMethod = record.tokenEndpointAuthMethod === 'private_key_jwt' || record.tokenEndpointAuthMethod === 'client_secret_jwt';
+    const isJwtMethod = authMethod === 'private_key_jwt' || authMethod === 'client_secret_jwt';
+    if (wasJwtMethod ? (record.tokenEndpointAuthMethod !== authMethod) : isJwtMethod) {
+      throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch to or from a JWT client authentication method on update');
     }
     // Key-authenticated clients are confidential even though they hold no secret hash.
-    const wasPublic = !wasKey && record.clientSecretHash === null;
+    const wasPublic = !wasJwtMethod && record.clientSecretHash === null;
     if ((authMethod === 'none') !== wasPublic) {
       throw new OAuthError('invalid_client_metadata', 'token_endpoint_auth_method cannot switch between public and confidential');
     }
@@ -430,7 +441,7 @@ function normalizeRedirectUris(value: unknown, policy: ResolvedRegistrationPolic
 
 function normalizeAuthMethod(value: unknown): string {
   if (value === undefined) return 'client_secret_basic';
-  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none' && value !== 'private_key_jwt') {
+  if (value !== 'client_secret_basic' && value !== 'client_secret_post' && value !== 'none' && value !== 'client_secret_jwt' && value !== 'private_key_jwt') {
     throw new OAuthError('invalid_client_metadata', 'unsupported token_endpoint_auth_method');
   }
   return value;

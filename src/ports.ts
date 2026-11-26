@@ -26,6 +26,12 @@ export interface ClientRecord {
   enabled: boolean;
   /** Registered authentication method; absent means secret-based (or none when clientSecretHash is null). */
   tokenEndpointAuthMethod?: string | null | undefined;
+  /**
+   * AES-256-GCM sealed symmetric secret for `client_secret_jwt` (RFC 7523 §2.2).
+   * Bound to client_id as AAD and encrypted under a server-derived key; a database
+   * copy alone cannot be used to sign assertions. Never log the decrypted value.
+   */
+  clientSecretKey?: string | null | undefined;
   /** Inline public JWKS for `private_key_jwt` (RFC 7523 §2.2). */
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */
@@ -35,6 +41,10 @@ export interface ClientRecord {
    * or to act for its subjects. Operator-provisioned only; never settable via dynamic registration.
    */
   allowedActors?: string[] | undefined;
+  /** RFC 9101: when true, authorization requests must carry a signed request object. */
+  requireSignedRequestObject?: boolean | undefined;
+  /** RFC 9396: authorization_details types this client may request; absent means none. */
+  authorizationDetailsTypesSupported?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
 }
@@ -107,6 +117,8 @@ export interface AuthorizationCodeRecord {
   nonce: string | null;
   /** Epoch seconds the end-user authenticated, recorded when max_age was requested (OIDC auth_time). */
   authTime: number | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
 }
 
 export interface AccessTokenRecord {
@@ -137,6 +149,8 @@ export interface RefreshTokenRecord {
   revokedAt: number | null;
   /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
   dpopJkt?: string | null;
+  /** RFC 9396 authorization_details granted at authorization time (JSON value). */
+  authorizationDetails?: unknown[] | null | undefined;
 }
 
 /** State of a fixed-window counter: hits so far and the epoch second the window ends. */
