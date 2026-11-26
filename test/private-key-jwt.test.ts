@@ -141,7 +141,7 @@ test('discovery advertises private_key_jwt with exactly the implemented algs', a
   const c = await setup();
   const meta = (await c.server.inject({ method: 'GET', url: '/.well-known/oauth-authorization-server' })).json();
   assert.ok(meta.token_endpoint_auth_methods_supported.includes('private_key_jwt'));
-  assert.deepEqual(meta.token_endpoint_auth_signing_alg_values_supported, ['RS256', 'ES256']);
+  assert.deepEqual(meta.token_endpoint_auth_signing_alg_values_supported, ['RS256', 'ES256', 'HS256', 'HS384', 'HS512']);
 });
 
 test('dynamic registration: private_key_jwt requires inline public jwks and issues no secret', async () => {
