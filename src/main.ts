@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { deriveDpopNonceKey } from './dpop.js';
+import { deriveClientHmacKey } from './client-auth.js';
 import { cryptoRandom, systemClock } from './runtime.js';
 import { buildServer } from './server.js';
 import { createJoseSigner } from './signer.js';
@@ -42,7 +43,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     assertSafeForConformance(env, config);
     const seed = await loadSeed(mode.seedPath!);
     assertProvisionable(seed, { issuer: config.issuer, signingKeyId: config.signingKeyId });
-    await applySeed(seed, store);
+    await applySeed(seed, store, deriveClientHmacKey(config.sessionSecret));
     registry = createTestRegistry(seed.users, systemClock);
     consent = makeConsent(seed.users);
   }
@@ -58,6 +59,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     maxDelegationDepth: config.maxDelegationDepth,
     trustProxy: config.trustedProxies,
     dpopNonce: config.dpopNonce === 'required' ? { key: deriveDpopNonceKey(config.sessionSecret), required: true } : undefined,
+    hmacKey: deriveClientHmacKey(config.sessionSecret),
     rateLimit: config.rateLimit === 'off' ? false : config.rateLimit === 'on' ? undefined : config.rateLimit,
     authenticate: registry ? makeTestAuthenticate(registry) : undefined,
     loginPath: registry ? LOGIN_PATH : undefined,
