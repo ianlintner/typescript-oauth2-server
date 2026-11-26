@@ -27,6 +27,12 @@ export interface ClientRecord {
   enabled: boolean;
   /** Registered authentication method; absent means secret-based (or none when clientSecretHash is null). */
   tokenEndpointAuthMethod?: string | null | undefined;
+  /**
+   * AES-256-GCM sealed symmetric secret for `client_secret_jwt` (RFC 7523 §2.2).
+   * Bound to client_id as AAD and encrypted under a server-derived key; a database
+   * copy alone cannot be used to sign assertions. Never log the decrypted value.
+   */
+  clientSecretKey?: string | null | undefined;
   /** Inline public JWKS for `private_key_jwt` (RFC 7523 §2.2). */
   jwks?: Jwks | null | undefined;
   /** Registered jwks_uri; stored only. Remote JWKS fetching is not implemented, so it is never used to verify. */

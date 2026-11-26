@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { refreshTokenId } from './token-digest.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { decodeProtectedHeader, importJWK, jwtVerify, type JWK } from 'jose';
-import { hashClientSecret, verifyClientSecret } from './client-auth.js';
+import { hashClientSecret, unsealClientHmacSecret, verifyClientSecret } from './client-auth.js';
 import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceConfig } from './dpop.js';
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
@@ -38,6 +38,12 @@ export interface OAuthDeps {
   maxDelegationDepth?: number | undefined;
   /** RFC 9449 §8 server-provided DPoP nonces. Absent disables them. */
   dpopNonce?: DpopNonceConfig | undefined;
+  /**
+   * Server key-encryption key used to unseal client HMAC secrets for
+   * `client_secret_jwt`. Derive from OAUTH2_SESSION_SECRET with
+   * `deriveClientHmacKey`. Absent disables that auth method.
+   */
+  hmacKey?: Buffer | undefined;
   /** RFC 9396 authorization_details types accepted globally; a client-level list overrides this. */
   authorizationDetailsTypesSupported?: string[] | undefined;
   /** RFC 9101: require a signed request object on every authorize request. */
@@ -146,13 +152,16 @@ export function formDecode(value: string): string {
 export const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 /** Algorithms accepted for private_key_jwt client assertions (RFC 7523 §2.2). */
 export const CLIENT_ASSERTION_ALGS = ['RS256', 'ES256'] as const;
+/** HMAC algorithms accepted for client_secret_jwt assertions (RFC 7523 §2.2 / RFC 7518 §3.2). */
+export const CLIENT_SECRET_JWT_ALGS = ['HS256', 'HS384', 'HS512'] as const;
 /** RFC 7523 §2.1 JWT-bearer authorization grant type. */
 export const JWT_BEARER_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 /** jti replay namespace for JWT-bearer assertions, prefixed per the parity card (`jwtb:`) and scoped by issuer. */
 const JWT_BEARER_JTI_PREFIX = 'jwtb:';
 
 /** A client with neither a secret nor a registered key cannot authenticate: it is public. */
-export const isPublicClient = (c: ClientRecord): boolean => c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt';
+export const isPublicClient = (c: ClientRecord): boolean =>
+  c.clientSecretHash === null && c.tokenEndpointAuthMethod !== 'private_key_jwt' && c.tokenEndpointAuthMethod !== 'client_secret_jwt';
 
 function candidateKeys(client: ClientRecord, alg: string, kid: string | undefined): JWK[] {
   const kty = alg === 'ES256' ? 'EC' : 'RSA';
@@ -161,7 +170,8 @@ function candidateKeys(client: ClientRecord, alg: string, kid: string | undefine
 }
 
 /** private_key_jwt (RFC 7523 §2.2 / OIDC Core 9): every failure is the same opaque invalid_client. */
-async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claimedId: string | undefined): Promise<ClientRecord> {
+async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claimedId: string | undefined,
+  lookup: ClientLookup = { registered: false }): Promise<ClientRecord> {
   const invalid = new OAuthError('invalid_client', 'client authentication failed');
   let iss: unknown, alg: string, kid: string | undefined;
   try {
@@ -173,6 +183,7 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   if (typeof iss !== 'string' || iss === '' || (claimedId !== undefined && claimedId !== iss)) throw invalid;
   if (!(CLIENT_ASSERTION_ALGS as readonly string[]).includes(alg)) throw invalid;
   const client = await deps.store.getClient(iss);
+  lookup.registered = client !== null;
   if (!client || !client.enabled || client.tokenEndpointAuthMethod !== 'private_key_jwt') throw invalid;
   const now = deps.clock.now();
   let exp: number | undefined, jti: string | undefined;
@@ -189,6 +200,44 @@ async function authenticateByAssertion(deps: OAuthDeps, assertion: string, claim
   }
   if (exp === undefined || jti === undefined) throw invalid;
   // RFC 7523 §3 / RFC 9700: a (client, jti) pair is accepted once within the assertion's lifetime.
+  if (!await deps.store.consumeDpopJti(`cja:${createHash('sha256').update(JSON.stringify([client.clientId, jti])).digest('base64url')}`, exp, now)) throw invalid;
+  return client;
+}
+
+/**
+ * client_secret_jwt (RFC 7523 §2.2): HS{256,384,512} assertion keyed by the
+ * client's symmetric secret. Only clients registered with that method and with
+ * sealed key material are accepted; every failure is the same opaque invalid_client.
+ */
+async function authenticateByClientSecretJwt(deps: OAuthDeps, assertion: string, claimedId: string | undefined,
+  lookup: ClientLookup): Promise<ClientRecord> {
+  const invalid = new OAuthError('invalid_client', 'client authentication failed');
+  let iss: unknown, alg: string;
+  try {
+    alg = String(decodeProtectedHeader(assertion).alg);
+    const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString('utf8')) as Record<string, unknown>;
+    iss = payload.iss;
+  } catch { throw invalid; }
+  if (typeof iss !== 'string' || iss === '' || (claimedId !== undefined && claimedId !== iss)) throw invalid;
+  if (!(CLIENT_SECRET_JWT_ALGS as readonly string[]).includes(alg)) throw invalid;
+  const client = await deps.store.getClient(iss);
+  lookup.registered = client !== null;
+  if (!client || !client.enabled || client.tokenEndpointAuthMethod !== 'client_secret_jwt') throw invalid;
+  if (!deps.hmacKey || !client.clientSecretKey) throw invalid;
+  const secret = await unsealClientHmacSecret(client.clientSecretKey, client.clientId, deps.hmacKey);
+  if (secret === null) throw invalid;
+  const now = deps.clock.now();
+  let exp: number | undefined, jti: string | undefined;
+  try {
+    const { payload } = await jwtVerify(assertion, new TextEncoder().encode(secret), {
+      algorithms: [alg], issuer: client.clientId, subject: client.clientId,
+      audience: [`${deps.issuer}/oauth/token`, deps.issuer], currentDate: new Date(now * 1000),
+      requiredClaims: ['exp', 'iss', 'sub', 'aud', 'jti'],
+    });
+    if (typeof payload.jti !== 'string' || payload.jti === '' || typeof payload.exp !== 'number') throw invalid;
+    exp = payload.exp; jti = payload.jti;
+  } catch { throw invalid; }
+  // RFC 7523 §3 / RFC 9700: same (client, jti) namespace as private_key_jwt.
   if (!await deps.store.consumeDpopJti(`cja:${createHash('sha256').update(JSON.stringify([client.clientId, jti])).digest('base64url')}`, exp, now)) throw invalid;
   return client;
 }
@@ -244,7 +293,12 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
     // RFC 6749 §2.3: one authentication method per request.
     if (req.headers.authorization !== undefined || secret !== undefined) throw new OAuthError('invalid_request', 'multiple client authentication methods');
     if (assertionType !== CLIENT_ASSERTION_TYPE || assertion === undefined) throw new OAuthError('invalid_client', 'client authentication failed');
-    return authenticateByAssertion(deps, assertion, id);
+    let alg: string | undefined;
+    try { alg = String(decodeProtectedHeader(assertion).alg); } catch { /* handled by verifier */ }
+    if (alg !== undefined && (CLIENT_SECRET_JWT_ALGS as readonly string[]).includes(alg)) {
+      return authenticateByClientSecretJwt(deps, assertion, id, lookup);
+    }
+    return authenticateByAssertion(deps, assertion, id, lookup);
   }
   const header = req.headers.authorization;
   if (header !== undefined) {
@@ -269,7 +323,7 @@ async function authenticateClientUnthrottled(deps: OAuthDeps, req: FastifyReques
     await verifyClientSecret(secret ?? '', await dummySecretHash);
     throw invalid;
   }
-  if (client.tokenEndpointAuthMethod === 'private_key_jwt') throw invalid; // must present an assertion
+  if (client.tokenEndpointAuthMethod === 'private_key_jwt' || client.tokenEndpointAuthMethod === 'client_secret_jwt') throw invalid; // must present an assertion
   if (client.clientSecretHash === null) {
     if (secret) throw invalid; // public clients never authenticate with a secret
     return client;
@@ -1137,8 +1191,8 @@ export function registerOAuthRoutes(
     scopes_supported: ['openid', 'profile', 'email'],
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', TOKEN_EXCHANGE_GRANT_TYPE],
-    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
-    token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS],
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'client_secret_jwt', 'private_key_jwt', 'none'],
+    token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGS, ...CLIENT_SECRET_JWT_ALGS],
     request_parameter_supported: true,
     request_object_signing_alg_values_supported: [...REQUEST_OBJECT_SIGNING_ALGS],
     request_uri_parameter_supported: true,

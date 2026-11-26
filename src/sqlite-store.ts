@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS clients (
   enabled INTEGER NOT NULL,
   registration TEXT,
   token_endpoint_auth_method TEXT,
+  client_secret_key TEXT,
   jwks TEXT,
   jwks_uri TEXT,
   resources TEXT,
@@ -119,6 +120,7 @@ interface ClientRow {
   enabled: number;
   registration: string | null;
   token_endpoint_auth_method: string | null;
+  client_secret_key: string | null;
   jwks: string | null;
   jwks_uri: string | null;
   resources: string | null;
@@ -269,18 +271,18 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, jwks, jwks_uri, resources, allowed_actors, require_signed_request_object, authorization_details_types)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, client_secret_key, jwks, jwks_uri, resources, allowed_actors, require_signed_request_object, authorization_details_types)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
-         token_endpoint_auth_method=excluded.token_endpoint_auth_method, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
+         token_endpoint_auth_method=excluded.token_endpoint_auth_method, client_secret_key=excluded.client_secret_key, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
          resources=excluded.resources, allowed_actors=excluded.allowed_actors, require_signed_request_object=excluded.require_signed_request_object,
          authorization_details_types=excluded.authorization_details_types`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
-      c.tokenEndpointAuthMethod ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
+      c.tokenEndpointAuthMethod ?? null, c.clientSecretKey ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
       c.resources && c.resources.length > 0 ? JSON.stringify(c.resources) : null,
       c.allowedActors ? JSON.stringify(c.allowedActors) : null,
       c.requireSignedRequestObject === undefined ? null : (c.requireSignedRequestObject ? 1 : 0),
@@ -364,6 +366,7 @@ const ops = {
       scopes: JSON.parse(r.scopes) as string[],
       enabled: r.enabled === 1,
       ...(r.token_endpoint_auth_method ? { tokenEndpointAuthMethod: r.token_endpoint_auth_method } : {}),
+      ...(r.client_secret_key ? { clientSecretKey: r.client_secret_key } : {}),
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
       ...(r.resources ? { resources: JSON.parse(r.resources) as string[] } : {}),
@@ -762,6 +765,8 @@ export class SqliteStore implements Store {
     for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri', 'resources']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
+    // Databases created before client_secret_jwt lack the sealed client key column.
+    if (!cols.some((c) => c.name === 'client_secret_key')) db.exec('ALTER TABLE clients ADD COLUMN client_secret_key TEXT');
     // Databases created before RFC 8693 token exchange lack the delegation allow-list column.
     if (!cols.some((c) => c.name === 'allowed_actors')) db.exec('ALTER TABLE clients ADD COLUMN allowed_actors TEXT');
     // Databases created before RFC 9101/9396 lack the JAR/RAR client columns.

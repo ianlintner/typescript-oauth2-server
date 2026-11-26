@@ -1,7 +1,7 @@
 import { createPublicKey, type webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
-import { hashClientSecret } from '../client-auth.js';
+import { hashClientSecret, sealClientHmacSecret } from '../client-auth.js';
 import type { ClientRecord, Jwks, Store } from '../ports.js';
 
 /** Validated, normalized conformance seed (contract/sut-interface.md §2, schemas/seed.schema.json). */
@@ -9,6 +9,8 @@ export interface SeedClient {
   clientId: string;
   /** Plaintext only until applySeed hashes it; null for public clients. */
   clientSecret: string | null;
+  /** Registered RFC 7591 method, when the seed names one explicitly. */
+  tokenEndpointAuthMethod?: string | undefined;
   /** private_key_jwt only: the client's public JWKS (RFC 7523 §2.2). */
   jwks?: Jwks | undefined;
   redirectUris: string[];
@@ -52,7 +54,7 @@ const GRANT_TYPES = new Set([
   'urn:ietf:params:oauth:grant-type:jwt-bearer',
   'urn:ietf:params:oauth:grant-type:token-exchange',
 ]);
-const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post', 'private_key_jwt']);
+const AUTH_METHODS = new Set(['none', 'client_secret_basic', 'client_secret_post', 'client_secret_jwt', 'private_key_jwt']);
 const ALG_RE = /^(RS|ES|PS|HS)[0-9]{3}$/;
 /** The only signing algorithm this server can provision (see signer.ts). */
 const PROVISIONABLE_ALG = 'ES256';
@@ -215,7 +217,7 @@ function parseClient(raw: unknown, index: number): SeedClient {
   }
   const allowedActors = c.allowed_actors === undefined ? undefined : strArray(c, 'allowed_actors', where);
   if (allowedActors?.some((a) => a === '')) fail(`${where}: allowed_actors entries must be nonempty`);
-  return { clientId, clientSecret: secret, redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}), ...(allowedActors ? { allowedActors } : {}) };
+  return { clientId, clientSecret: secret, ...(method ? { tokenEndpointAuthMethod: method } : {}), redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}), ...(allowedActors ? { allowedActors } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -323,9 +325,11 @@ export function assertProvisionable(seed: Seed, config: { issuer: string; signin
 }
 
 /** Apply the seed atomically to a store. Existing clients are never overwritten: the store must be empty of them. */
-export async function applySeed(seed: Seed, store: Store): Promise<void> {
+export async function applySeed(seed: Seed, store: Store, hmacKey?: Buffer): Promise<void> {
   const records: ClientRecord[] = [];
   for (const c of seed.clients) {
+    const sealed = c.clientSecret !== null && c.tokenEndpointAuthMethod === 'client_secret_jwt' && hmacKey
+      ? await sealClientHmacSecret(c.clientSecret, c.clientId, hmacKey) : null;
     records.push({
       clientId: c.clientId,
       clientSecretHash: c.clientSecret === null ? null : await hashClientSecret(c.clientSecret),
@@ -333,6 +337,8 @@ export async function applySeed(seed: Seed, store: Store): Promise<void> {
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
+      ...(c.tokenEndpointAuthMethod ? { tokenEndpointAuthMethod: c.tokenEndpointAuthMethod } : {}),
+      ...(sealed ? { clientSecretKey: sealed } : {}),
       ...(c.jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks: c.jwks } : {}),
       ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
     });
