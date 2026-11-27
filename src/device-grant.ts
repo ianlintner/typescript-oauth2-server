@@ -3,7 +3,7 @@ import { importJWK, type JWK } from 'jose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { OAuthError } from './errors.js';
 import { parseAuthorizationDetails } from './jar-rar.js';
-import { redirectUriMatches } from './redirect-uri.js';
+import { logoutUriError, redirectUriMatches } from './redirect-uri.js';
 import { hashClientSecret, sealClientHmacSecret, verifyClientSecret } from './client-auth.js';
 import type { ClientRecord, Store } from './ports.js';
 import { creationKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
@@ -121,6 +121,70 @@ const normalizeUserCode = (code: string): string => code.toUpperCase().replace(/
 /** RFC 8628 §5.1 brute-force guard: max failed user-code guesses per source per window. */
 const USER_CODE_MAX_FAILURES = 5;
 const USER_CODE_WINDOW_SECONDS = 60;
+
+type LogoutRegistration = Pick<ClientRecord,
+  'postLogoutRedirectUris' | 'backchannelLogoutUri' | 'backchannelLogoutSessionRequired' |
+  'frontchannelLogoutUri' | 'frontchannelLogoutSessionRequired'>;
+
+const LOGOUT_URI_KEYS = {
+  backchannel_logout_uri: 'backchannelLogoutUri',
+  frontchannel_logout_uri: 'frontchannelLogoutUri',
+} as const;
+const LOGOUT_FLAG_KEYS = {
+  backchannel_logout_session_required: 'backchannelLogoutSessionRequired',
+  frontchannel_logout_session_required: 'frontchannelLogoutSessionRequired',
+} as const;
+
+/**
+ * OIDC RP-Initiated Logout §2, Back-Channel Logout §2.2 and Front-Channel Logout §2
+ * client registration metadata. `null` clears a value; omitted keys are left untouched
+ * on update (consistent with the rest of the RFC 7592 PUT handler).
+ */
+function normalizeLogoutRegistration(meta: Record<string, unknown>): {
+  wire: Record<string, unknown>; record: LogoutRegistration;
+} {
+  const record: LogoutRegistration = {};
+  const wire: Record<string, unknown> = {};
+  if (meta.post_logout_redirect_uris !== undefined) {
+    const value = meta.post_logout_redirect_uris;
+    if (value === null) {
+      wire.post_logout_redirect_uris = undefined;
+      record.postLogoutRedirectUris = undefined;
+    } else {
+      if (!Array.isArray(value) || !value.every((u) => typeof u === 'string')) {
+        throw new OAuthError('invalid_client_metadata', 'post_logout_redirect_uris must be an array of absolute URIs');
+      }
+      for (const uri of value as string[]) {
+        const reason = logoutUriError(uri);
+        if (reason) throw new OAuthError('invalid_client_metadata', `post_logout_redirect_uris: ${reason}`);
+      }
+      wire.post_logout_redirect_uris = value;
+      record.postLogoutRedirectUris = [...(value as string[])];
+    }
+  }
+  for (const [wireKey, prop] of Object.entries(LOGOUT_URI_KEYS)) {
+    if (meta[wireKey] === undefined) continue;
+    const value = meta[wireKey];
+    if (value === null) {
+      wire[wireKey] = undefined;
+      record[prop] = undefined;
+    } else {
+      if (typeof value !== 'string') throw new OAuthError('invalid_client_metadata', `${wireKey} must be an absolute URI or null`);
+      const reason = logoutUriError(value);
+      if (reason) throw new OAuthError('invalid_client_metadata', `${wireKey}: ${reason}`);
+      wire[wireKey] = value;
+      record[prop] = value;
+    }
+  }
+  for (const [wireKey, prop] of Object.entries(LOGOUT_FLAG_KEYS)) {
+    if (meta[wireKey] === undefined) continue;
+    const value = meta[wireKey];
+    if (typeof value !== 'boolean') throw new OAuthError('invalid_client_metadata', `${wireKey} must be a boolean`);
+    wire[wireKey] = value;
+    record[prop] = value;
+  }
+  return { wire, record };
+}
 
 export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): void {
   const policy = resolvePolicy(deps.registrationPolicy);
@@ -273,6 +337,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     }
     const meta = body as Record<string, unknown>;
 
+    const logout = normalizeLogoutRegistration(meta);
     const redirectUris = normalizeRedirectUris(meta.redirect_uris, policy);
     if (redirectUris.length === 0) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must not be empty');
     const authMethod = normalizeAuthMethod(meta.token_endpoint_auth_method);
@@ -296,6 +361,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grant_types: grantTypes,
       response_types: responseTypes,
       scope,
+      ...logout.wire,
     };
     if (jwks) metadata.jwks = jwks;
     for (const k of ['client_uri', 'logo_uri', 'tos_uri', 'policy_uri', 'jwks_uri', 'contacts']) {
@@ -309,6 +375,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grantTypes,
       scopes: scope.split(' ').filter((s) => s !== ''),
       enabled: true,
+      ...logout.record,
       ...(jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks } : {}),
       ...(authMethod === 'client_secret_jwt' ? { tokenEndpointAuthMethod: authMethod, clientSecretKey: clientSecretKey ?? undefined } : {}),
       registration: { tokenHash: sha256(regToken), issuedAt: now, metadata },
@@ -343,6 +410,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       throw new OAuthError('invalid_client_metadata', 'request body must be a JSON object');
     }
     const meta = body as Record<string, unknown>;
+    const logout = normalizeLogoutRegistration(meta);
     const redirectUris = normalizeRedirectUris(meta.redirect_uris, policy);
     if (redirectUris.length === 0) throw new OAuthError('invalid_redirect_uri', 'redirect_uris must not be empty');
     const authMethod = meta.token_endpoint_auth_method === undefined
@@ -372,6 +440,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
       grant_types: grantTypes,
       response_types: normalizeResponseTypes(meta.response_types),
       scope,
+      ...logout.wire,
     };
     if (typeof meta.client_name === 'string') prev.metadata.client_name = meta.client_name;
     if (newJwks) {
@@ -382,6 +451,7 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtDeps): vo
     record.redirectUris = redirectUris;
     record.grantTypes = grantTypes;
     record.scopes = scope.split(' ').filter((s) => s !== '');
+    Object.assign(record, logout.record);
     await deps.store.saveClient(record);
     return clientConfigHandler(req, reply);
   });

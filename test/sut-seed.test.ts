@@ -7,6 +7,8 @@ import { SeedError, applySeed, assertProvisionable, loadSeed, parseSeed } from '
 
 const SEED_PATH = new URL('./data/conformance-seed.yaml', import.meta.url).pathname;
 const EXAMPLE = readFileSync(SEED_PATH, 'utf8');
+const LOGOUT_SEED_PATH = new URL('./data/seed-logout.yaml', import.meta.url).pathname;
+const LOGOUT_EXAMPLE = readFileSync(LOGOUT_SEED_PATH, 'utf8');
 
 const minimal = {
   issuer: 'http://localhost:8080',
@@ -196,4 +198,56 @@ test('allowed_actors (RFC 8693) is parsed, validated and stored on the client', 
   await applySeed(seed, store);
   assert.deepEqual((await store.getClient('c'))?.allowedActors, ['svc-a', 'svc-b']);
   assert.equal(parseSeed(JSON.stringify(minimal)).clients[0]?.allowedActors, undefined);
+});
+
+// --- OIDC logout client registration metadata (ticket 1/5) ---
+
+const logoutSeedClient = (extra: Record<string, unknown>) => JSON.stringify({
+  ...minimal,
+  clients: [{ client_id: 'c', client_secret: 's3cret', redirect_uris: ['https://a.example/cb'], ...extra }],
+});
+const rejectsLogout = (extra: Record<string, unknown>, needle: RegExp) =>
+  assert.throws(() => parseSeed(logoutSeedClient(extra)), (e: unknown) => e instanceof SeedError && needle.test((e as Error).message));
+
+test('the contract logout seed parses and exposes the five registration fields', () => {
+  const seed = parseSeed(LOGOUT_EXAMPLE);
+  const client = seed.clients.find((c) => c.clientId === 'client-logout');
+  assert.ok(client);
+  assert.deepEqual(client.postLogoutRedirectUris, ['https://client.example/logged-out']);
+  assert.equal(client.backchannelLogoutUri, 'http://127.0.0.1:8099/backchannel-logout');
+  assert.equal(client.backchannelLogoutSessionRequired, true);
+  assert.equal(client.frontchannelLogoutUri, 'http://127.0.0.1:8099/frontchannel-logout');
+  assert.equal(client.frontchannelLogoutSessionRequired, true);
+  const idle = seed.clients.find((c) => c.clientId === 'client-logout-idle');
+  assert.ok(idle);
+  assert.equal(idle.postLogoutRedirectUris, undefined);
+  assert.equal(idle.backchannelLogoutSessionRequired, undefined);
+  assert.equal(idle.frontchannelLogoutSessionRequired, undefined);
+});
+
+test('applySeed persists logout registration metadata on the client record', async () => {
+  const store = new SqliteStore(':memory:');
+  await store.init();
+  try {
+    await applySeed(parseSeed(LOGOUT_EXAMPLE), store);
+    const stored = await store.getClient('client-logout');
+    assert.ok(stored);
+    assert.deepEqual(stored.postLogoutRedirectUris, ['https://client.example/logged-out']);
+    assert.equal(stored.backchannelLogoutUri, 'http://127.0.0.1:8099/backchannel-logout');
+    assert.equal(stored.backchannelLogoutSessionRequired, true);
+    assert.equal(stored.frontchannelLogoutUri, 'http://127.0.0.1:8099/frontchannel-logout');
+    assert.equal(stored.frontchannelLogoutSessionRequired, true);
+  } finally { await store.close(); }
+});
+
+test('seed rejects malformed logout URIs, session flags and post-logout redirect arrays', () => {
+  rejectsLogout({ backchannel_logout_uri: 'not a url' }, /absolute/);
+  rejectsLogout({ backchannel_logout_uri: 'https://a.example/cb#frag' }, /fragment/);
+  rejectsLogout({ backchannel_logout_uri: 'ftp://a.example/cb' }, /http/);
+  rejectsLogout({ backchannel_logout_uri: 'http://example.com/cb' }, /loopback/);
+  rejectsLogout({ frontchannel_logout_uri: 42 }, /string/);
+  rejectsLogout({ backchannel_logout_session_required: 'true' }, /boolean/);
+  rejectsLogout({ frontchannel_logout_session_required: 1 }, /boolean/);
+  rejectsLogout({ post_logout_redirect_uris: 'https://a.example/out' }, /array/);
+  rejectsLogout({ post_logout_redirect_uris: ['https://a.example/out#f'] }, /fragment/);
 });
