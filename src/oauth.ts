@@ -7,7 +7,7 @@ import { DPOP_SIGNING_ALGS, issueDpopNonce, validateDpopProof, type DpopNonceCon
 import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { parseAuthorizationDetails, mergeJarParams, REQUEST_OBJECT_SIGNING_ALGS, verifyJar } from './jar-rar.js';
-import { redirectUriMatches } from './redirect-uri.js';
+import { logoutUriError, redirectUriMatches } from './redirect-uri.js';
 import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 import { failureKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
@@ -1174,6 +1174,7 @@ export function registerOAuthRoutes(
     issuer: deps.issuer,
     authorization_endpoint: `${deps.issuer}/oauth/authorize`,
     token_endpoint: `${deps.issuer}/oauth/token`,
+    end_session_endpoint: `${deps.issuer}/oauth/logout`,
     jwks_uri: `${deps.issuer}/.well-known/jwks.json`,
     userinfo_endpoint: `${deps.issuer}/oauth/userinfo`,
     revocation_endpoint: `${deps.issuer}/oauth/revoke`,
@@ -1271,13 +1272,47 @@ export function registerOAuthRoutes(
     if (payload.client_id !== undefined || typeof payload.sub !== 'string') {
       throw new OAuthError('invalid_request', 'id_token_hint is not a valid ID token');
     }
-    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    for (const a of audiences) {
+    const audienceIds: string[] = [];
+    for (const a of Array.isArray(payload.aud) ? payload.aud : [payload.aud]) {
       if (typeof a !== 'string' || !(await clientEnabled(deps, a))) {
         throw new OAuthError('invalid_request', 'id_token_hint audience is not a registered client');
       }
+      audienceIds.push(a);
     }
+    const clientId = single(params, 'client_id');
+    if (clientId !== undefined && !audienceIds.includes(clientId)) {
+      throw new OAuthError('invalid_request', 'client_id is not an audience of id_token_hint');
+    }
+    const postLogoutRedirectUri = single(params, 'post_logout_redirect_uri');
+    const state = single(params, 'state');
+
+    // D3: an exact match only against the postLogoutRedirectUris of the hint's
+    // audience client(s) (or the client_id client). No redirect_uris fallback.
+    // Validate shape and registration before ending the session: an error response
+    // is never a redirect and must not terminate the session (RPINIT-2).
+    let redirectTarget: string | undefined;
+    if (postLogoutRedirectUri !== undefined) {
+      const reason = logoutUriError(postLogoutRedirectUri);
+      if (reason !== null) throw new OAuthError('invalid_request', `invalid post_logout_redirect_uri: ${reason}`);
+      const redirectClients = clientId !== undefined ? [clientId] : audienceIds;
+      let registered = false;
+      for (const id of redirectClients) {
+        const client = await deps.store.getClient(id);
+        if (client?.postLogoutRedirectUris?.includes(postLogoutRedirectUri) === true) {
+          registered = true;
+          break;
+        }
+      }
+      if (!registered) throw new OAuthError('invalid_request', 'unregistered post_logout_redirect_uri');
+      const target = new URL(postLogoutRedirectUri);
+      if (state !== undefined) target.searchParams.set('state', state);
+      redirectTarget = target.toString();
+    }
+
     deps.endSession?.(req, reply);
+    if (redirectTarget !== undefined) {
+      return reply.status(302).header('location', redirectTarget).send();
+    }
     return reply.status(200).header('content-type', 'text/plain; charset=utf-8').send('logged out');
   });
 }
