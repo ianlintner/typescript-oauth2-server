@@ -7,7 +7,26 @@
  * name) over `http`, and only the port is free. Scheme, host literal, path and
  * query must still equal the registration, and userinfo/fragment are refused.
  */
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]']);
+export const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]']);
+
+/**
+ * Validate a URI carried as OIDC logout client metadata. These endpoints are
+ * http(s) only, absolute, and carry no fragment or credentials. Plain http is
+ * the conformance/test allowance and, as for redirect URIs, is limited to an
+ * IP-literal loopback host (RFC 8252 §8.3).
+ * Returns a reason string when invalid, or null when valid.
+ */
+export function logoutUriError(value: unknown): string | null {
+  if (typeof value !== 'string') return 'must be a string';
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { return 'must be an absolute URI'; }
+  if (parsed.hash !== '' || value.includes('#')) return 'must not contain a fragment';
+  if (parsed.username !== '' || parsed.password !== '') return 'must not contain credentials';
+  const scheme = parsed.protocol.replace(/:$/, '').toLowerCase();
+  if (scheme === 'https') return null;
+  if (scheme !== 'http') return 'scheme must be http or https';
+  return LOOPBACK_HOSTS.has(parsed.hostname) ? null : 'http is only allowed for 127.0.0.1 or [::1] loopback';
+}
 
 function parseLoopback(uri: string): URL | null {
   let url: URL;

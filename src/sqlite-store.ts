@@ -21,7 +21,12 @@ CREATE TABLE IF NOT EXISTS clients (
   resources TEXT,
   allowed_actors TEXT,
   require_signed_request_object INTEGER,
-  authorization_details_types TEXT
+  authorization_details_types TEXT,
+  post_logout_redirect_uris TEXT,
+  backchannel_logout_uri TEXT,
+  backchannel_logout_session_required INTEGER,
+  frontchannel_logout_uri TEXT,
+  frontchannel_logout_session_required INTEGER
 );
 CREATE TABLE IF NOT EXISTS authorization_codes (
   code_hash TEXT PRIMARY KEY,
@@ -127,6 +132,11 @@ interface ClientRow {
   allowed_actors: string | null;
   require_signed_request_object: number | null;
   authorization_details_types: string | null;
+  post_logout_redirect_uris: string | null;
+  backchannel_logout_uri: string | null;
+  backchannel_logout_session_required: number | null;
+  frontchannel_logout_uri: string | null;
+  frontchannel_logout_session_required: number | null;
 }
 
 interface DeviceRow {
@@ -271,14 +281,17 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, client_secret_key, jwks, jwks_uri, resources, allowed_actors, require_signed_request_object, authorization_details_types)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, client_secret_key, jwks, jwks_uri, resources, allowed_actors, require_signed_request_object, authorization_details_types, post_logout_redirect_uris, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
          token_endpoint_auth_method=excluded.token_endpoint_auth_method, client_secret_key=excluded.client_secret_key, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
          resources=excluded.resources, allowed_actors=excluded.allowed_actors, require_signed_request_object=excluded.require_signed_request_object,
-         authorization_details_types=excluded.authorization_details_types`,
+         authorization_details_types=excluded.authorization_details_types,
+         post_logout_redirect_uris=excluded.post_logout_redirect_uris, backchannel_logout_uri=excluded.backchannel_logout_uri,
+         backchannel_logout_session_required=excluded.backchannel_logout_session_required,
+         frontchannel_logout_uri=excluded.frontchannel_logout_uri, frontchannel_logout_session_required=excluded.frontchannel_logout_session_required`,
     ).run(
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
@@ -287,6 +300,11 @@ const ops = {
       c.allowedActors ? JSON.stringify(c.allowedActors) : null,
       c.requireSignedRequestObject === undefined ? null : (c.requireSignedRequestObject ? 1 : 0),
       c.authorizationDetailsTypesSupported ? JSON.stringify(c.authorizationDetailsTypesSupported) : null,
+      c.postLogoutRedirectUris ? JSON.stringify(c.postLogoutRedirectUris) : null,
+      c.backchannelLogoutUri ?? null,
+      c.backchannelLogoutSessionRequired === undefined ? null : (c.backchannelLogoutSessionRequired ? 1 : 0),
+      c.frontchannelLogoutUri ?? null,
+      c.frontchannelLogoutSessionRequired === undefined ? null : (c.frontchannelLogoutSessionRequired ? 1 : 0),
     );
   },
 
@@ -374,6 +392,11 @@ const ops = {
       ...(r.require_signed_request_object === 1 ? { requireSignedRequestObject: true } : {}),
       ...(r.authorization_details_types ? { authorizationDetailsTypesSupported: JSON.parse(r.authorization_details_types) as string[] } : {}),
       ...(r.registration ? { registration: JSON.parse(r.registration) as ClientRecord['registration'] } : {}),
+      ...(r.post_logout_redirect_uris ? { postLogoutRedirectUris: JSON.parse(r.post_logout_redirect_uris) as string[] } : {}),
+      ...(r.backchannel_logout_uri ? { backchannelLogoutUri: r.backchannel_logout_uri } : {}),
+      ...(r.backchannel_logout_session_required === null ? {} : { backchannelLogoutSessionRequired: r.backchannel_logout_session_required === 1 }),
+      ...(r.frontchannel_logout_uri ? { frontchannelLogoutUri: r.frontchannel_logout_uri } : {}),
+      ...(r.frontchannel_logout_session_required === null ? {} : { frontchannelLogoutSessionRequired: r.frontchannel_logout_session_required === 1 }),
     };
   },
 
@@ -772,6 +795,16 @@ export class SqliteStore implements Store {
     // Databases created before RFC 9101/9396 lack the JAR/RAR client columns.
     if (!cols.some((c) => c.name === 'require_signed_request_object')) db.exec('ALTER TABLE clients ADD COLUMN require_signed_request_object INTEGER');
     if (!cols.some((c) => c.name === 'authorization_details_types')) db.exec('ALTER TABLE clients ADD COLUMN authorization_details_types TEXT');
+    // Databases created before OIDC logout client registration lack the five metadata columns.
+    for (const [col, type] of [
+      ['post_logout_redirect_uris', 'TEXT'],
+      ['backchannel_logout_uri', 'TEXT'],
+      ['backchannel_logout_session_required', 'INTEGER'],
+      ['frontchannel_logout_uri', 'TEXT'],
+      ['frontchannel_logout_session_required', 'INTEGER'],
+    ] as const) {
+      if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} ${type}`);
+    }
     const codeCols = db.prepare('PRAGMA table_info(authorization_codes)').all() as unknown as Array<{ name: string }>;
     if (!codeCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE authorization_codes ADD COLUMN authorization_details TEXT');
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.

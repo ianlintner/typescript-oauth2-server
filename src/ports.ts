@@ -50,6 +50,15 @@ export interface ClientRecord {
   authorizationDetailsTypesSupported?: string[] | undefined;
   /** Present only for clients created through RFC 7591 dynamic registration. */
   registration?: ClientRegistration | null | undefined;
+  /**
+   * OIDC logout registration metadata (RP-Initiated Logout §2, Back-Channel §2.2,
+   * Front-Channel §2). Every field is optional; absent means none/false.
+   */
+  postLogoutRedirectUris?: string[] | undefined;
+  backchannelLogoutUri?: string | null | undefined;
+  backchannelLogoutSessionRequired?: boolean | undefined;
+  frontchannelLogoutUri?: string | null | undefined;
+  frontchannelLogoutSessionRequired?: boolean | undefined;
 }
 
 /** RFC 7591/7592 state. The registration access token is stored only as a SHA-256 hash. */

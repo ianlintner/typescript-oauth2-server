@@ -168,6 +168,36 @@ for (const [name, make] of factories) {
 }
 
 for (const [name, make] of factories) {
+  test(`${name}: OIDC logout client registration metadata survives save/load and update`, async () => {
+    const a = make();
+    await a.init();
+    const id = `logout-${crypto.randomUUID()}`;
+    const base = { clientId: id, clientSecretHash: null, redirectUris: ['https://client.example/cb'], grantTypes: ['authorization_code'], scopes: ['openid'], enabled: true };
+    try {
+      await a.saveClient({
+        ...base,
+        postLogoutRedirectUris: ['https://client.example/out'],
+        backchannelLogoutUri: 'https://client.example/bcl',
+        backchannelLogoutSessionRequired: true,
+        frontchannelLogoutUri: 'https://client.example/fcl',
+        frontchannelLogoutSessionRequired: false,
+      });
+      const stored = await a.getClient(id);
+      assert.ok(stored);
+      assert.deepEqual(stored.postLogoutRedirectUris, ['https://client.example/out']);
+      assert.equal(stored.backchannelLogoutUri, 'https://client.example/bcl');
+      assert.equal(stored.backchannelLogoutSessionRequired, true);
+      assert.equal(stored.frontchannelLogoutUri, 'https://client.example/fcl');
+      assert.equal(stored.frontchannelLogoutSessionRequired, false);
+      // A partial update replaces the metadata rather than leaving stale values.
+      await a.saveClient({ ...base, postLogoutRedirectUris: ['https://client.example/new'], backchannelLogoutSessionRequired: false });
+      const updated = await a.getClient(id);
+      assert.deepEqual(updated?.postLogoutRedirectUris, ['https://client.example/new']);
+      assert.equal(updated?.backchannelLogoutSessionRequired, false);
+      assert.equal(updated?.backchannelLogoutUri, undefined);
+      assert.equal(updated?.frontchannelLogoutUri, undefined);
+    } finally { await a.close(); }
+  });
   test(`${name}: window counters, live counts and expiry sweep behave the same across replicas`, async () => {
     const a = make(); const b = make();
     await a.init(); await b.init();

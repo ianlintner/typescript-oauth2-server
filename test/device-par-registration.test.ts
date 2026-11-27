@@ -511,3 +511,110 @@ test('initial access token gates registration when configured', async () => {
   assert.equal((await s.server.inject({ method: 'GET', url: uri, headers: { authorization: `Bearer ${rat}` } })).statusCode, 200);
   await s.server.close();
 });
+
+// -- OIDC logout client registration metadata (ticket 1/5) --
+
+const LOGOUT_METADATA = {
+  post_logout_redirect_uris: ['https://app.example/logged-out'],
+  backchannel_logout_uri: 'https://app.example/backchannel-logout',
+  backchannel_logout_session_required: true,
+  frontchannel_logout_uri: 'https://app.example/frontchannel-logout',
+  frontchannel_logout_session_required: true,
+};
+
+test('DCR accepts, persists and echoes OIDC logout registration metadata', async () => {
+  const s = await setup();
+  const res = await regPost(s, { redirect_uris: [CB], ...LOGOUT_METADATA });
+  assert.equal(res.statusCode, 201, JSON.stringify(res.json()));
+  for (const [key, value] of Object.entries(LOGOUT_METADATA)) assert.deepEqual(res.json()[key], value, key);
+  const id = res.json().client_id;
+  const stored = await s.store.getClient(id);
+  assert.deepEqual(stored?.postLogoutRedirectUris, LOGOUT_METADATA.post_logout_redirect_uris);
+  assert.equal(stored?.backchannelLogoutUri, LOGOUT_METADATA.backchannel_logout_uri);
+  assert.equal(stored?.backchannelLogoutSessionRequired, true);
+  assert.equal(stored?.frontchannelLogoutUri, LOGOUT_METADATA.frontchannel_logout_uri);
+  assert.equal(stored?.frontchannelLogoutSessionRequired, true);
+  const read = await s.server.inject({
+    method: 'GET', url: res.json().registration_client_uri,
+    headers: { authorization: `Bearer ${res.json().registration_access_token}` },
+  });
+  assert.equal(read.statusCode, 200);
+  for (const [key, value] of Object.entries(LOGOUT_METADATA)) assert.deepEqual(read.json()[key], value, key);
+  await s.server.close();
+});
+
+test('DCR PUT updates OIDC logout registration metadata and echoes the new values', async () => {
+  const s = await setup();
+  const created = (await regPost(s, { redirect_uris: [CB], ...LOGOUT_METADATA })).json();
+  const put = (body: unknown) => s.server.inject({
+    method: 'PUT', url: created.registration_client_uri,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${created.registration_access_token}` },
+    payload: JSON.stringify(body),
+  });
+  const update = {
+    redirect_uris: [CB],
+    post_logout_redirect_uris: ['https://app.example/bye'],
+    backchannel_logout_uri: 'https://app.example/bcl-2',
+    backchannel_logout_session_required: false,
+    frontchannel_logout_uri: null,
+    frontchannel_logout_session_required: false,
+  };
+  const res = await put(update);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.json()));
+  assert.deepEqual(res.json().post_logout_redirect_uris, ['https://app.example/bye']);
+  assert.equal(res.json().backchannel_logout_uri, 'https://app.example/bcl-2');
+  assert.equal(res.json().backchannel_logout_session_required, false);
+  assert.equal(res.json().frontchannel_logout_uri, undefined);
+  const stored = await s.store.getClient(created.client_id);
+  assert.deepEqual(stored?.postLogoutRedirectUris, ['https://app.example/bye']);
+  assert.equal(stored?.backchannelLogoutUri, 'https://app.example/bcl-2');
+  assert.equal(stored?.frontchannelLogoutUri, undefined);
+  assert.equal(stored?.frontchannelLogoutSessionRequired, false);
+  await s.server.close();
+});
+
+test('DCR rejects malformed OIDC logout registration metadata with invalid_client_metadata', async () => {
+  const s = await setup();
+  const bad = [
+    { post_logout_redirect_uris: 'https://app.example/out' },
+    { post_logout_redirect_uris: ['https://app.example/out#fragment'] },
+    { post_logout_redirect_uris: ['not a url'] },
+    { post_logout_redirect_uris: [7] },
+    { backchannel_logout_uri: 'https://app.example/cb#fragment' },
+    { backchannel_logout_uri: 'ftp://app.example/cb' },
+    { backchannel_logout_uri: 'http://app.example/cb' },
+    { backchannel_logout_uri: 7 },
+    { frontchannel_logout_uri: 'javascript:alert(1)' },
+    { backchannel_logout_session_required: 'yes' },
+    { frontchannel_logout_session_required: 1 },
+  ];
+  for (const patch of bad) {
+    const res = await regPost(s, { redirect_uris: [CB], ...LOGOUT_METADATA, ...patch });
+    assert.equal(res.statusCode, 400, JSON.stringify(patch));
+    assert.equal(res.json().error, 'invalid_client_metadata', JSON.stringify(patch));
+  }
+  // The conformance/test policy allows http only on loopback IP literals.
+  const loopback = await regPost(s, {
+    redirect_uris: [CB],
+    backchannel_logout_uri: 'http://127.0.0.1:8099/backchannel-logout',
+    frontchannel_logout_uri: 'http://[::1]:8099/frontchannel-logout',
+    post_logout_redirect_uris: ['http://127.0.0.1:8099/logged-out'],
+  });
+  assert.equal(loopback.statusCode, 201, JSON.stringify(loopback.json()));
+  await s.server.close();
+});
+
+test('DCR PUT rejects invalid logout metadata without changing the stored client', async () => {
+  const s = await setup();
+  const created = (await regPost(s, { redirect_uris: [CB], ...LOGOUT_METADATA })).json();
+  const before = JSON.stringify(await s.store.getClient(created.client_id));
+  const res = await s.server.inject({
+    method: 'PUT', url: created.registration_client_uri,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${created.registration_access_token}` },
+    payload: JSON.stringify({ redirect_uris: [CB], ...LOGOUT_METADATA, backchannel_logout_session_required: 'true' }),
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_client_metadata');
+  assert.equal(JSON.stringify(await s.store.getClient(created.client_id)), before);
+  await s.server.close();
+});
