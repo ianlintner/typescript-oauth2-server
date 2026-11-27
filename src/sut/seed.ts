@@ -1,6 +1,7 @@
 import { createPublicKey, type webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parse as parseYaml } from 'yaml';
+import { logoutUriError } from '../redirect-uri.js';
 import { hashClientSecret, sealClientHmacSecret } from '../client-auth.js';
 import type { ClientRecord, Jwks, Store } from '../ports.js';
 
@@ -18,6 +19,12 @@ export interface SeedClient {
   scopes: string[];
   /** RFC 8693 delegation allow-list (client_ids). */
   allowedActors?: string[];
+  /** OIDC logout client metadata (T-LOGOUT ticket 1). */
+  postLogoutRedirectUris?: string[];
+  backchannelLogoutUri?: string | null;
+  backchannelLogoutSessionRequired?: boolean;
+  frontchannelLogoutUri?: string | null;
+  frontchannelLogoutSessionRequired?: boolean;
 }
 export interface SeedUser {
   username: string;
@@ -163,10 +170,26 @@ function checkVerificationKey(k: Obj, where: string): Obj {
   return k;
 }
 
+function parseLogoutUri(value: unknown, field: string, where: string): string {
+  const reason = logoutUriError(value);
+  if (reason !== null) fail(`${where}: ${field} ${reason}`);
+  return value as string;
+}
+
+function parseLogoutRedirectUris(value: unknown, where: string): string[] {
+  if (!Array.isArray(value)) fail(`${where}: post_logout_redirect_uris must be an array`);
+  return (value as unknown[]).map((entry, i) => parseLogoutUri(entry, `post_logout_redirect_uris[${i}]`, where));
+}
+
+function parseSessionRequired(value: unknown, field: string, where: string): boolean {
+  if (typeof value !== 'boolean') fail(`${where}: ${field} must be a boolean`);
+  return value as boolean;
+}
+
 function parseClient(raw: unknown, index: number): SeedClient {
   const at = `clients[${index}]`;
   const c = obj(raw, at);
-  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types', 'jwks', 'allowed_actors'], at);
+  onlyKeys(c, ['client_id', 'name', 'client_secret', 'token_endpoint_auth_method', 'public', 'redirect_uris', 'scopes', 'grant_types', 'jwks', 'allowed_actors', 'post_logout_redirect_uris', 'backchannel_logout_uri', 'backchannel_logout_session_required', 'frontchannel_logout_uri', 'frontchannel_logout_session_required'], at);
   const clientId = str(c, 'client_id', at);
   const where = `client ${JSON.stringify(clientId)}`;
   optStr(c, 'name', where);
@@ -217,7 +240,12 @@ function parseClient(raw: unknown, index: number): SeedClient {
   }
   const allowedActors = c.allowed_actors === undefined ? undefined : strArray(c, 'allowed_actors', where);
   if (allowedActors?.some((a) => a === '')) fail(`${where}: allowed_actors entries must be nonempty`);
-  return { clientId, clientSecret: secret, ...(method ? { tokenEndpointAuthMethod: method } : {}), redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}), ...(allowedActors ? { allowedActors } : {}) };
+  const postLogoutRedirectUris = c.post_logout_redirect_uris === undefined ? undefined : parseLogoutRedirectUris(c.post_logout_redirect_uris, where);
+  const backchannelLogoutUri = c.backchannel_logout_uri === undefined ? undefined : parseLogoutUri(c.backchannel_logout_uri, 'backchannel_logout_uri', where);
+  const frontchannelLogoutUri = c.frontchannel_logout_uri === undefined ? undefined : parseLogoutUri(c.frontchannel_logout_uri, 'frontchannel_logout_uri', where);
+  const backchannelLogoutSessionRequired = c.backchannel_logout_session_required === undefined ? undefined : parseSessionRequired(c.backchannel_logout_session_required, 'backchannel_logout_session_required', where);
+  const frontchannelLogoutSessionRequired = c.frontchannel_logout_session_required === undefined ? undefined : parseSessionRequired(c.frontchannel_logout_session_required, 'frontchannel_logout_session_required', where);
+  return { clientId, clientSecret: secret, ...(method ? { tokenEndpointAuthMethod: method } : {}), redirectUris, grantTypes, scopes, ...(jwks ? { jwks } : {}), ...(allowedActors ? { allowedActors } : {}), ...(postLogoutRedirectUris ? { postLogoutRedirectUris } : {}), ...(backchannelLogoutUri !== undefined ? { backchannelLogoutUri } : {}), ...(backchannelLogoutSessionRequired !== undefined ? { backchannelLogoutSessionRequired } : {}), ...(frontchannelLogoutUri !== undefined ? { frontchannelLogoutUri } : {}), ...(frontchannelLogoutSessionRequired !== undefined ? { frontchannelLogoutSessionRequired } : {}) };
 }
 
 /** Parse and validate a YAML or JSON seed document. Any defect throws SeedError: no partial seed, no defaults for invalid input. */
@@ -341,6 +369,11 @@ export async function applySeed(seed: Seed, store: Store, hmacKey?: Buffer): Pro
       ...(sealed ? { clientSecretKey: sealed } : {}),
       ...(c.jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks: c.jwks } : {}),
       ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
+      ...(c.postLogoutRedirectUris ? { postLogoutRedirectUris: c.postLogoutRedirectUris } : {}),
+      ...(c.backchannelLogoutUri !== undefined ? { backchannelLogoutUri: c.backchannelLogoutUri } : {}),
+      ...(c.backchannelLogoutSessionRequired !== undefined ? { backchannelLogoutSessionRequired: c.backchannelLogoutSessionRequired } : {}),
+      ...(c.frontchannelLogoutUri !== undefined ? { frontchannelLogoutUri: c.frontchannelLogoutUri } : {}),
+      ...(c.frontchannelLogoutSessionRequired !== undefined ? { frontchannelLogoutSessionRequired: c.frontchannelLogoutSessionRequired } : {}),
     });
   }
   await store.transaction(async (tx) => {
