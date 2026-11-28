@@ -12,6 +12,10 @@ import { DEVICE_GRANT_TYPE } from '../src/device-grant.js';
 
 const SECRET = 'confidential-client-secret-value';
 const FORM = { 'content-type': 'application/x-www-form-urlencoded' };
+const PAR = {
+  response_type: 'code', redirect_uri: 'https://app.example/cb',
+  code_challenge: 'c'.repeat(43), code_challenge_method: 'S256',
+};
 
 async function setup(extra: Partial<Deps> = {}) {
   const { privateKey } = await generateKeyPair('ES256', { extractable: true });
@@ -107,19 +111,19 @@ test('device authorization and PAR creation are bounded per source and by live-r
   assert.equal(limited.statusCode, 429);
   assert.ok(Number(limited.headers['retry-after']) >= 1);
   // PAR has its own source counter.
-  assert.equal((await post(s, '/oauth/par', { client_id: 'pub', response_type: 'code' })).statusCode, 201);
+  assert.equal((await post(s, '/oauth/par', { ...PAR, client_id: 'pub' })).statusCode, 201);
   await s.close();
 
   const capped = await setup({ throttle: { maxLiveRecordsPerClient: 2, maxLiveRecords: 3, maxCreationsPerSource: 1000 } });
-  for (let i = 0; i < 2; i += 1) assert.equal((await post(capped, '/oauth/par', { client_id: 'pub' })).statusCode, 201);
-  assert.equal((await post(capped, '/oauth/par', { client_id: 'pub' })).statusCode, 429);
+  for (let i = 0; i < 2; i += 1) assert.equal((await post(capped, '/oauth/par', { ...PAR, client_id: 'pub' })).statusCode, 201);
+  assert.equal((await post(capped, '/oauth/par', { ...PAR, client_id: 'pub' })).statusCode, 429);
   assert.equal(await capped.store.countLiveRecords('par', capped.now(), 'pub'), 2);
   // Another client still has room under the global cap, until it is reached.
-  assert.equal((await post(capped, '/oauth/par', { client_id: 'conf', client_secret: SECRET })).statusCode, 201);
-  assert.equal((await post(capped, '/oauth/par', { client_id: 'conf', client_secret: SECRET })).statusCode, 429);
+  assert.equal((await post(capped, '/oauth/par', { ...PAR, client_id: 'conf', client_secret: SECRET })).statusCode, 201);
+  assert.equal((await post(capped, '/oauth/par', { ...PAR, client_id: 'conf', client_secret: SECRET })).statusCode, 429);
   // Expiry frees capacity.
   capped.advance(61);
-  assert.equal((await post(capped, '/oauth/par', { client_id: 'pub' })).statusCode, 201);
+  assert.equal((await post(capped, '/oauth/par', { ...PAR, client_id: 'pub' })).statusCode, 201);
   await capped.close();
 });
 

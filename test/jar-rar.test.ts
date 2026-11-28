@@ -290,6 +290,7 @@ test('RAR is validated at PAR and rejected with invalid_authorization_details', 
   const res = await s.server.inject({ method: 'POST', url: '/oauth/par',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     payload: new URLSearchParams({ client_id: 'pub', response_type: 'code', redirect_uri: CB,
+      code_challenge: CHALLENGE, code_challenge_method: 'S256',
       authorization_details: JSON.stringify([{ type: 'unknown' }]) }).toString() });
   assert.equal(res.statusCode, 400, res.body);
   assert.equal(res.json().error, 'invalid_authorization_details');
