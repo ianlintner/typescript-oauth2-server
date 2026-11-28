@@ -8,6 +8,7 @@ import { OAuthError } from './errors.js';
 import { ASSERTION_ALGS, candidateKeys as jwksCandidateKeys, fetchJwks } from './jwks.js';
 import { parseAuthorizationDetails, mergeJarParams, REQUEST_OBJECT_SIGNING_ALGS, verifyJar } from './jar-rar.js';
 import { logoutUriError, redirectUriMatches } from './redirect-uri.js';
+import type { LogoutContext, SessionParticipation } from './session.js';
 import { TOKEN_EXCHANGE_GRANT_TYPE, tokenExchangeGrant } from './token-exchange.js';
 import type { ClientRecord, Clock, Random, Signer, Store, TrustedIssuerRecord } from './ports.js';
 import { failureKey, resolveThrottle, tooManyRequests, type ThrottleConfig } from './throttle.js';
@@ -72,6 +73,12 @@ export interface OAuthDeps {
   userClaims?: ((subject: string) => UserClaims | null) | undefined;
   /** Terminates the request's session (RP-initiated logout). */
   endSession?: ((req: FastifyRequest, reply: FastifyReply) => void) | undefined;
+  /** Opaque OP session identifier for the `sid` claim; never the cookie secret. */
+  sessionId?: ((req: FastifyRequest) => string | null) | undefined;
+  /** Relying parties that received ID tokens for each session (D2). */
+  sessionParticipation?: SessionParticipation | undefined;
+  /** Single internal hook for back-/front-channel notification (tickets 4/5 consume it). */
+  onLogout?: ((ctx: LogoutContext) => void | Promise<void>) | undefined;
 }
 
 export interface UserClaims {
@@ -765,6 +772,7 @@ export function registerOAuthRoutes(
       // auth_time is claimed when max_age was requested (OIDC Core 2).
       authTime: maxAge !== null ? authTime : null,
       authorizationDetails,
+      sid: deps.sessionId?.(req) ?? null,
     });
     return redirectTo(reply, effectiveRedirectUri, { code, state, iss: deps.issuer });
   });
@@ -871,6 +879,10 @@ export function registerOAuthRoutes(
           };
           if (record.nonce) idClaims.nonce = record.nonce;
           if (record.authTime !== null) idClaims.auth_time = record.authTime;
+          if (record.sid) {
+            idClaims.sid = record.sid;
+            await deps.sessionParticipation?.record(record.sid, client.clientId);
+          }
           body.id_token = await deps.signer.sign(idClaims);
         }
 
@@ -884,6 +896,7 @@ export function registerOAuthRoutes(
             family: record.codeHash, // each auth code starts a new family, which doubles as the grant id
             parentJti: null, revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
             authorizationDetails: record.authorizationDetails,
+            sid: record.sid,
           });
           body.refresh_token = rtValue;
         }
@@ -990,6 +1003,7 @@ export function registerOAuthRoutes(
           parentJti: consumed.jti,
           revokedByReplayAt: null, revokedAt: null, dpopJkt: jkt,
           authorizationDetails: consumed.authorizationDetails,
+          sid: consumed.sid,
         });
 
         // Rotation vs. replay race: a concurrent replay may revoke the family after the parent
@@ -1036,6 +1050,10 @@ export function registerOAuthRoutes(
             iss: deps.issuer, sub: consumed.subject, aud: client.clientId,
             iat, exp: iat + ACCESS_TOKEN_TTL_SECONDS, jti: deps.random.token(16),
           };
+          if (consumed.sid) {
+            idClaims.sid = consumed.sid;
+            await deps.sessionParticipation?.record(consumed.sid, client.clientId);
+          }
           body.id_token = await deps.signer.sign(idClaims);
         }
         return { body };
@@ -1331,6 +1349,14 @@ export function registerOAuthRoutes(
     }
 
     deps.endSession?.(req, reply);
+    // D5: the ending sid comes from the live session when available, otherwise
+    // from the hint (RP-initiated logout without a browser session).
+    const sid = deps.sessionId?.(req) ?? (typeof payload.sid === 'string' ? payload.sid : null);
+    const clients = sid !== null && deps.sessionParticipation !== undefined
+      ? await deps.sessionParticipation.clientsFor(sid)
+      : [];
+    if (deps.onLogout !== undefined) await deps.onLogout({ sid, sub: payload.sub, clients });
+    if (sid !== null) await deps.sessionParticipation?.end(sid);
     if (redirectTarget !== undefined) {
       return reply.status(302).header('location', redirectTarget).send();
     }

@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
   consumed_at INTEGER,
   nonce TEXT,
   auth_time INTEGER,
-  authorization_details TEXT
+  authorization_details TEXT,
+  sid TEXT
 );
 CREATE TABLE IF NOT EXISTS access_tokens (
   jti TEXT PRIMARY KEY,
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER,
   dpop_jkt TEXT,
-  authorization_details TEXT
+  authorization_details TEXT,
+  sid TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT PRIMARY KEY,
@@ -211,6 +213,7 @@ interface CodeRow {
   nonce: string | null;
   auth_time: number | null;
   authorization_details: string | null;
+  sid: string | null;
 }
 
 interface AccessTokenRow {
@@ -237,6 +240,7 @@ interface RefreshTokenRow {
   revoked_by_replay_at: number | null;
   dpop_jkt: string | null;
   authorization_details: string | null;
+  sid: string | null;
 }
 
 function rowToAccessToken(r: AccessTokenRow): AccessTokenRecord {
@@ -265,6 +269,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     revokedAt: r.revoked_at,
     dpopJkt: r.dpop_jkt,
     authorizationDetails: r.authorization_details === null ? undefined : JSON.parse(r.authorization_details) as unknown[],
+    sid: r.sid,
   };
 }
 
@@ -426,11 +431,12 @@ const ops = {
 
   saveCode(db: DatabaseSync, c: AuthorizationCodeRecord): void {
     db.prepare(
-      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce, auth_time, authorization_details)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, subject, scope, code_challenge, expires_at, consumed_at, nonce, auth_time, authorization_details, sid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(c.codeHash, c.clientId, c.redirectUri, c.subject, c.scope, c.codeChallenge, c.expiresAt,
       c.consumedAt, c.nonce ?? null, c.authTime ?? null,
-      c.authorizationDetails === undefined || c.authorizationDetails === null ? null : JSON.stringify(c.authorizationDetails));
+      c.authorizationDetails === undefined || c.authorizationDetails === null ? null : JSON.stringify(c.authorizationDetails),
+      c.sid ?? null);
   },
 
   // Single conditional UPDATE ... RETURNING: the database decides the winner of a race.
@@ -455,6 +461,7 @@ const ops = {
       nonce: r.nonce,
       authTime: r.auth_time,
       ...(r.authorization_details ? { authorizationDetails: JSON.parse(r.authorization_details) as unknown[] } : {}),
+      sid: r.sid,
     };
   },
 
@@ -485,10 +492,11 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, authorization_details)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, authorization_details, sid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
     ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null,
-      t.authorizationDetails === undefined || t.authorizationDetails === null ? null : JSON.stringify(t.authorizationDetails));
+      t.authorizationDetails === undefined || t.authorizationDetails === null ? null : JSON.stringify(t.authorizationDetails),
+      t.sid ?? null);
   },
 
   // INSERT OR IGNORE on the primary key: the database decides the winner across connections and processes.
@@ -799,11 +807,14 @@ export class SqliteStore implements Store {
     }
     const codeCols = db.prepare('PRAGMA table_info(authorization_codes)').all() as unknown as Array<{ name: string }>;
     if (!codeCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE authorization_codes ADD COLUMN authorization_details TEXT');
+    // Databases created before T-LOGOUT lack the session-id columns.
+    if (!codeCols.some((c) => c.name === 'sid')) db.exec('ALTER TABLE authorization_codes ADD COLUMN sid TEXT');
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
     // Databases created before RFC 9396 support lack the RAR refresh-token column.
     if (!rtCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT');
+    if (!rtCols.some((c) => c.name === 'sid')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN sid TEXT');
     // Databases created before grant linking lack the access-token grant column.
     const atCols = db.prepare('PRAGMA table_info(access_tokens)').all() as unknown as Array<{ name: string }>;
     if (!atCols.some((c) => c.name === 'grant_id')) db.exec('ALTER TABLE access_tokens ADD COLUMN grant_id TEXT');

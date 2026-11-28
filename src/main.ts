@@ -13,7 +13,8 @@ import { startSweeper, type Sweeper } from './sweep.js';
 import type { Store } from './ports.js';
 import { assertSafeForConformance, conformanceModeFromEnv } from './sut/mode.js';
 import { applySeed, assertProvisionable, loadSeed } from './sut/seed.js';
-import { createTestRegistry, LOGIN_PATH, makeConsent, makeTestAuthenticate, makeTestAuthTime, makeTestEndSession, registerTestLoginRoutes } from './sut/routes.js';
+import { createTestRegistry, LOGIN_PATH, makeConsent, makeTestAuthenticate, makeTestAuthTime, makeTestEndSession, makeTestSessionId, registerTestLoginRoutes } from './sut/routes.js';
+import { InMemorySessionParticipation } from './session.js';
 
 export interface RunningServer {
   address: string;
@@ -47,6 +48,7 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     registry = createTestRegistry(seed.users, systemClock);
     consent = makeConsent(seed.users);
   }
+  const sessionParticipation = registry ? new InMemorySessionParticipation() : undefined;
 
   const server = buildServer({
     store,
@@ -67,6 +69,8 @@ export async function startServer(env: Record<string, string | undefined>): Prom
     authTime: registry ? makeTestAuthTime(registry) : undefined,
     userClaims: registry ? (sub) => registry!.claimsFor(sub) : undefined,
     endSession: registry ? makeTestEndSession(registry) : undefined,
+    sessionId: registry ? makeTestSessionId(registry) : undefined,
+    sessionParticipation,
     // Conformance mode is loopback-only with an in-memory store, so every scenario shares one source
     // address; per-source limits would lock later scenarios out after the runner's repeated-failure cases.
     throttle: mode.enabled ? false : undefined,
