@@ -9,7 +9,7 @@ import { cryptoRandom } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
-import { clearJwksCache, setJwksNetGuard } from '../src/jwks.js';
+import { clearJwksCache, setJwksNetGuard, __setJwksClock } from '../src/jwks.js';
 
 // These tests serve JWKS documents from a loopback listener, so the fetch-time
 // address check is relaxed for this file only (test seam; not reachable from config).
@@ -618,11 +618,376 @@ test('a rotated verification key is refreshed when the cached document lacks the
     assert.equal((await c.jwtb(await signWith(oldKey.privateKey, 'old', '1'))).statusCode, 200);
     assert.equal(fetches, 1);
     // Rotate: the endpoint now publishes only the new key. The assertion names
-    // a kid the cached document lacks, so the handler must refresh once.
+    // a kid the cached document lacks, so the handler must refresh once -- but
+    // only after the forced-refresh cooldown has elapsed. Advance the JWKS clock
+    // past the cooldown so the rotation is actually re-fetched.
+    __setJwksClock(() => Date.now() + 60_000);
     current = { keys: [newJwk] };
     const res = await c.jwtb(await signWith(newKey.privateKey, 'new', '2'));
     assert.equal(res.statusCode, 200, res.body);
     assert.equal(fetches, 2);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('an outage past the cache TTL is served stale for matching kids, but an unknown kid fails closed', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'stale-1' };
+  let fetches = 0;
+  let up = true;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    if (!up) { res.writeHead(500); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string, kid = 'stale-1') => {
+    const body = { iss: 'https://stale.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
+  };
+  // A virtual wall-clock for the cache, decoupled from the handler's assertion clock.
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-stale', issuer: 'https://stale.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    // Populate the cache.
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // Advance past the TTL, then take the endpoint down. A kid the stale
+    // document covers must still verify: the failed non-forced refresh keeps
+    // the stale entry, so the in-handler forced retry is served from it during
+    // the cooldown instead of failing closed.
+    cacheNow += 3600 * 1000;
+    up = false;
+    const res = await c.jwtb(await signFor('2'));
+    assert.equal(res.statusCode, 200, res.body);
+    // The expired entry hit the endpoint once; the failed attempt starts the
+    // cooldown, so the in-handler forced retry was served from cache and the
+    // endpoint was not hit a second time.
+    assert.equal(fetches, 2);
+    // An unknown kid cannot be verified from the stale document; once the
+    // cooldown has passed the forced refresh fails and must fail closed rather
+    // than be papered over with stale keys.
+    cacheNow += 60_000;
+    const unknown = await c.jwtb(await signFor('3', 'rotated-away'));
+    assert.equal(unknown.statusCode, 400);
+    assert.equal(unknown.json().error, 'invalid_grant');
+    // One more cache-miss fetch; the forced retry is held off by the cooldown
+    // that the failed attempt started.
+    assert.equal(fetches, 3);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('forceFresh does not refetch a document younger than the cooldown', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'cool-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string, kid: string) => {
+    const body = { iss: 'https://cooldown.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
+  };
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-cool', issuer: 'https://cooldown.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('1', 'cool-1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+    // An unknown kid would normally trigger a forced refresh, but the document
+    // was fetched moments ago: the cooldown serves the cached doc instead of
+    // hitting the endpoint again, so this request fails without a second fetch.
+    const res = await c.jwtb(await signFor('2', 'other-kid'));
+    assert.equal(res.statusCode, 400);
+    assert.equal(fetches, 1);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+test('a failed forceFresh refresh past the cooldown does not serve stale keys (no fetch amplification)', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'fresh-1' };
+  let fetches = 0;
+  let up = true;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    if (!up) { res.writeHead(500); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string, kid: string) => {
+    const body = { iss: 'https://fresh.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid }).sign(ext2.privateKey);
+  };
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-fresh', issuer: 'https://fresh.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    assert.equal((await c.jwtb(await signFor('1', 'fresh-1'))).statusCode, 200);
+    assert.equal(fetches, 1);
+
+    // Past the TTL, with the endpoint down. The initial lookup cannot refresh,
+    // so it serves the stale document; the unknown kid then forces a refresh,
+    // which fails. That failure must surface (opaque invalid_grant) rather than
+    // returning the stale document, which would look like a key mismatch and
+    // let the next request hit the dead endpoint all over again.
+    cacheNow += 3600 * 1000;
+    up = false;
+    const first = await c.jwtb(await signFor('2', 'unknown-kid'));
+    assert.equal(first.statusCode, 400);
+    assert.equal(first.json().error, 'invalid_grant');
+    // Initial setup (1) + cache-miss lookup (2). The failed attempt starts the
+    // cooldown, so the forced retry does not hit the dead endpoint again.
+    assert.equal(fetches, 2);
+    // Once the cooldown elapses a third exchange refetches once, fails, and
+    // still fails closed for the unknown kid.
+    cacheNow += 60_000;
+    const second = await c.jwtb(await signFor('3', 'unknown-kid'));
+    assert.equal(second.statusCode, 400);
+    assert.equal(second.json().error, 'invalid_grant');
+    assert.equal(fetches, 3);
+  } finally {
+    if (server.listening) server.close();
+    clearJwksCache();
+  }
+});
+
+/** Loopback JWKS endpoint whose availability and latency the test controls. */
+async function startJwksEndpoint(doc: () => object) {
+  const st = { fetches: 0, up: true, delayMs: 0 };
+  const server: Server = createServer((_req, res) => {
+    st.fetches += 1;
+    const respond = () => {
+      if (!st.up) { res.writeHead(500); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(doc()));
+    };
+    if (st.delayMs > 0) setTimeout(respond, st.delayMs); else respond();
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  return { st, server, jwksUri: `http://127.0.0.1:${addr.port}/jwks.json` };
+}
+
+test('consecutive requests during an outage probe the endpoint once per cooldown, not per request', async () => {
+  const c = await setup();
+  const k = await generateKeyPair('ES256', { extractable: true });
+  const jwk = { ...(await exportJWK(k.publicKey)), kid: 'att-1' };
+  const ep = await startJwksEndpoint(() => ({ keys: [jwk] }));
+  const signFor = (jti: string) => new SignJWT({ iss: 'https://attempt.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 })
+    .setProtectedHeader({ alg: 'ES256', kid: 'att-1' }).sign(k.privateKey);
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({ id: 'ti-att', issuer: 'https://attempt.example', jwksUri: ep.jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true, createdAt: T0, updatedAt: T0 });
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    assert.equal(ep.st.fetches, 1);
+    cacheNow += 3600 * 1000; // past the TTL
+    ep.st.up = false;
+    // No clock advance between requests: only the first may hit the dead endpoint.
+    for (const jti of ['2', '3', '4']) {
+      const r = await c.jwtb(await signFor(jti));
+      assert.equal(r.statusCode, 200, r.body);
+    }
+    assert.equal(ep.st.fetches, 2);
+    // After the cooldown a single further probe is allowed.
+    cacheNow += 60_000;
+    assert.equal((await c.jwtb(await signFor('5'))).statusCode, 200);
+    assert.equal(ep.st.fetches, 3);
+  } finally {
+    ep.server.close();
+    clearJwksCache();
+  }
+});
+
+test('concurrent valid exchanges during an outage all get the stale-key policy', async () => {
+  const c = await setup();
+  const k = await generateKeyPair('ES256', { extractable: true });
+  const jwk = { ...(await exportJWK(k.publicKey)), kid: 'conc-1' };
+  const ep = await startJwksEndpoint(() => ({ keys: [jwk] }));
+  const signFor = (jti: string) => new SignJWT({ iss: 'https://conc.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 })
+    .setProtectedHeader({ alg: 'ES256', kid: 'conc-1' }).sign(k.privateKey);
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({ id: 'ti-conc', issuer: 'https://conc.example', jwksUri: ep.jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true, createdAt: T0, updatedAt: T0 });
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    cacheNow += 3600 * 1000;
+    ep.st.up = false;
+    ep.st.delayMs = 50; // keep the failing refresh in flight so the others join it
+    const assertions = await Promise.all(['2', '3', '4'].map(signFor));
+    const results = await Promise.all(assertions.map((a) => c.jwtb(a)));
+    for (const r of results) assert.equal(r.statusCode, 200, r.body);
+    assert.equal(ep.st.fetches, 2); // one shared failed refresh
+  } finally {
+    ep.server.close();
+    clearJwksCache();
+  }
+});
+
+test('stale keys stop verifying once the stale grace period from the last good fetch expires', async () => {
+  const c = await setup();
+  const k = await generateKeyPair('ES256', { extractable: true });
+  const jwk = { ...(await exportJWK(k.publicKey)), kid: 'age-1' };
+  const ep = await startJwksEndpoint(() => ({ keys: [jwk] }));
+  const signFor = (jti: string) => new SignJWT({ iss: 'https://age.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 })
+    .setProtectedHeader({ alg: 'ES256', kid: 'age-1' }).sign(k.privateKey);
+  let cacheNow = Date.now();
+  __setJwksClock(() => cacheNow);
+  try {
+    await c.store.saveTrustedIssuer({ id: 'ti-age', issuer: 'https://age.example', jwksUri: ep.jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true, createdAt: T0, updatedAt: T0 });
+    assert.equal((await c.jwtb(await signFor('1'))).statusCode, 200);
+    ep.st.up = false;
+    cacheNow += 23 * 3600 * 1000; // inside the grace period
+    assert.equal((await c.jwtb(await signFor('2'))).statusCode, 200);
+    cacheNow += 2 * 3600 * 1000; // 25h since the last good fetch: beyond the grace period
+    const expired = await c.jwtb(await signFor('3'));
+    assert.equal(expired.statusCode, 400);
+    assert.equal(expired.json().error, 'invalid_grant');
+    // Fails closed on a repeat request too, rather than reviving the stale document.
+    const again = await c.jwtb(await signFor('4'));
+    assert.equal(again.statusCode, 400);
+    // Recovery: once the endpoint is back and the cooldown has passed, verification resumes.
+    ep.st.up = true;
+    cacheNow += 60_000;
+    assert.equal((await c.jwtb(await signFor('5'))).statusCode, 200);
+  } finally {
+    ep.server.close();
+    clearJwksCache();
+  }
+});
+
+test('an assertion that expires while the rotation refresh is in flight is rejected', async () => {
+  const c = await setup();
+  const oldKey = await generateKeyPair('ES256', { extractable: true });
+  const newKey = await generateKeyPair('ES256', { extractable: true });
+  const oldJwk = { ...(await exportJWK(oldKey.publicKey)), kid: 'old' };
+  const newJwk = { ...(await exportJWK(newKey.publicKey)), kid: 'new' };
+  let current: object = { keys: [oldJwk] };
+  let expireWhileServing = false;
+  // While serving the rotation refresh, the handler's clock passes the assertion's exp.
+  const ep = await startJwksEndpoint(() => { if (expireWhileServing) c.state.v = T0 + 120; return current; });
+  const signWith = (key: CryptoKey, kid: string, jti: string) =>
+    new SignJWT({ iss: 'https://rotexp.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 })
+      .setProtectedHeader({ alg: 'ES256', kid }).sign(key);
+  try {
+    clearJwksCache();
+    await c.store.saveTrustedIssuer({ id: 'ti-rotexp', issuer: 'https://rotexp.example', jwksUri: ep.jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true, createdAt: T0, updatedAt: T0 });
+    assert.equal((await c.jwtb(await signWith(oldKey.privateKey, 'old', '1'))).statusCode, 200);
+    __setJwksClock(() => Date.now() + 60_000); // past the forced-refresh cooldown
+    current = { keys: [newJwk] };
+    expireWhileServing = true;
+    const assertion = await signWith(newKey.privateKey, 'new', '2'); // valid at T0
+    const res = await c.jwtb(assertion);
+    assert.equal(c.state.v, T0 + 120); // the refresh really did run
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal(res.json().error, 'invalid_grant');
+  } finally {
+    ep.server.close();
+    clearJwksCache();
+  }
+});
+
+test('subject_mapping=email with an empty email is an opaque invalid_grant', async () => {
+  const c = await setup();
+  await c.store.saveTrustedIssuer({
+    id: 'ti-1', issuer: EXT, jwks: (await c.store.getTrustedIssuer(EXT))!.jwks,
+    allowedAudiences: [], subjectMapping: 'email', allowedClientIds: [], enabled: true,
+    createdAt: T0, updatedAt: T0,
+  });
+  const res = await c.jwtb(await c.sign({ sub: 'x', email: '' }));
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_grant');
+});
+
+test('scope with doubled separators filters empty tokens and rejects unknown scope', async () => {
+  const c = await setup();
+  // 'read' is allowed, 'admin' is not; the empty token between doubled spaces
+  // must be dropped rather than matched (and thus must not itself fail).
+  const res = await c.jwtb(await c.sign(), { scope: 'read  admin' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error, 'invalid_scope');
+  // Purely doubled separators around an allowed scope resolve to just 'read'.
+  const ok = await c.jwtb(await c.sign(), { scope: ' read ' });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.ok(ok.json().access_token);
+});
+
+test('concurrent exchanges coalesce onto a single in-flight JWKS fetch', async () => {
+  const c = await setup();
+  const ext2 = await generateKeyPair('ES256', { extractable: true });
+  const pubJwk = { ...(await exportJWK(ext2.publicKey)), kid: 'coalesce-1' };
+  let fetches = 0;
+  const server: Server = createServer((_req, res) => {
+    fetches += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ keys: [pubJwk] }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const addr = server.address(); assert.ok(addr && typeof addr !== 'string');
+  const jwksUri = `http://127.0.0.1:${addr.port}/jwks.json`;
+  const signFor = (jti: string) => {
+    const body = { iss: 'https://coalesce.example', sub: 'bob', aud: ISSUER, jti, iat: T0, exp: T0 + 60 };
+    return new SignJWT(body).setProtectedHeader({ alg: 'ES256', kid: 'coalesce-1' }).sign(ext2.privateKey);
+  };
+  try {
+    await c.store.saveTrustedIssuer({
+      id: 'ti-coalesce', issuer: 'https://coalesce.example', jwksUri,
+      allowedAudiences: [], subjectMapping: 'sub', allowedClientIds: [], enabled: true,
+      createdAt: T0, updatedAt: T0,
+    });
+    const results = await Promise.all([c.jwtb(await signFor('1')), c.jwtb(await signFor('2')), c.jwtb(await signFor('3'))]);
+    for (const r of results) assert.equal(r.statusCode, 200, r.body);
+    // All three shared the single fetch already in flight.
+    assert.equal(fetches, 1);
   } finally {
     if (server.listening) server.close();
     clearJwksCache();
