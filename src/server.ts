@@ -2,6 +2,7 @@ import rateLimit from '@fastify/rate-limit';
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { OAuthError, errorResponse } from './errors.js';
 import { registerOAuthRoutes, type OAuthDeps } from './oauth.js';
+import type { SessionParticipation } from './session.js';
 import { registerExtensionRoutes, type RegistrationPolicy } from './device-grant.js';
 import { registerAdminTrustedIssuerRoutes } from './admin-trusted-issuers.js';
 import type { Clock, Random, Signer, Store } from './ports.js';
@@ -19,6 +20,16 @@ export interface Deps {
   authTime?: OAuthDeps['authTime'] | undefined;
   userClaims?: OAuthDeps['userClaims'] | undefined;
   endSession?: OAuthDeps['endSession'] | undefined;
+  /**
+   * Opaque identifier of the end-user's OP session, used as the `sid` claim in
+   * ID tokens. Must not be the session cookie value itself (D5); absent when
+   * the host has no session concept.
+   */
+  sessionId?: OAuthDeps['sessionId'] | undefined;
+  /** Relying parties that received ID tokens for each session (D2). */
+  sessionParticipation?: SessionParticipation | undefined;
+  /** Single internal hook for back-/front-channel notification (tickets 4/5 consume it). */
+  onLogout?: OAuthDeps['onLogout'];
   refreshTokenTtl?: number | undefined;
   /**
    * Per-source request bound on /oauth/userinfo and /oauth/logout, in requests per 60s.

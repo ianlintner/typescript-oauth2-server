@@ -16,6 +16,13 @@ export interface TestLoginRegistry {
   end(sessionId: string | null): void;
   /** Seeded profile claims for a username, or null. */
   claimsFor(username: string): UserClaims | null;
+  /** Opaque OP session id for a cookie (never the cookie value itself). */
+  sessionIdFor(sessionId: string | null): string | null;
+}
+
+/** Adapt a test registry to the OAuthDeps.sessionId hook. */
+export function makeTestSessionId(registry: TestLoginRegistry) {
+  return (req: FastifyRequest): string | null => registry.sessionIdFor(sessionFrom(req));
 }
 
 export const SESSION_COOKIE = 'oauth2_test_session';
@@ -53,7 +60,7 @@ export function sessionFrom(request: FastifyRequest): string | null {
 export function createTestRegistry(users: SeedUser[], clock: Clock): TestLoginRegistry {
   const byName = new Map<string, string>();
   const profiles = new Map<string, UserClaims>();
-  const sessions = new Map<string, { username: string; at: number }>();
+  const sessions = new Map<string, { username: string; at: number; sid: string }>();
   for (const user of users) {
     byName.set(user.username, user.password);
     profiles.set(user.username, { preferred_username: user.username, ...(user.email !== undefined ? { email: user.email } : {}) });
@@ -64,7 +71,8 @@ export function createTestRegistry(users: SeedUser[], clock: Clock): TestLoginRe
       const expected = byName.get(username);
       if (expected === undefined || !secureEqual(expected, password)) return null;
       const sessionId = randomBytes(32).toString('base64url');
-      sessions.set(sessionId, { username, at: clock.now() });
+      const sid = randomBytes(32).toString('base64url');
+      sessions.set(sessionId, { username, at: clock.now(), sid });
       return sessionId;
     },
     usernameFor(sessionId) {
@@ -78,6 +86,9 @@ export function createTestRegistry(users: SeedUser[], clock: Clock): TestLoginRe
     },
     claimsFor(username) {
       return profiles.get(username) ?? null;
+    },
+    sessionIdFor(sessionId) {
+      return sessionId === null ? null : sessions.get(sessionId)?.sid ?? null;
     },
   };
 }

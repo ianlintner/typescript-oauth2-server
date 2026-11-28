@@ -126,6 +126,8 @@ export interface AuthorizationCodeRecord {
   nonce: string | null;
   /** Epoch seconds the end-user authenticated, recorded when max_age was requested (OIDC auth_time). */
   authTime: number | null;
+  /** Opaque OP session identifier (T-LOGOUT D5); absent when the code was issued without a session. */
+  sid?: string | null | undefined;
   /** RFC 9396 authorization_details granted at authorization time (JSON value). */
   authorizationDetails?: unknown[] | null | undefined;
 }
@@ -158,6 +160,8 @@ export interface RefreshTokenRecord {
   revokedAt: number | null;
   /** RFC 9449 JWK thumbprint the token is bound to; absent/null when unbound. */
   dpopJkt?: string | null;
+  /** OP session identifier inherited from the authorization code (T-LOGOUT D5). */
+  sid?: string | null | undefined;
   /** RFC 9396 authorization_details granted at authorization time (JSON value). */
   authorizationDetails?: unknown[] | null | undefined;
 }
