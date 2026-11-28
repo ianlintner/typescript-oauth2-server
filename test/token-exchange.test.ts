@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { SignJWT, calculateJwkThumbprint, decodeJwt, exportJWK, exportPKCS8, generateKeyPair, type JWK } from 'jose';
+import { SignJWT, calculateJwkThumbprint, decodeJwt, decodeProtectedHeader, exportJWK, exportPKCS8, generateKeyPair, type JWK } from 'jose';
 import { hashClientSecret } from '../src/client-auth.js';
+import { ACCESS_TOKEN_TYP } from '../src/oauth.js';
 import type { ClientRecord, Clock, Signer } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
@@ -48,7 +49,7 @@ async function setup(opts: { maxDelegationDepth?: number; clients?: Partial<Clie
   const mint = async (claims: Record<string, unknown>, ttl = 3600): Promise<string> => {
     const jti = randomUUID();
     const body = { iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read write', iat: state.v, exp: state.v + ttl, jti, ...claims };
-    const token = await signer.sign(body);
+    const token = await signer.sign(body, { typ: ACCESS_TOKEN_TYP });
     await store.saveAccessToken({
       jti, clientId: String(body.client_id), subject: String(body.sub), scope: String(body.scope ?? ''),
       expiresAt: Number(body.exp), revokedAt: null, tokenHash: null,
@@ -67,7 +68,7 @@ test('exchanged access token inherits the subject grant and is revoked by its ca
   const subjectToken = await c.signer.sign({
     iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read',
     iat: T0, exp: T0 + 3600, jti,
-  });
+  }, { typ: ACCESS_TOKEN_TYP });
   await c.store.saveAccessToken({
     jti, clientId: 'a', subject: 'a', scope: 'read',
     expiresAt: T0 + 3600, revokedAt: null, tokenHash: null, grant,
@@ -108,6 +109,36 @@ test('same-client exchange narrows scope and returns RFC 8693 response members',
   // the issued token is recorded (usable at userinfo/introspection/revocation, and exchangeable again)
   const again = await c.exchange('a', { subject_token: body.access_token });
   assert.equal(again.statusCode, 200, again.body);
+});
+
+test('exchanged access tokens carry typ at+jwt and introspect as active', async () => {
+  const c = await setup();
+  const subj = await c.cc('a');
+  const res = await c.exchange('a', { subject_token: subj, scope: 'read' });
+  assert.equal(res.statusCode, 200, res.body);
+  const token = res.json().access_token as string;
+  assert.equal(decodeProtectedHeader(token).typ, ACCESS_TOKEN_TYP);
+  const introspection = await c.server.inject({
+    method: 'POST', url: '/oauth/introspect',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: basic('a') },
+    payload: new URLSearchParams({ token, token_type_hint: 'access_token' }).toString(),
+  });
+  assert.equal(introspection.statusCode, 200, introspection.body);
+  assert.equal(introspection.json().active, true);
+});
+
+test('a recorded token without typ at+jwt is rejected as a subject token', async () => {
+  const c = await setup();
+  const jti = randomUUID();
+  const body = { iss: ISSUER, sub: 'a', aud: 'a', client_id: 'a', scope: 'read write', iat: c.state.v, exp: c.state.v + 3600, jti };
+  const legacy = await c.signer.sign(body); // default typ JWT, still on record
+  await c.store.saveAccessToken({
+    jti, clientId: 'a', subject: 'a', scope: 'read write', expiresAt: c.state.v + 3600,
+    revokedAt: null, tokenHash: null,
+  });
+  const res = await c.exchange('a', { subject_token: legacy });
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, 'invalid_request');
 });
 
 test('omitted scope inherits the subject token scope', async () => {

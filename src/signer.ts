@@ -10,7 +10,7 @@ export async function createJoseSigner(pem: string, kid: string): Promise<Signer
   const publicJwk = await exportJWK(createPublicKey(createPrivateKey(pem)));
   const jwks: Jwks = { keys: [{ ...publicJwk, kid, alg: ALG, use: 'sig' }] };
   return {
-    sign: (claims) => new SignJWT(claims).setProtectedHeader({ alg: ALG, kid, typ: 'JWT' }).sign(privateKey),
+    sign: (claims, header) => new SignJWT(claims).setProtectedHeader({ alg: ALG, kid, typ: header?.typ ?? 'JWT' }).sign(privateKey),
     publicJwks: async () => jwks,
   };
 }

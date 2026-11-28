@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS clients (
   client_secret_key TEXT,
   jwks TEXT,
   jwks_uri TEXT,
+  resources TEXT,
   allowed_actors TEXT,
   require_signed_request_object INTEGER,
   authorization_details_types TEXT,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   revoked_at INTEGER,
   revoked_by_replay_at INTEGER,
   dpop_jkt TEXT,
+  resource TEXT,
   authorization_details TEXT
 );
 CREATE TABLE IF NOT EXISTS device_codes (
@@ -126,6 +128,7 @@ interface ClientRow {
   client_secret_key: string | null;
   jwks: string | null;
   jwks_uri: string | null;
+  resources: string | null;
   allowed_actors: string | null;
   require_signed_request_object: number | null;
   authorization_details_types: string | null;
@@ -236,6 +239,7 @@ interface RefreshTokenRow {
   revoked_at: number | null;
   revoked_by_replay_at: number | null;
   dpop_jkt: string | null;
+  resource: string | null;
   authorization_details: string | null;
 }
 
@@ -264,6 +268,7 @@ function rowToRefreshToken(r: RefreshTokenRow): RefreshTokenRecord {
     revokedByReplayAt: r.revoked_by_replay_at,
     revokedAt: r.revoked_at,
     dpopJkt: r.dpop_jkt,
+    resource: r.resource,
     authorizationDetails: r.authorization_details === null ? undefined : JSON.parse(r.authorization_details) as unknown[],
   };
 }
@@ -276,13 +281,13 @@ const ops = {
 
   saveClient(db: DatabaseSync, c: ClientRecord): void {
     db.prepare(
-      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, client_secret_key, jwks, jwks_uri, allowed_actors, require_signed_request_object, authorization_details_types, post_logout_redirect_uris, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO clients (client_id, client_secret_hash, redirect_uris, grant_types, scopes, enabled, registration, token_endpoint_auth_method, client_secret_key, jwks, jwks_uri, resources, allowed_actors, require_signed_request_object, authorization_details_types, post_logout_redirect_uris, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_id) DO UPDATE SET client_secret_hash=excluded.client_secret_hash,
          redirect_uris=excluded.redirect_uris, grant_types=excluded.grant_types,
          scopes=excluded.scopes, enabled=excluded.enabled, registration=excluded.registration,
          token_endpoint_auth_method=excluded.token_endpoint_auth_method, client_secret_key=excluded.client_secret_key, jwks=excluded.jwks, jwks_uri=excluded.jwks_uri,
-         allowed_actors=excluded.allowed_actors, require_signed_request_object=excluded.require_signed_request_object,
+         resources=excluded.resources, allowed_actors=excluded.allowed_actors, require_signed_request_object=excluded.require_signed_request_object,
          authorization_details_types=excluded.authorization_details_types,
          post_logout_redirect_uris=excluded.post_logout_redirect_uris, backchannel_logout_uri=excluded.backchannel_logout_uri,
          backchannel_logout_session_required=excluded.backchannel_logout_session_required,
@@ -291,6 +296,7 @@ const ops = {
       c.clientId, c.clientSecretHash, JSON.stringify(c.redirectUris), JSON.stringify(c.grantTypes), JSON.stringify(c.scopes),
       c.enabled ? 1 : 0, c.registration ? JSON.stringify(c.registration) : null,
       c.tokenEndpointAuthMethod ?? null, c.clientSecretKey ?? null, c.jwks ? JSON.stringify(c.jwks) : null, c.jwksUri ?? null,
+      c.resources && c.resources.length > 0 ? JSON.stringify(c.resources) : null,
       c.allowedActors ? JSON.stringify(c.allowedActors) : null,
       c.requireSignedRequestObject === undefined ? null : (c.requireSignedRequestObject ? 1 : 0),
       c.authorizationDetailsTypesSupported ? JSON.stringify(c.authorizationDetailsTypesSupported) : null,
@@ -381,6 +387,7 @@ const ops = {
       ...(r.client_secret_key ? { clientSecretKey: r.client_secret_key } : {}),
       ...(r.jwks ? { jwks: JSON.parse(r.jwks) as ClientRecord['jwks'] } : {}),
       ...(r.jwks_uri ? { jwksUri: r.jwks_uri } : {}),
+      ...(r.resources ? { resources: JSON.parse(r.resources) as string[] } : {}),
       ...(r.allowed_actors ? { allowedActors: JSON.parse(r.allowed_actors) as string[] } : {}),
       ...(r.require_signed_request_object === 1 ? { requireSignedRequestObject: true } : {}),
       ...(r.authorization_details_types ? { authorizationDetailsTypesSupported: JSON.parse(r.authorization_details_types) as string[] } : {}),
@@ -485,9 +492,10 @@ const ops = {
 
   saveRefreshToken(db: DatabaseSync, t: RefreshTokenRecord): void {
     db.prepare(
-      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, authorization_details)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+      `INSERT INTO refresh_tokens (jti, client_id, subject, scope, expires_at, family, parent_jti, consumed_at, revoked_at, revoked_by_replay_at, dpop_jkt, resource, authorization_details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
     ).run(t.jti, t.clientId, t.subject, t.scope, t.expiresAt, t.family, t.parentJti, t.revokedAt, t.revokedByReplayAt, t.dpopJkt ?? null,
+      t.resource ?? null,
       t.authorizationDetails === undefined || t.authorizationDetails === null ? null : JSON.stringify(t.authorizationDetails));
   },
 
@@ -777,7 +785,7 @@ export class SqliteStore implements Store {
     const cols = db.prepare('PRAGMA table_info(clients)').all() as unknown as Array<{ name: string }>;
     if (!cols.some((c) => c.name === 'registration')) db.exec('ALTER TABLE clients ADD COLUMN registration TEXT');
     // Databases created before private_key_jwt (RFC 7523 §2.2) lack the client key columns.
-    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri']) {
+    for (const col of ['token_endpoint_auth_method', 'jwks', 'jwks_uri', 'resources']) {
       if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE clients ADD COLUMN ${col} TEXT`);
     }
     // Databases created before client_secret_jwt lack the sealed client key column.
@@ -802,6 +810,7 @@ export class SqliteStore implements Store {
     // Databases created before DPoP (RFC 9449) support lack the refresh-token binding column.
     const rtCols = db.prepare('PRAGMA table_info(refresh_tokens)').all() as unknown as Array<{ name: string }>;
     if (!rtCols.some((c) => c.name === 'dpop_jkt')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT');
+    if (!rtCols.some((c) => c.name === 'resource')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN resource TEXT');
     // Databases created before RFC 9396 support lack the RAR refresh-token column.
     if (!rtCols.some((c) => c.name === 'authorization_details')) db.exec('ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT');
     // Databases created before grant linking lack the access-token grant column.

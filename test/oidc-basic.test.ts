@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { decodeJwt, exportPKCS8, generateKeyPair, SignJWT } from 'jose';
+import { decodeJwt, decodeProtectedHeader, exportPKCS8, generateKeyPair, SignJWT } from 'jose';
 import { hashClientSecret } from '../src/client-auth.js';
 import type { Clock } from '../src/ports.js';
 import { claimsForScope } from '../src/oauth.js';
@@ -181,12 +181,33 @@ test('an access token is not accepted as id_token_hint, the id token is', async 
   assert.equal(s.ended(), 1);
 });
 
+test('logout rejects an access token as id_token_hint', async () => {
+  const s = await setup();
+  const body = await exchange(s, {});
+  assert.equal(decodeProtectedHeader(body.access_token).typ, 'at+jwt');
+  const res = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.access_token}` });
+  assert.equal(res.statusCode, 400);
+  assert.equal((res.json() as { error: string }).error, 'invalid_request');
+  assert.equal(s.ended(), 0);
+});
+
 test('an id_token_hint for a disabled client is refused', async () => {
   const s = await setup();
   const body = await exchange(s, {});
   const client = (await s.store.getClient('conf'))!;
   await s.store.saveClient({ ...client, enabled: false });
   const res = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${body.id_token}` });
+  assert.equal(res.statusCode, 400);
+  assert.equal((res.json() as { error: string }).error, 'invalid_request');
+  assert.equal(s.ended(), 0);
+});
+
+test('logout rejects a pre-upgrade access token (typ JWT) as id_token_hint', async () => {
+  const s = await setup();
+  const exp = 2_000_000;
+  const legacy = await s.signer.sign({ iss: ISSUER, sub: 'alice', aud: 'conf', client_id: 'conf', scope: 'openid', iat: exp - 10, exp, jti: 'legacy' });
+  assert.equal(decodeProtectedHeader(legacy).typ, 'JWT');
+  const res = await s.server.inject({ method: 'GET', url: `/oauth/logout?id_token_hint=${legacy}` });
   assert.equal(res.statusCode, 400);
   assert.equal((res.json() as { error: string }).error, 'invalid_request');
   assert.equal(s.ended(), 0);

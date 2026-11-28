@@ -1,5 +1,6 @@
 import { importJWK, jwtVerify, type JWK } from 'jose';
 import { OAuthError } from './errors.js';
+import { ACCESS_TOKEN_TYP } from './oauth.js';
 import type { ClientRecord } from './ports.js';
 import type { OAuthDeps } from './oauth.js';
 
@@ -95,6 +96,7 @@ async function resolveToken(deps: OAuthDeps, raw: string, which: 'subject' | 'ac
     payload = (await jwtVerify(raw, key, {
       issuer: deps.issuer,
       algorithms: ['ES256'],
+      typ: ACCESS_TOKEN_TYP, // only JWT access tokens are acceptable subject/actor tokens
       currentDate: new Date(deps.clock.now() * 1000),
     })).payload as Record<string, unknown>;
   } catch {
@@ -262,7 +264,7 @@ export async function tokenExchangeGrant(
   if (presentedJkt) claims.cnf = { jkt: presentedJkt };
   const issuedAct = actClaim(act);
   if (issuedAct) claims.act = issuedAct;
-  const accessToken = await deps.signer.sign(claims);
+  const accessToken = await deps.signer.sign(claims, { typ: ACCESS_TOKEN_TYP });
   await deps.store.saveAccessToken({
     jti, clientId: client.clientId, subject: subject.sub, scope: scope.join(' '),
     expiresAt: exp, revokedAt: null, tokenHash: null, grant: subject.grant,
