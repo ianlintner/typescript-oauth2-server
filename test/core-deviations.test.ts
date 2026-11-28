@@ -11,6 +11,7 @@ import type { ClientRecord } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 
 const ISSUER = 'http://localhost:8080';
@@ -32,7 +33,7 @@ async function setup() {
   await store.saveClient({ ...base, clientId: 'off', redirectUris: ['https://app.example/cb'], enabled: false });
   const server = buildServer({
     store, signer, clock: { now: () => 1_000_000 }, random: cryptoRandom, issuer: ISSUER,
-    authenticate: async () => 'user-1',
+    authenticate: async () => 'user-1', consent: consentAll('user-1'),
   });
   return { server, store };
 }

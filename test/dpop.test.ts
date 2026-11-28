@@ -9,6 +9,7 @@ import { SignJWT, calculateJwkThumbprint, decodeJwt, exportJWK, exportPKCS8, gen
 import { hashClientSecret } from '../src/client-auth.js';
 import type { ClientRecord, Clock } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -58,7 +59,7 @@ async function setup(opts: { path?: string; now?: { v: number }; store?: SqliteS
   await store.saveClient({ ...base, clientId: 'pub', clientSecretHash: null });
   const state = opts.now ?? { v: T0 };
   const clock: Clock = { now: () => state.v };
-  const server = buildServer({ store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'user-1' });
+  const server = buildServer({ store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'user-1', consent: consentAll('user-1') });
   return { server, store, clock, advance: (s) => { state.v += s; } };
 }
 

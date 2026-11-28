@@ -5,6 +5,7 @@ import { SignJWT, calculateJwkThumbprint, decodeJwt, exportJWK, exportPKCS8, gen
 import { hashClientSecret } from '../src/client-auth.js';
 import type { ClientRecord, Clock, Signer } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
@@ -33,7 +34,7 @@ async function setup(opts: { maxDelegationDepth?: number; clients?: Partial<Clie
   const state = { v: T0 };
   const clock: Clock = { now: () => state.v };
   const server = buildServer({
-    store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'u',
+    store, signer, clock, random: cryptoRandom, issuer: ISSUER, authenticate: async () => 'u', consent: consentAll('u'),
     ...(opts.maxDelegationDepth !== undefined ? { maxDelegationDepth: opts.maxDelegationDepth } : {}),
   });
   const post = (form: Record<string, string>, headers: Record<string, string> = {}) =>

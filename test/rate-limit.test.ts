@@ -5,6 +5,7 @@ import { hashClientSecret } from '../src/client-auth.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 
 const ISSUER = 'http://localhost:8080';
@@ -21,7 +22,7 @@ async function setup(opts: { rateLimit?: boolean | number } = {}) {
   });
   const server = buildServer({
     store, signer, clock: { now: () => 1_700_000_000 }, random: cryptoRandom, issuer: ISSUER,
-    authenticate: async () => 'alice',
+    authenticate: async () => 'alice', consent: consentAll('alice'),
     rateLimit: opts.rateLimit,
   });
   return { server };

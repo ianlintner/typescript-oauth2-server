@@ -7,6 +7,7 @@ import type { ClientRecord } from '../src/ports.js';
 import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 import type { RegistrationPolicy } from '../src/device-grant.js';
 
@@ -33,7 +34,7 @@ async function setup(opts: { dynamicRegistration?: boolean; registrationPolicy?:
   const clock = { now: () => now };
   const server = buildServer({
     store, signer, clock, random: cryptoRandom, issuer: ISSUER,
-    authenticate: async () => 'user-1',
+    authenticate: async () => 'user-1', consent: consentAll('user-1'),
     dynamicRegistration: opts.dynamicRegistration ?? true,
     registrationPolicy: opts.registrationPolicy,
   });

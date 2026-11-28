@@ -2,7 +2,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Clock } from '../ports.js';
 import type { UserClaims } from '../oauth.js';
-import type { SeedUser } from './seed.js';
+import { createConsentDecider } from '../oauth.js';
+import type { SeedClient, SeedUser } from './seed.js';
 
 /** Process-local test-login session registry for conformance mode only. */
 export interface TestLoginRegistry {
@@ -98,11 +99,21 @@ export function makeTestEndSession(registry: TestLoginRegistry) {
   };
 }
 
-/** Consent check: grant only if the subject's seed lists this client for auto-approval. */
-export function makeConsent(users: SeedUser[]) {
-  const auto = new Map<string, Set<string>>();
-  for (const user of users) auto.set(user.username, new Set(user.autoApproveClients));
-  return (subject: string, clientId: string): boolean => auto.get(subject)?.has(clientId) ?? false;
+/**
+ * Consent for conformance mode only: a subject's seed may auto-approve a
+ * client, in which case that client's full registered scope set is recorded as
+ * approved. Scope-aware: narrower requests are covered, wider ones are denied.
+ */
+export function makeConsent(users: SeedUser[], clients: SeedClient[]) {
+  const decider = createConsentDecider();
+  const scopesById = new Map(clients.map((c) => [c.clientId, c.scopes]));
+  for (const user of users) {
+    for (const clientId of user.autoApproveClients) {
+      const scopes = scopesById.get(clientId);
+      if (scopes) decider.approve(user.username, clientId, scopes);
+    }
+  }
+  return decider.consent;
 }
 
 /**

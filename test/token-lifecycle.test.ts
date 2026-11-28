@@ -9,6 +9,7 @@ import { cryptoRandom } from '../src/runtime.js';
 import { createJoseSigner } from '../src/signer.js';
 import { refreshTokenId } from '../src/token-digest.js';
 import { SqliteStore } from '../src/sqlite-store.js';
+import { consentAll } from '../src/oauth.js';
 import { buildServer } from '../src/server.js';
 
 const ISSUER = 'http://localhost:8080';
@@ -48,7 +49,7 @@ async function setup(opts: { user?: string | null; refreshTokenTtl?: number } = 
   const user = opts.user === undefined ? 'user-1' : opts.user;
   const server = buildServer({
     store, signer, clock, random: cryptoRandom, issuer: ISSUER,
-    authenticate: async () => user,
+    authenticate: async () => user, consent: consentAll(user),
     refreshTokenTtl: opts.refreshTokenTtl ?? 86_400,
   });
   return { server, store, signer, advance: (s: number) => { now += s; } };
