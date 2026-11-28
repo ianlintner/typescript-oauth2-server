@@ -30,6 +30,10 @@ Refresh tokens rotate on every use. Presenting a refresh token that was already 
 
 Every access and refresh token records the grant it descends from. Revoking a refresh token at `/oauth/revoke`, presenting an already-used refresh token, or presenting an already-used authorization code also revokes the access tokens and refresh tokens of that same grant, so `/oauth/userinfo` and introspection stop accepting them immediately. Tokens from other grants (other devices or sessions) and tokens issued before grants were recorded are not affected.
 
+### Client authentication method
+
+`authenticateClient` honours the registered `token_endpoint_auth_method` on every endpoint that authenticates a client: `client_secret_basic` accepts only the Basic header, `client_secret_post` accepts only a body secret, `none` accepts only `client_id`, and `private_key_jwt` requires a signed assertion. Clients written directly to the store without a registered method keep accepting Basic or body secrets; a client without a secret hash is treated as a public client. A method mismatch produces the same opaque `invalid_client` response as any other authentication failure. `POST /oauth/introspect` additionally rejects public clients, because it discloses token metadata: a caller that proved no credential cannot use it. `POST /oauth/revoke` still allows public clients to revoke their own tokens (RFC 7009 §2.1) and returns no data.
+
 ### Dynamic client registration policy
 
 Embedders that pass `dynamicRegistration: true` to `buildServer` can also pass a `registrationPolicy`. Every value a registrant supplies must appear on the matching allow-list, otherwise `POST` and `PUT /connect/register` return `invalid_client_metadata` or `invalid_redirect_uri`:

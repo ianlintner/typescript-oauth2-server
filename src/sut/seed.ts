@@ -365,7 +365,7 @@ export async function applySeed(seed: Seed, store: Store, hmacKey?: Buffer): Pro
       grantTypes: c.grantTypes,
       scopes: c.scopes,
       enabled: true,
-      ...(c.tokenEndpointAuthMethod ? { tokenEndpointAuthMethod: c.tokenEndpointAuthMethod } : {}),
+      ...(c.tokenEndpointAuthMethod ? { tokenEndpointAuthMethod: c.tokenEndpointAuthMethod as ClientRecord['tokenEndpointAuthMethod'] } : {}),
       ...(sealed ? { clientSecretKey: sealed } : {}),
       ...(c.jwks ? { tokenEndpointAuthMethod: 'private_key_jwt', jwks: c.jwks } : {}),
       ...(c.allowedActors ? { allowedActors: c.allowedActors } : {}),
