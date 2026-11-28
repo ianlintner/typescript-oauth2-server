@@ -138,6 +138,54 @@ test('logout exposes sid, sub and participating clients to the internal hook and
   assert.deepEqual(s.participation.clientsFor(sid), []);
 });
 
+test('logout reports the live session sid (not a stale hint sid) and ends that session only', async () => {
+  const contexts: LogoutContext[] = [];
+  const s = await setupConformance({ onLogout: (ctx) => { contexts.push(ctx); } });
+
+  // Session 1 yields an ID token that will later be reused as a stale id_token_hint.
+  const cookie1 = await login(s);
+  const sid1 = s.registry.sessionIdFor(cookie1.split('=')[1] ?? null);
+  assert.ok(sid1);
+  const stale = await exchange(s, {}, { cookie: cookie1 });
+  assert.equal(decodeJwt(stale.id_token!).sid, sid1);
+
+  // Session 2 is the browser's *live* session at logout time.
+  const cookie2 = await login(s);
+  const sid2 = s.registry.sessionIdFor(cookie2.split('=')[1] ?? null);
+  assert.ok(sid2);
+  assert.notEqual(sid2, sid1);
+  await exchange(s, {}, { cookie: cookie2 });
+
+  assert.deepEqual(s.participation.clientsFor(sid1), ['conf']);
+  assert.deepEqual(s.participation.clientsFor(sid2), ['conf']);
+
+  // The RP presents the stale session-1 hint, but the browser is in session 2.
+  const out = await s.server.inject({
+    method: 'GET', url: logoutUrl(stale.id_token!), headers: { cookie: cookie2 },
+  });
+  assert.equal(out.statusCode, 200);
+
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0]!.sid, sid2, 'the ending live session sid must reach the hook, not the stale hint sid');
+  assert.equal(contexts[0]!.sub, 'alice');
+  assert.deepEqual(contexts[0]!.clients, ['conf']);
+  assert.deepEqual(s.participation.clientsFor(sid2), [], 'the ended live session participation is cleared');
+  assert.deepEqual(s.participation.clientsFor(sid1), ['conf'], 'the stale hint session is not ended');
+});
+
+test('a throwing notification hook does not break logout or skip participation cleanup', async () => {
+  const s = await setupConformance({
+    onLogout: () => { throw new Error('downstream notification failed'); },
+  });
+  const cookie = await login(s);
+  const sid = s.registry.sessionIdFor(cookie.split('=')[1] ?? null);
+  assert.ok(sid);
+  const tokens = await exchange(s, {}, { cookie });
+  const out = await s.server.inject({ method: 'GET', url: logoutUrl(tokens.id_token!), headers: { cookie } });
+  assert.equal(out.statusCode, 200, 'logout still succeeds when the notification hook throws');
+  assert.deepEqual(s.participation.clientsFor(sid), [], 'participation is cleared even when the hook throws');
+});
+
 test('conformance session hook returns an opaque sid, distinct from the cookie and stable until logout', () => {
   const clock: Clock = { now: () => 1_000_000 };
   const registry = createTestRegistry([{ username: 'alice', password: 'pw', autoApproveClients: ['conf'] }], clock);

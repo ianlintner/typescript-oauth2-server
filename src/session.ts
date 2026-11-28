@@ -21,6 +21,12 @@ export interface LogoutContext {
   clients: string[];
 }
 
+/**
+ * In-memory implementation intended for conformance mode only. Entries live
+ * until `end(sid)` is called on logout; sessions that never log out retain
+ * their entry until the process restarts (no TTL). Hosts in production should
+ * supply a store with their own expiry policy.
+ */
 export class InMemorySessionParticipation implements SessionParticipation {
   readonly #clientsBySid = new Map<string, Set<string>>();
 

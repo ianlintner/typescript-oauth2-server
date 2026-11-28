@@ -1348,14 +1348,30 @@ export function registerOAuthRoutes(
       redirectTarget = target.toString();
     }
 
-    deps.endSession?.(req, reply);
-    // D5: the ending sid comes from the live session when available, otherwise
-    // from the hint (RP-initiated logout without a browser session).
-    const sid = deps.sessionId?.(req) ?? (typeof payload.sid === 'string' ? payload.sid : null);
+    // D5: resolve the ending session's facts BEFORE endSession terminates it —
+    // conformance endSession deletes the session entry, so sessionId()/authenticate()
+    // return null afterwards. The live session is authoritative over a stale
+    // id_token_hint: a hint may come from an older session while the browser has
+    // since re-authenticated, and tickets 4/5 must notify the session that ends.
+    // Without a live session (RP logout from a different device), fall back to the hint.
+    const liveSid = deps.sessionId?.(req) ?? null;
+    const liveSub = deps.authenticate ? await deps.authenticate(req) : null;
+    const sid = liveSid ?? (typeof payload.sid === 'string' ? payload.sid : null);
+    const sub = liveSub ?? payload.sub;
     const clients = sid !== null && deps.sessionParticipation !== undefined
       ? await deps.sessionParticipation.clientsFor(sid)
       : [];
-    if (deps.onLogout !== undefined) await deps.onLogout({ sid, sub: payload.sub, clients });
+
+    deps.endSession?.(req, reply);
+    // The notification hook is best-effort: a throwing consumer must not turn a
+    // completed logout into a 500 or skip clearing the ended session's participation.
+    if (deps.onLogout !== undefined) {
+      try {
+        await deps.onLogout({ sid, sub, clients });
+      } catch {
+        // Tickets 4/5 own delivery; logout itself succeeds regardless of hook failure.
+      }
+    }
     if (sid !== null) await deps.sessionParticipation?.end(sid);
     if (redirectTarget !== undefined) {
       return reply.status(302).header('location', redirectTarget).send();
